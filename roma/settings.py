@@ -37,6 +37,7 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
+    'corsheaders',
     'rest_framework',
     'user',
     'data',
@@ -45,12 +46,19 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
+    'corsheaders.middleware.CorsMiddleware',
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
+
+CORS_ALLOWED_ORIGINS = [
+    "http://localhost:4200",
+    "http://127.0.0.1:4200",
+]
+CORS_ALLOW_CREDENTIALS = True
 
 ROOT_URLCONF = "roma.urls"
 
@@ -79,7 +87,7 @@ WSGI_APPLICATION = "roma.wsgi.application"
 DATABASES = {
     'data': {
         'ENGINE': 'django.db.backends.mysql',
-        'NAME': 'prj_romani',
+        'NAME': 'romani',
         'USER': 'root',
         'PASSWORD': '',
         'HOST': 'localhost',
@@ -94,7 +102,7 @@ DATABASES = {
         'PORT': '3306',
     },
 }
-
+DATABASE_ROUTERS = ['roma.dbrouters.DBRouter',]
 
 # Password validation
 # https://docs.djangoproject.com/en/5.1/ref/settings/#auth-password-validators

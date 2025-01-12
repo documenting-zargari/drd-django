@@ -1,6 +1,6 @@
 .DS_Store
 .env
-__pychache__
+**/__pycache__/
 media
 
 .vscode/*

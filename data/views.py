@@ -8,6 +8,12 @@ class CategoryViewSet(viewsets.ModelViewSet):
     queryset = Category.objects.all()
     serializer_class = CategorySerializer
 
+    def get_queryset(self):
+        parent_category = self.request.query_params.get('parent', None)
+        if parent_category is not None:
+            return self.queryset.filter(parent__pk=parent_category)
+        return self.queryset.filter(parent=None)
+
 def index(request):
     return JsonResponse({ "message": "Hello, world!" })
 

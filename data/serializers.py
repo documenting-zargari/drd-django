@@ -4,7 +4,8 @@ from data.models import Category, Sample
 class CategorySerializer(serializers.ModelSerializer):
     class Meta:
         model = Category
-        fields = '__all__'
+        fields = ('category_id', 'category_name', 'category_description', 
+                  'parent', 'path',)
 
 class SampleSerializer(serializers.ModelSerializer):
     class Meta:

@@ -33,6 +33,8 @@ class Category(models.Model):
     category_name = models.CharField(max_length=50)
     category_description = models.TextField(blank=True, null=True,)
     category_image = models.CharField(max_length=100, blank=True, null=True)
+    parent = models.ForeignKey('self', on_delete=models.CASCADE, blank=True, null=True, db_column='parent_category')
+    path = models.CharField(max_length=200, blank=True, null=True)
 
     def _str_(self):
         return self.category_name

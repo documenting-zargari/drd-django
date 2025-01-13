@@ -7,7 +7,12 @@ class CategorySerializer(serializers.ModelSerializer):
         fields = ('category_id', 'category_name', 'category_description', 
                   'parent', 'path',)
 
-class SampleSerializer(serializers.ModelSerializer):
+class SampleListSerializer(serializers.ModelSerializer):
     class Meta:
         model = Sample
         fields = ('sample_ref', 'dialect_name',)
+
+class SampleRetrieveSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Sample
+        fields = '__all__'

@@ -1,8 +1,6 @@
-from django.http import HttpResponse, JsonResponse
-from django.shortcuts import render
 from rest_framework import viewsets
 from data.models import Category, Sample
-from data.serializers import CategorySerializer, SampleSerializer
+from data.serializers import CategorySerializer, SampleListSerializer, SampleRetrieveSerializer
 
 class CategoryViewSet(viewsets.ModelViewSet):
     queryset = Category.objects.all()
@@ -14,9 +12,12 @@ class CategoryViewSet(viewsets.ModelViewSet):
             return self.queryset.filter(parent__pk=parent_category)
         return self.queryset.filter(parent=None)
 
-def index(request):
-    return JsonResponse({ "message": "Hello, world!" })
-
 class SampleViewSet(viewsets.ModelViewSet):
     queryset = Sample.objects.all()
-    serializer_class = SampleSerializer
+
+    def get_serializer_class(self):
+        if hasattr(self, 'action') and self.action == 'retrieve':
+            return SampleRetrieveSerializer
+        elif hasattr(self, 'action') and self.action == 'list':
+            return SampleListSerializer
+        return super().get_serializer_class()

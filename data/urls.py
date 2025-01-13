@@ -4,5 +4,5 @@ from data import views
 urlpatterns = [
     path('categories', views.CategoryViewSet.as_view({'get': 'list'}), name='categories-list'),
     path('samples', views.SampleViewSet.as_view({'get': 'list'}), name='samples-list'),
-    path('', views.index, name='index'),
+    path("samples/<str:pk>", views.SampleViewSet.as_view({'get': 'retrieve'}), name="sample-detail"),
 ]

@@ -1,6 +1,6 @@
 from rest_framework import viewsets
-from data.models import Category, Sample
-from data.serializers import CategorySerializer, SampleListSerializer, SampleRetrieveSerializer
+from data.models import Category, Sample, Source
+from data.serializers import CategorySerializer, SampleListSerializer, SampleRetrieveSerializer, SourceSerializer
 
 class CategoryViewSet(viewsets.ModelViewSet):
     queryset = Category.objects.all()
@@ -21,3 +21,7 @@ class SampleViewSet(viewsets.ModelViewSet):
         elif hasattr(self, 'action') and self.action == 'list':
             return SampleListSerializer
         return super().get_serializer_class()
+
+class SourceViewSet(viewsets.ModelViewSet):
+    queryset = Source.objects.all()
+    serializer_class = SourceSerializer

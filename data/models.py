@@ -21,9 +21,6 @@ class Sample(models.Model):
     def _str_(self):
         return self.sample_ref
 
-    def get_objects(self):
-        return Sample.objects.filter(visible='yes').order_by('sample_ref')
-
 class Category(models.Model):
     class Meta:
         db_table = 'categories'
@@ -40,7 +37,7 @@ class Category(models.Model):
         return self.category_name
 
     def get_objects(self):
-        return Category.objects.all().order_by('category_name')
+        return Category.objects.order_by('category_name')
 
 class Source(models.Model):
     class Meta:

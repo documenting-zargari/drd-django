@@ -21,6 +21,10 @@ class SampleViewSet(viewsets.ModelViewSet):
         elif hasattr(self, 'action') and self.action == 'list':
             return SampleListSerializer
         return super().get_serializer_class()
+    
+    def get_queryset(self):
+        return Sample.objects.filter(visible='Yes').order_by('sample_ref')
+
 
 class SourceViewSet(viewsets.ModelViewSet):
     queryset = Source.objects.all()

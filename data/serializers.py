@@ -11,7 +11,7 @@ class CategorySerializer(serializers.ModelSerializer):
 class SampleListSerializer(serializers.ModelSerializer):
     class Meta:
         model = Sample
-        fields = ('sample_ref', 'dialect_name',)
+        fields = ('sample_ref', 'dialect_name', 'visible')
 
 class SampleRetrieveSerializer(serializers.ModelSerializer):
     class Meta:

@@ -16,7 +16,7 @@ class SampleListSerializer(serializers.ModelSerializer):
 class SampleRetrieveSerializer(serializers.ModelSerializer):
     class Meta:
         model = Sample
-        fields = '__all__'
+        exclude = ('visible', 'live')
 
 class SourceSerializer(serializers.ModelSerializer): 
     class Meta:

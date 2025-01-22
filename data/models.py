@@ -36,9 +36,6 @@ class Category(models.Model):
     def _str_(self):
         return self.category_name
 
-    def get_objects(self):
-        return Category.objects.order_by('category_name')
-
 class Source(models.Model):
     class Meta:
         db_table = 'sample_rmsq_sources' # or 'sample_external_source'

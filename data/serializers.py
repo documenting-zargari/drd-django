@@ -1,6 +1,6 @@
 from collections import OrderedDict
 from rest_framework import serializers
-from data.models import Category, Sample, Source
+from data.models import Category, Phrase, Sample, Source, Translation
 
 class CategorySerializer(serializers.ModelSerializer):
     class Meta:
@@ -26,3 +26,21 @@ class SourceSerializer(serializers.ModelSerializer):
     def to_representation(self, instance):
         result = super().to_representation(instance)
         return OrderedDict([(key, result[key]) for key in result if result[key] is not None])
+
+class TranslationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Translation
+        fields = ['id', 'conjugated', 'english',]
+
+class PhraseSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Phrase
+        fields = ['id', 'sample', 'phrase', 'translation',]
+
+    translation = TranslationSerializer(read_only=True)
+
+    def to_representation(self, instance):
+        result = super().to_representation(instance)
+        return OrderedDict([(key, result[key]) for key in result if result[key] is not None])
+        # return result['phrase']
+    

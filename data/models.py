@@ -73,3 +73,19 @@ class Source(models.Model):
     sample = models.CharField(max_length=20, blank=True, null=True,)
     sound_separated = models.CharField(max_length=20, blank=True, null=True,)
     in_romani = models.CharField(max_length=20, blank=True, null=True,)
+
+
+class Translation(models.Model):
+    class Meta:
+        db_table = 'phrase_anchors'
+    
+    conjugated = models.BooleanField(null=True, blank=True)
+    english = models.TextField(blank=True, null=True)
+   
+class Phrase(models.Model):
+    class Meta:
+        db_table = 'sample_phrases'
+
+    sample = models.ForeignKey(Sample, on_delete=models.CASCADE, db_column='sample')
+    phrase = models.CharField(max_length=225)
+    translation = models.ForeignKey(Translation, on_delete=models.CASCADE, db_column='phrase_anchor')

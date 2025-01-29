@@ -1,6 +1,6 @@
 from rest_framework import viewsets
-from data.models import Category, Sample, Source
-from data.serializers import CategorySerializer, SampleListSerializer, SampleRetrieveSerializer, SourceSerializer
+from data.models import Category, Phrase, Sample, Source
+from data.serializers import CategorySerializer, PhraseSerializer, SampleListSerializer, SampleRetrieveSerializer, SourceSerializer
 
 class CategoryViewSet(viewsets.ModelViewSet):
     queryset = Category.objects.all()
@@ -12,7 +12,7 @@ class CategoryViewSet(viewsets.ModelViewSet):
             return self.queryset.filter(parent__pk=parent_category)
         return self.queryset.filter(parent=None)
 
-class SampleViewSet(viewsets.ModelViewSet):
+class SampleViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = Sample.objects.all()
 
     def get_serializer_class(self):
@@ -20,7 +20,7 @@ class SampleViewSet(viewsets.ModelViewSet):
             return SampleRetrieveSerializer
         elif hasattr(self, 'action') and self.action == 'list':
             return SampleListSerializer
-        return super().get_serializer_class()
+        return SampleListSerializer
     
     def get_queryset(self):
         return Sample.objects.filter(visible='Yes').order_by('sample_ref')
@@ -29,3 +29,15 @@ class SampleViewSet(viewsets.ModelViewSet):
 class SourceViewSet(viewsets.ModelViewSet):
     queryset = Source.objects.all()
     serializer_class = SourceSerializer
+
+class PhraseViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = Phrase.objects.all()
+    serializer_class = PhraseSerializer
+
+    def get_queryset(self):
+        sample = self.request.query_params.get('sample', None)
+        print("request", self.request.query_params)
+        print("sample", sample)
+        if sample is not None:
+            return self.queryset.filter(sample__pk=sample)
+        return None

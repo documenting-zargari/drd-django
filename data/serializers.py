@@ -33,11 +33,12 @@ class TranslationSerializer(serializers.ModelSerializer):
         fields = ['id', 'conjugated', 'english',]
 
 class PhraseSerializer(serializers.ModelSerializer):
+    translation = serializers.CharField(source='translation.english')
+    # translation = TranslationSerializer(read_only=True)
     class Meta:
         model = Phrase
         fields = ['id', 'sample', 'phrase', 'translation',]
 
-    translation = TranslationSerializer(read_only=True)
 
     def to_representation(self, instance):
         result = super().to_representation(instance)

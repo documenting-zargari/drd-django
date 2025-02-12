@@ -25,26 +25,6 @@ class Sample(models.Model):
 class Dialect(ArangoModel):
     collection_name = 'Dialects'
     
-    def __init__(self, **kwargs):
-        self._id = kwargs.get('_id')
-        self._key = kwargs.get('_key')
-        self._rev = kwargs.get('_rev')
-        for key, value in kwargs.items():
-            setattr(self, key, value)
-    
-    # sample_ref
-    # source_type
-    # dialect_group 
-    # self_attrib_name 
-    # dialect_name)
-    # location 
-    # country_code
-    # live 
-    # longitude
-    # latitude
-    # visible
-    # migrant
-
     def _str_(self):
         return self.sample_ref
 

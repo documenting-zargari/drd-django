@@ -1,6 +1,7 @@
 from collections import OrderedDict
 from rest_framework import serializers
 from data.models import Category, Dialect, Phrase, Sample, Source, Translation
+from roma.serializers import ArangoModelSerializer
 
 class CategorySerializer(serializers.ModelSerializer):
     class Meta:
@@ -45,7 +46,13 @@ class PhraseSerializer(serializers.ModelSerializer):
         return OrderedDict([(key, result[key]) for key in result if result[key] is not None])
         # return result['phrase']
 
-class DialectSerializer(serializers.ModelSerializer):
+class DialectSerializer(ArangoModelSerializer):
+
+        sample_ref = serializers.CharField(source='ref')
         class Meta:
             model = Dialect
-            fields = '__all__'
+            fields = ['sample_ref', 'source_type', 'dialect_group ', 
+                      'self_attrib_name', 'dialect_name', 'location ', 
+                      'country_code', 'live ', 'longitude', 'latitude', 
+                      'visible', 'migrant', 'sample_ref', 
+                      ]

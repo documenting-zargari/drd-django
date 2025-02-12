@@ -27,7 +27,7 @@ router.register(r'users', views.UserViewSet)
 router.register(r'samples', data_views.SampleViewSet)
 router.register(r'categories', data_views.CategoryViewSet)
 router.register(r'phrases', data_views.PhraseViewSet)
-# router.register(r'dialects', data_views.DialectViewSet)
+router.register(r'dialects', data_views.DialectViewSet, basename='dialects')
 
 urlpatterns = [
     path('', include(router.urls)),

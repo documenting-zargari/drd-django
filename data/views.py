@@ -2,6 +2,7 @@ from django.http import JsonResponse
 from rest_framework import viewsets
 from data.models import Category, Dialect, Phrase, Sample, Source
 from data.serializers import CategorySerializer, DialectSerializer, PhraseSerializer, SampleListSerializer, SampleRetrieveSerializer, SourceSerializer
+from roma.views import ArangoModelViewSet
 
 class CategoryViewSet(viewsets.ModelViewSet):
     queryset = Category.objects.all()
@@ -54,6 +55,13 @@ def get_dialects(request):
     dialects = [dialect for dialect in cursor]
     return JsonResponse(dialects, safe=False)
 
-# class DialectViewSet(viewsets.ViewSet):
-#     serializer_class = DialectSerializer
-    
+class DialectViewSet(ArangoModelViewSet):
+    serializer_class = DialectSerializer
+    model = Dialect
+
+    def get_queryset(self):
+        db = self.request.arangodb
+        collection = db.collection('Dialects')
+        cursor = collection.find({'visible': "Yes"})
+        return [dialect for dialect in cursor]
+

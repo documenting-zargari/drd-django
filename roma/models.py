@@ -14,7 +14,7 @@ class ArangoModel:
             setattr(self, key, value)
     
     @classmethod
-    def get_db(cls):
+    def db(cls):
         """ Connect to the Arango database """
         client = ArangoClient()
         return client.db(
@@ -24,52 +24,45 @@ class ArangoModel:
         )
     
     @classmethod
-    def get_collection(cls):
+    def collection(cls):
         """ Get the collection for the model """
-        db = cls.get_db()
-        return db.collection(cls.collection_name)
+        if cls.collection_name is None:
+            raise ValueError("collection_name must be defined")
+        return cls.db().collection(cls.collection_name)
     
     def save(self):
-        """ Save the model to the database """
-        collection = self.get_collection()
-        data = self.__dict__.copy()
-        data.pop('_id', None)
-        data.pop('_rev', None)
+        data = self.to_dict()
         if self._key:
-            collection.update(data)
+            # If the document already exists, update it.
+            result = self.collection().update(data)
         else:
-            result = collection.insert(data)
+            # Insert a new document.
+            result = self.collection().insert(data)
             self._key = result['_key']
+        return result
     
     @classmethod
     def get(cls, key):
-        """ Get a single document from the collection by key """
-        collection = cls.get_collection()
-        document = collection.get(key)
-        return cls(**document) if document else None
+        # Returns a single document by _key.
+        doc = cls.collection().get(key)
+        return cls(**doc) if doc else None
     
     @classmethod
     def all(cls):
-        """ Get all documents from the collection """
-        collection = cls.get_collection()
-        for document in collection.all():
-            yield cls(**document)
-    
-    @classmethod
-    def filter(cls, **kwargs):
-        """ Filter documents in the collection """
-        collection = cls.get_collection()
-        query = "FOR doc IN {} FILTER".format(cls.collection_name)
-        conditions = [" doc.{} == @{}".format(k, k) for k in kwargs]
-        query += " AND".join(conditions) + " RETURN doc"
-
-        db = cls._get_db()
-        cursor = db.aql.execute(query, bind_vars=kwargs)
+        # Returns a list of all documents in the collection.
+        query = f"FOR doc IN {cls.collection_name} RETURN doc"
+        cursor = cls.db().aql.execute(query)
         return [cls(**doc) for doc in cursor]
-    
+
     def delete(self):
-        """Delete a document."""
         if not self._key:
-            raise ValueError("Cannot delete a document without a _key.")
-        collection = self._get_collection()
-        collection.delete(self._key)
+            raise Exception("Cannot delete an unsaved instance (missing _key)")
+        return self.collection().delete(self._key)
+
+    def to_dict(self):
+            # Convert the instance’s data to a dictionary.
+            data = {}
+            for key, value in self.__dict__.items():
+                # Optionally filter out any non–document fields.
+                data[key] = value
+            return data

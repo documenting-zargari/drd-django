@@ -7,4 +7,5 @@ urlpatterns = [
     path("samples/<str:pk>", views.SampleViewSet.as_view({'get': 'retrieve'}), name="sample-detail"),
     path('sources', views.SourceViewSet.as_view({'get': 'list'}), name='sources-list'),
     path("phrases/<str:sample>", views.PhraseViewSet.as_view({'get': 'list'}), name="phrases-list"),
+    path("dialects/", views.get_dialects, name="dialects-list"),
 ]

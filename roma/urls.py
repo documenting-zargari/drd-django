@@ -27,10 +27,12 @@ router.register(r'users', views.UserViewSet)
 router.register(r'samples', data_views.SampleViewSet)
 router.register(r'categories', data_views.CategoryViewSet)
 router.register(r'phrases', data_views.PhraseViewSet)
+# router.register(r'dialects', data_views.DialectViewSet)
 
 urlpatterns = [
     path('', include(router.urls)),
     path("admin/", admin.site.urls),
     path("api-auth/", include("rest_framework.urls", namespace="rest_framework")),
     path("api/token/", obtain_auth_token, name="api_token_auth"),
+    path("data/", include("data.urls")),
 ]

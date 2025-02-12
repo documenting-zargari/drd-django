@@ -1,6 +1,7 @@
+from django.http import JsonResponse
 from rest_framework import viewsets
-from data.models import Category, Phrase, Sample, Source
-from data.serializers import CategorySerializer, PhraseSerializer, SampleListSerializer, SampleRetrieveSerializer, SourceSerializer
+from data.models import Category, Dialect, Phrase, Sample, Source
+from data.serializers import CategorySerializer, DialectSerializer, PhraseSerializer, SampleListSerializer, SampleRetrieveSerializer, SourceSerializer
 
 class CategoryViewSet(viewsets.ModelViewSet):
     queryset = Category.objects.all()
@@ -41,3 +42,18 @@ class PhraseViewSet(viewsets.ReadOnlyModelViewSet):
         if sample is not None:
             return self.queryset.filter(sample__pk=sample)
         return None
+    
+def get_dialects(request):
+    db = request.arangodb
+    collection = db.collection('Dialects')
+    filter_param = request.GET.get('filter', None)
+    if filter_param:
+        cursor = collection.find({'country_code': filter_param})
+    else:
+        cursor = collection.all()
+    dialects = [dialect for dialect in cursor]
+    return JsonResponse(dialects, safe=False)
+
+# class DialectViewSet(viewsets.ViewSet):
+#     serializer_class = DialectSerializer
+    

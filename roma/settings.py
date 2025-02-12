@@ -53,7 +53,12 @@ MIDDLEWARE = [
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
+    'roma.middleware.arangodb_middleware.ArangoDBMiddleware',
 ]
+
+ARANGO_DB_NAME = 'rms'
+ARANGO_USERNAME = 'root'
+ARANGO_PASSWORD = 'blabla'
 
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:4200",

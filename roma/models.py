@@ -16,7 +16,7 @@ class ArangoModel:
     @classmethod
     def db(cls):
         """ Connect to the Arango database """
-        client = ArangoClient()
+        client = ArangoClient(hosts=settings.ARANGO_HOST)
         return client.db(
             settings.ARANGO_DB_NAME,
             username=settings.ARANGO_USERNAME,

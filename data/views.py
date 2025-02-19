@@ -3,6 +3,7 @@ from rest_framework import viewsets
 from data.models import Category, Dialect, Phrase, Sample, Source
 from data.serializers import CategorySerializer, DialectSerializer, PhraseSerializer, SampleListSerializer, SampleRetrieveSerializer, SourceSerializer
 from roma.views import ArangoModelViewSet
+from roma.models import ArangoModel
 
 class CategoryViewSet(viewsets.ModelViewSet):
     queryset = Category.objects.all()
@@ -38,8 +39,6 @@ class PhraseViewSet(viewsets.ReadOnlyModelViewSet):
 
     def get_queryset(self):
         sample = self.request.query_params.get('sample', None)
-        print("request", self.request.query_params)
-        print("sample", sample)
         if sample is not None:
             return self.queryset.filter(sample__pk=sample)
         return None

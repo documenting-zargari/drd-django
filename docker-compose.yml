@@ -1,0 +1,32 @@
+services:
+  django:
+    build: .
+    container_name: django_backend
+    restart: always
+    env_file:
+      - .env.prod
+    ports:
+      - "8000:8000"
+    depends_on:
+      - mysql
+    volumes:
+      - .:/app
+
+  mysql:
+    image: mysql:8
+    container_name: mysql_db
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: ahF4yaiS
+      MYSQL_ROOT_HOST: '%'
+      MYSQL_DATABASE: rms
+      MYSQL_USER: romani
+      MYSQL_PASSWORD: ahF4yaiS
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./mysql_data:/var/lib/mysql
+      - ./mysql-init:/docker-entrypoint-initdb.d  # Mount init.sql
+
+volumes:
+  mysql_data:

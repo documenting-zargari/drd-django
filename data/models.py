@@ -88,6 +88,7 @@ class Translation(models.Model):
     
     conjugated = models.BooleanField(null=True, blank=True)
     english = models.TextField(blank=True, null=True)
+    phrase_ref = models.IntegerField()
    
 class Phrase(models.Model):
     class Meta:

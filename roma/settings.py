@@ -11,6 +11,7 @@ https://docs.djangoproject.com/en/5.1/ref/settings/
 """
 
 from pathlib import Path
+import os
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -56,9 +57,10 @@ MIDDLEWARE = [
     'roma.middleware.arangodb_middleware.ArangoDBMiddleware',
 ]
 
-ARANGO_DB_NAME = 'rms'
-ARANGO_USERNAME = 'root'
-ARANGO_PASSWORD = 'blabla'
+ARANGO_DB_NAME = os.getenv('ARANGO_DB_NAME', 'rms')
+ARANGO_USERNAME = os.getenv('ARANGO_USERNAME', 'root')
+ARANGO_PASSWORD = os.getenv('ARANGO_PASSWORD', 'blabla')
+ARANGO_HOST = os.getenv('ARANGO_HOST', 'http://localhost:8529')
 
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:4200",
@@ -103,19 +105,19 @@ WSGI_APPLICATION = "roma.wsgi.application"
 DATABASES = {
     'data': {
         'ENGINE': 'django.db.backends.mysql',
-        'NAME': 'romani',
-        'USER': 'root',
-        'PASSWORD': '',
-        'HOST': 'localhost',
-        'PORT': '3306',
+        'NAME': os.getenv('MYSQL_DATA_NAME', 'romani'),
+        'USER': os.getenv('MYSQL_DATA_USER', 'root'),
+        'PASSWORD': os.getenv('MYSQL_DATA_PASSWORD', ''),
+        'HOST': os.getenv('MYSQL_DATA_HOST', 'localhost'),
+        'PORT': os.getenv('MYSQL_DATA_PORT', '3306'),
     },
     'default': {
         'ENGINE': 'django.db.backends.mysql',
-        'NAME': 'rms',
-        'USER': 'root',
-        'PASSWORD': '',
-        'HOST': 'localhost',
-        'PORT': '3306',
+        'NAME': os.getenv('MYSQL_DEFAULT_NAME', 'rms'),
+        'USER': os.getenv('MYSQL_DEFAULT_USER', 'root'),
+        'PASSWORD': os.getenv('MYSQL_DEFAULT_PASSWORD', ''),
+        'HOST': os.getenv('MYSQL_DEFAULT_HOST', 'localhost'),
+        'PORT': os.getenv('MYSQL_DEFAULT_PORT', '3306'),
     },
 }
 DATABASE_ROUTERS = ['roma.dbrouters.DBRouter',]

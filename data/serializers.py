@@ -10,9 +10,16 @@ class CategorySerializer(serializers.ModelSerializer):
                   'parent', 'path',)
 
 class SampleListSerializer(serializers.ModelSerializer):
+
     class Meta:
         model = Sample
-        fields = ('sample_ref', 'dialect_name', 'visible')
+        fields = ('sample_ref', 'dialect_name', 'visible', 'migrant',)
+
+    def to_representation(self, instance):
+        result = super().to_representation(instance)
+        result['migrant'] = True if instance.migrant == 'Yes' else False
+        return result
+
 
 class SampleRetrieveSerializer(serializers.ModelSerializer):
     class Meta:
@@ -35,10 +42,11 @@ class TranslationSerializer(serializers.ModelSerializer):
 
 class PhraseSerializer(serializers.ModelSerializer):
     translation = serializers.CharField(source='translation.english')
+    phrase_ref = serializers.CharField(source='translation.phrase_ref')
     # translation = TranslationSerializer(read_only=True)
     class Meta:
         model = Phrase
-        fields = ['id', 'sample', 'phrase', 'translation',]
+        fields = ['phrase_ref', 'sample', 'phrase', 'translation',]
 
 
     def to_representation(self, instance):

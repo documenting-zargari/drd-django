@@ -1,11 +1,13 @@
-from django.urls import path
+from django.urls import path, include
 from data import views
+from rest_framework import routers
+
+router = routers.DefaultRouter()
+router.register(r'samples', views.SampleViewSet)
+router.register(r'categories', views.CategoryViewSet)
+router.register(r'phrases/(?P<sample>[^/.]+)', views.PhraseViewSet, basename='phrases')
+router.register(r'dialects', views.DialectViewSet, basename='dialects')
 
 urlpatterns = [
-    # path('categories', views.CategoryViewSet.as_view({'get': 'list'}), name='categories-list'),
-    # path('samples', views.SampleViewSet.as_view({'get': 'list'}), name='samples-list'),
-    # path("samples/<str:pk>", views.SampleViewSet.as_view({'get': 'retrieve'}), name="sample-detail"),
-    # path('sources', views.SourceViewSet.as_view({'get': 'list'}), name='sources-list'),
-    # path("phrases/<str:sample>", views.PhraseViewSet.as_view({'get': 'list'}), name="phrases-list"),
-    # path("dialects/", views.get_dialects, name="dialects-list"),
+    path('', include(router.urls)),
 ]

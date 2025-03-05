@@ -3,7 +3,7 @@ from rest_framework import viewsets
 from data.models import Category, Dialect, Phrase, Sample, Source
 from data.serializers import CategorySerializer, DialectSerializer, PhraseSerializer, SampleListSerializer, SampleRetrieveSerializer, SourceSerializer
 from roma.views import ArangoModelViewSet
-from roma.models import ArangoModel
+
 
 class CategoryViewSet(viewsets.ModelViewSet):
     queryset = Category.objects.all()
@@ -38,29 +38,24 @@ class PhraseViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = PhraseSerializer
 
     def get_queryset(self):
-        sample = self.request.query_params.get('sample', None)
+        sample = self.kwargs.get('sample', None)
         if sample is not None:
             return self.queryset.filter(sample__pk=sample)
         return None
-    
-def get_dialects(request):
-    db = request.arangodb
-    collection = db.collection('Dialects')
-    filter_param = request.GET.get('filter', None)
-    if filter_param:
-        cursor = collection.find({'country_code': filter_param})
-    else:
-        cursor = collection.all()
-    dialects = [dialect for dialect in cursor]
-    return JsonResponse(dialects, safe=False)
 
 class DialectViewSet(ArangoModelViewSet):
     serializer_class = DialectSerializer
     model = Dialect
+    http_method_names = ['get', 'head', 'options'] # prevent post
 
     def get_queryset(self):
-        db = self.request.arangodb
-        collection = db.collection('Dialects')
-        cursor = collection.find({'visible': "Yes"})
-        return [dialect for dialect in cursor]
+        try:
+            db = self.request.arangodb
+            collection = db.collection(self.model.collection_name)
+            cursor = collection.find({'visible': "Yes"})
+            return [dialect for dialect in cursor]
+        except Exception as e:
+            return []
 
+    def create(self, request):
+        return JsonResponse({'error': 'Method not allowed'}, status=405)

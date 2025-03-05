@@ -23,7 +23,7 @@ class Sample(models.Model):
         return self.sample_ref
 
 class Dialect(ArangoModel):
-    collection_name = 'Dialects'
+    collection_name = 'Samples'
     
     def _str_(self):
         return self.sample_ref

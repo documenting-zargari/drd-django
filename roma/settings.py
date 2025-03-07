@@ -65,6 +65,8 @@ ARANGO_HOST = os.getenv('ARANGO_HOST', 'http://localhost:8529')
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:4200",
     "http://127.0.0.1:4200",
+    "http://127.0.0.1:8080",
+    "http://localhost:8080",
 ]
 CORS_ALLOW_CREDENTIALS = True
 

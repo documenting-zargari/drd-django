@@ -2,8 +2,8 @@
 FROM python:3.13-slim AS builder
 
 # Set environment variables
-ENV PYTHONDONTWRITEBYTECODE 1
-ENV PYTHONUNBUFFERED 1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
 
 # Set working directory
 WORKDIR /app
@@ -19,6 +19,12 @@ RUN apt-get update && apt-get install -y \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
+# Ensure symbolic links are created
+RUN ln -sf /usr/lib/x86_64-linux-gnu/libmariadb.so.3 /usr/lib/libmariadb.so.3 || true
+
+# Update the dynamic linker cache
+RUN ldconfig
+
 # Upgrade pip, setuptools, and wheel to avoid build issues
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
@@ -30,6 +36,17 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Stage 2: Production stage
 FROM python:3.13-slim
+
+# Install runtime dependencies for mysqlclient
+RUN apt-get update && apt-get install -y \
+    libmariadb3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Ensure symbolic links are created
+RUN ln -sf /usr/lib/x86_64-linux-gnu/libmariadb.so.3 /usr/lib/libmariadb.so.3 || true
+
+# Update the dynamic linker cache
+RUN ldconfig
 
 RUN useradd -m -r appuser && \
     mkdir /app && \
@@ -46,8 +63,8 @@ WORKDIR /app
 COPY --chown=appuser:appuser . . 
 
 # Set environment variables
-ENV PYTHONDONTWRITEBYTECODE 1
-ENV PYTHONUNBUFFERED 1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
 
 # Set user
 USER appuser

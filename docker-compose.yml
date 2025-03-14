@@ -29,4 +29,5 @@ services:
       - ./mysql-init:/docker-entrypoint-initdb.d  # Mount init.sql
 
 volumes:
-  mysql_data:
+  - mysql_data
+  - mysql-init

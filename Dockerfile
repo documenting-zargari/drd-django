@@ -1,6 +1,4 @@
-FROM python:3.11-slim
-
-WORKDIR /app
+FROM python:3.11-buster
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \

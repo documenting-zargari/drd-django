@@ -16,18 +16,24 @@ import os
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.1/howto/deployment/checklist/
 
-# SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = "django-insecure-q5qhkg3q2jlgygcn@3w6xmq#8=txu9jo=jw3zx--$x9+!__!n#"
+SECRET_KEY = os.environ.get("SECRET_KEY", "django-insecure-q5qhkg3q2jlgygcn@3w6xmq#8=txu9jo=jw3zx--$x9+!__!n#")
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+if os.environ.get("DEBUG"):
+    DEBUG = True
+else:
+    DEBUG = False
 
-ALLOWED_HOSTS = []
+ADD_ALLOWED_HOST = os.environ.get("ALLOWED_HOST", "*")
 
+ALLOWED_HOSTS = [
+    "127.0.0.1",
+    "0.0.0.0",
+    ADD_ALLOWED_HOST,
+]
 
 # Application definition
 
@@ -146,14 +152,19 @@ AUTH_PASSWORD_VALIDATORS = [
 # Internationalization
 # https://docs.djangoproject.com/en/5.1/topics/i18n/
 
-LANGUAGE_CODE = "en-us"
-
-TIME_ZONE = "UTC"
-
+# Localisation
+LANGUAGE_CODE = "en"
+TIME_ZONE = "CET"
 USE_I18N = True
-
+USE_L10N = True
 USE_TZ = True
 
+LOCALE_PATHS = (os.path.join(BASE_DIR, "locale"),)
+
+LANGUAGES = (
+    ("en", "English"),
+    ("de", "Deutsch"),
+)
 
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/5.1/howto/static-files/

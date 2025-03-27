@@ -26,7 +26,8 @@ RUN pip install -U pip \
     && pip install gunicorn --no-cache-dir
 COPY . /opt/app
 WORKDIR /opt/app
-RUN chown -R www-data:www-data /opt/app
+RUN chown -R www-data:www-data /opt/app && \
+    chmod +x /opt/app/start-server.sh
 
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1

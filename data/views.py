@@ -13,7 +13,7 @@ class CategoryViewSet(viewsets.ModelViewSet):
         parent_category = self.request.query_params.get('parent', None)
         if parent_category is not None:
             return self.queryset.filter(parent__pk=parent_category)
-        return self.queryset.filter(parent=None)
+        return self.queryset.all()
 
 class SampleViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = Sample.objects.all()

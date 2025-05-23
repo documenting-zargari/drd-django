@@ -68,7 +68,10 @@ ARANGO_USERNAME = os.getenv('ARANGO_USERNAME', 'root')
 ARANGO_PASSWORD = os.getenv('ARANGO_PASSWORD', 'blabla')
 ARANGO_HOST = os.getenv('ARANGO_HOST', 'http://localhost:8529')
 
-CORS_ALLOWED_ORIGINS = [
+
+ADD_ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS")
+
+ALLOWED_ORIGINS = [
     "http://localhost:4200",
     "http://127.0.0.1:4200",
     "http://127.0.0.1:8080",
@@ -77,7 +80,9 @@ CORS_ALLOWED_ORIGINS = [
     "http://127.0.0.1:8020",
     "http://localhost:8010",
     "http://localhost:8020",
+    ADD_ALLOWED_ORIGINS,
 ]
+
 CORS_ALLOW_CREDENTIALS = True
 
 REST_FRAMEWORK = {

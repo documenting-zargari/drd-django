@@ -83,6 +83,21 @@ CORS_ALLOWED_ORIGINS = [
     ADD_ALLOWED_ORIGINS,
 ]
 
+ADD_ALLOWED_ORIGINS = os.environ.get("CORS_ALLOWED_ORIGINS")
+CORS_ALLOWED_ORIGINS = [
+    "http://localhost:4200",
+    "http://127.0.0.1:4200",
+    "http://127.0.0.1:8080",
+    "http://localhost:8080",
+    "http://127.0.0.1:8010",
+    "http://127.0.0.1:8020",
+    "http://localhost:8010",
+    "http://localhost:8020",
+]
+
+if ADD_ALLOWED_ORIGINS:
+    CORS_ALLOWED_ORIGINS.extend(ADD_ALLOWED_ORIGINS.split(","))
+
 CORS_ALLOW_CREDENTIALS = True
 
 REST_FRAMEWORK = {

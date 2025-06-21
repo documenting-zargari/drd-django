@@ -2,27 +2,7 @@ from django.db import models
 from roma.models import ArangoModel
 
 # Create your models here.
-class Sample(models.Model):
-    class Meta:
-        db_table = 'samples'
-    
-    sample_ref = models.CharField(max_length=20, primary_key=True)
-    source_type = models.CharField(max_length=50, null=True)
-    dialect_group = models.IntegerField(null=True)
-    self_attrib_name = models.CharField(max_length=100, null=True)
-    dialect_name = models.CharField(max_length=100)
-    location = models.CharField(max_length=100, null=True)
-    country_code = models.CharField(max_length=5, null=True)
-    live = models.BooleanField(null=True)
-    longitude = models.CharField(max_length=10, null=True)
-    latitude = models.CharField(max_length=10, null=True)
-    visible = models.CharField(max_length=3, null=True)
-    migrant = models.CharField(max_length=3, null=True)
-
-    def _str_(self):
-        return self.sample_ref
-
-class Dialect(ArangoModel):
+class Sample(ArangoModel):
     collection_name = 'Samples'
     
     def _str_(self):
@@ -94,6 +74,6 @@ class Phrase(models.Model):
     class Meta:
         db_table = 'sample_phrases'
 
-    sample = models.ForeignKey(Sample, on_delete=models.CASCADE, db_column='sample')
+    sample_ref = models.CharField(max_length=100, db_column='sample', blank=True, null=True)
     phrase = models.CharField(max_length=225)
     translation = models.ForeignKey(Translation, on_delete=models.CASCADE, db_column='phrase_anchor')

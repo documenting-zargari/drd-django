@@ -19,15 +19,27 @@ class SourceViewSet(viewsets.ModelViewSet):
     queryset = Source.objects.all()
     serializer_class = SourceSerializer
 
+        # sample = self.kwargs.get('sample', None)
+        # if sample is not None:
+        #     return self.queryset.filter(sample__pk=sample)
+        # return None
 class PhraseViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = Phrase.objects.all()
     serializer_class = PhraseSerializer
+    model = Phrase
 
     def get_queryset(self):
-        sample = self.kwargs.get('sample', None)
-        if sample is not None:
-            return self.queryset.filter(sample__pk=sample)
-        return None
+        try:
+            sample = self.kwargs.get('sample', None)
+            if sample is not None:
+                breakpoint()
+                db = self.request.arangodb
+                collection = db.collection(Phrase.collection_name)
+                cursor = collection.find({'sample': sample})
+                return [phrase for phrase in cursor]
+            return []
+        except Exception as e:
+            print(f"Error fetching phrases: {e}")
+            return []
 
 class SampleViewSet(ArangoModelViewSet):
     serializer_class = SampleSerializer

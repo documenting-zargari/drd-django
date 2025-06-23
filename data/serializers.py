@@ -23,21 +23,15 @@ class TranslationSerializer(serializers.ModelSerializer):
         model = Translation
         fields = ['id', 'conjugated', 'english',]
 
-class PhraseSerializer(serializers.ModelSerializer):
-    translation = serializers.CharField(source='translation.english')
-    phrase_ref = serializers.CharField(source='translation.phrase_ref')
-    # translation = TranslationSerializer(read_only=True)
+class PhraseSerializer(ArangoModelSerializer):
     class Meta:
         model = Phrase
-        fields = ['phrase_ref', 'sample', 'phrase', 'translation',]
+        fields = ['phrase', 'phrase_ref', 'conjugated', 'english',]
 
-
-    def to_representation(self, instance):
-        result = super().to_representation(instance)
-        return OrderedDict([(key, result[key]) for key in result if result[key] is not None])
-        # return result['phrase']
 
 class SampleSerializer(ArangoModelSerializer):
+    coordinates = serializers.SerializerMethodField()
+    contact_languages = serializers.SerializerMethodField()
     class Meta:
         model = Sample
         fields = [
@@ -46,3 +40,8 @@ class SampleSerializer(ArangoModelSerializer):
             'country_code', 'live', 'coordinates',
             'visible', 'migrant', 'dialect_group', 'contact_languages',
         ]
+    def get_coordinates(self, obj):
+        return getattr(obj, 'coordinates', None)
+    
+    def get_contact_languages(self, obj):
+        return getattr(obj, 'contact_languages', None)

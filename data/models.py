@@ -70,10 +70,16 @@ class Translation(models.Model):
     english = models.TextField(blank=True, null=True)
     phrase_ref = models.IntegerField()
    
-class Phrase(models.Model):
-    class Meta:
-        db_table = 'sample_phrases'
+# class Phrase(models.Model):
+#     class Meta:
+#         db_table = 'sample_phrases'
 
-    sample_ref = models.CharField(max_length=100, db_column='sample', blank=True, null=True)
-    phrase = models.CharField(max_length=225)
-    translation = models.ForeignKey(Translation, on_delete=models.CASCADE, db_column='phrase_anchor')
+#     sample_ref = models.CharField(max_length=100, db_column='sample', blank=True, null=True)
+#     phrase = models.CharField(max_length=225)
+#     translation = models.ForeignKey(Translation, on_delete=models.CASCADE, db_column='phrase_anchor')
+    
+class Phrase(ArangoModel):
+    collection_name = 'Phrases'
+
+    def _str_(self):
+        return self.phrase

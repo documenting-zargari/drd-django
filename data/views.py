@@ -1,5 +1,6 @@
 from django.http import JsonResponse
 from rest_framework import viewsets
+from rest_framework.exceptions import NotFound
 from data.models import Category, Phrase, Sample, Source
 from data.serializers import CategorySerializer, SampleSerializer, PhraseSerializer, SourceSerializer
 from roma.views import ArangoModelViewSet
@@ -45,6 +46,13 @@ class SampleViewSet(ArangoModelViewSet):
     serializer_class = SampleSerializer
     model = Sample
     http_method_names = ['get', 'head', 'options'] # prevent post
+    
+    def get_object(self, pk):
+        # Override to use sample_ref instead of _key
+        instance = self.model.get_by_field('sample_ref', pk)
+        if not instance:
+            raise NotFound(detail="Sample not found")
+        return instance
 
     def get_queryset(self):
         try:
@@ -57,3 +65,5 @@ class SampleViewSet(ArangoModelViewSet):
 
     def create(self, request):
         return JsonResponse({'error': 'Method not allowed'}, status=405)
+    
+    

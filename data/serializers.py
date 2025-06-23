@@ -41,7 +41,7 @@ class SampleSerializer(ArangoModelSerializer):
             'visible', 'migrant', 'dialect_group', 'contact_languages',
         ]
     def get_coordinates(self, obj):
-        return obj['coordinates'] if 'coordinates' in obj else None
+        return getattr(obj, 'coordinates', None)
     
     def get_contact_languages(self, obj):
-        return obj['contact_languages'] if 'contact_languages' in obj else None
+        return getattr(obj, 'contact_languages', None)

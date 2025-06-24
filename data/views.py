@@ -50,14 +50,25 @@ class PhraseViewSet(viewsets.ReadOnlyModelViewSet):
             db = self.request.arangodb
             collection = db.collection(Phrase.collection_name)
             if sample is None:
-                # Return all phrases when no sample parameter
-                cursor = collection.find({})
+                # Return no phrases when no sample parameter
+                raise NotFound(detail="Sample parameter is required to fetch phrases")
             else:
                 cursor = collection.find({'sample': sample})
             return [phrase for phrase in cursor]
+        except NotFound:
+            # Re-raise NotFound exceptions so they are handled by DRF
+            raise
         except Exception as e:
             print(f"Error fetching phrases: {e}")
             return []
+    
+    def retrieve(self, request, pk=None):
+        # Override retrieve to return list of phrases for the sample (pk is the sample_ref)
+        # Set the sample parameter in kwargs for get_queryset to use
+        self.kwargs['sample'] = pk
+        queryset = self.get_queryset()
+        serializer = self.serializer_class(queryset, many=True, context={'request': request})
+        return Response(serializer.data)
 
 class SampleViewSet(ArangoModelViewSet):
     serializer_class = SampleSerializer
@@ -100,8 +111,7 @@ class AnswerViewSet(ArangoModelViewSet):
             db = self.request.arangodb
             
             if id is None:
-                # Return all answers when no question parameter
-                return []
+                raise NotFound(detail="Question ID is required to fetch answers")
             else :
                 id = int(id)
             
@@ -120,8 +130,10 @@ class AnswerViewSet(ArangoModelViewSet):
             aql = aql.format(filter_clause=filter_clause)
             cursor = db.aql.execute(aql, bind_vars=bind_vars)
             return [doc for doc in cursor]
-        
+        except NotFound:
+            raise
         except Exception as e:
+            print(f"Error fetching answers: {e}")
             return []
 
     def retrieve(self, request, pk=None):

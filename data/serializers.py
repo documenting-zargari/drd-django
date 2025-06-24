@@ -4,9 +4,39 @@ from data.models import Category, Phrase, Sample, Source, Translation
 from roma.serializers import ArangoModelSerializer
 
 class CategorySerializer(ArangoModelSerializer):
+    has_children = serializers.SerializerMethodField()
+    drill = serializers.SerializerMethodField()
+    
     class Meta:
         model = Category
-        fields = ('id', 'name', 'parent_id', 'hierarchy', 'hierarchy_ids',)
+        fields = ('id', 'name', 'parent_id', 'hierarchy', 'hierarchy_ids', 'has_children', 'drill')
+    
+    def get_has_children(self, obj):
+        request = self.context.get('request')
+        if not request or not hasattr(request, 'arangodb'):
+            return False
+        
+        db = request.arangodb
+        collection = db.collection(self.Meta.model.collection_name)
+        cursor = collection.find({'parent_id': obj['id']}, limit=1)
+        return len([child for child in cursor]) > 0
+    
+    def get_drill(self, obj):
+        request = self.context.get('request')
+        if not request:
+            return None
+        
+        # Only include URL if category has children
+        if self.get_has_children(obj):
+            return request.build_absolute_uri(f"/categories/?parent_id={obj['id']}")
+        return None
+    
+    def to_representation(self, instance):
+        result = super().to_representation(instance)
+        # Remove drill field if it's null
+        if result.get('drill') is None:
+            result.pop('drill', None)
+        return result
 
 class SourceSerializer(serializers.ModelSerializer): 
     class Meta:

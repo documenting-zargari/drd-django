@@ -8,23 +8,6 @@ class Sample(ArangoModel):
     def _str_(self):
         return self.sample_ref
 
-"""
-class Category(models.Model):
-    class Meta:
-        db_table = 'categories'
-        verbose_name_plural = 'Categories'
-    
-    category_id = models.AutoField(primary_key=True)
-    category_name = models.CharField(max_length=50)
-    category_description = models.TextField(blank=True, null=True,)
-    category_image = models.CharField(max_length=100, blank=True, null=True)
-    parent = models.ForeignKey('self', on_delete=models.CASCADE, blank=True, null=True, db_column='parent_category')
-    path = models.CharField(max_length=200, blank=True, null=True)
-
-    def _str_(self):
-        return self.category_name
-"""
-
 class Category(ArangoModel):
     collection_name = 'Categories'
 

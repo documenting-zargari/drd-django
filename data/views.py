@@ -6,24 +6,14 @@ from data.serializers import CategorySerializer, SampleSerializer, PhraseSeriali
 from roma.views import ArangoModelViewSet
 
 
-class CategoryViewSet(viewsets.ModelViewSet):
-    queryset = Category.objects.all()
+class CategoryViewSet(ArangoModelViewSet):
+    model = Category
     serializer_class = CategorySerializer
-
-    def get_queryset(self):
-        parent_category = self.request.query_params.get('parent', None)
-        if parent_category is not None:
-            return self.queryset.filter(parent__pk=parent_category)
-        return self.queryset.filter(parent=None)
 
 class SourceViewSet(viewsets.ModelViewSet):
     queryset = Source.objects.all()
     serializer_class = SourceSerializer
 
-        # sample = self.kwargs.get('sample', None)
-        # if sample is not None:
-        #     return self.queryset.filter(sample__pk=sample)
-        # return None
 class PhraseViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = PhraseSerializer
     model = Phrase

@@ -8,6 +8,7 @@ class Sample(ArangoModel):
     def _str_(self):
         return self.sample_ref
 
+"""
 class Category(models.Model):
     class Meta:
         db_table = 'categories'
@@ -22,6 +23,13 @@ class Category(models.Model):
 
     def _str_(self):
         return self.category_name
+"""
+
+class Category(ArangoModel):
+    collection_name = 'Categories'
+
+    def _str_(self):
+        return self.name
 
 class Source(models.Model):
     class Meta:

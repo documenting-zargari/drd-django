@@ -3,11 +3,10 @@ from rest_framework import serializers
 from data.models import Category, Phrase, Sample, Source, Translation
 from roma.serializers import ArangoModelSerializer
 
-class CategorySerializer(serializers.ModelSerializer):
+class CategorySerializer(ArangoModelSerializer):
     class Meta:
         model = Category
-        fields = ('category_id', 'category_name', 'category_description', 
-                  'parent', 'path',)
+        fields = ('id', 'name', 'parent_id', 'hierarchy', 'hierarchy_ids',)
 
 class SourceSerializer(serializers.ModelSerializer): 
     class Meta:

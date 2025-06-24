@@ -51,7 +51,7 @@ class ArangoModel:
     def get_by_field(cls, field_name, value):
         # Returns a single document by any field.
         query = f"FOR doc IN {cls.collection_name} FILTER doc.{field_name} == @value RETURN doc"
-        cursor = cls.db().aql.execute(query, bind_vars={'value': int(value)})
+        cursor = cls.db().aql.execute(query, bind_vars={'value': value})
         docs = list(cursor)
         return cls(**docs[0]) if docs else None
     

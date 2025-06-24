@@ -2,8 +2,8 @@ from django.http import JsonResponse
 from rest_framework import viewsets
 from rest_framework.response import Response
 from rest_framework.exceptions import NotFound
-from data.models import Category, Phrase, Sample, Source
-from data.serializers import CategorySerializer, SampleSerializer, PhraseSerializer, SourceSerializer
+from data.models import Answer, Category, Phrase, Sample, Source
+from data.serializers import AnswerSerializer, CategorySerializer, SampleSerializer, PhraseSerializer, SourceSerializer
 from roma.views import ArangoModelViewSet
 
 
@@ -16,15 +16,11 @@ class CategoryViewSet(ArangoModelViewSet):
         parent_id = self.request.query_params.get('parent_id')
         db = self.request.arangodb
         collection = db.collection(self.model.collection_name)
-        
-        if parent_id:
-            # Filter by parent_id query parameter
-            cursor = collection.find({'parent_id': int(parent_id)})
-        else:
-            # Default to root categories (parent_id = 1)
-            cursor = collection.find({'parent_id': 1})
-        
-        return [category for category in cursor]
+        exclude_ids = [2, 3]
+        id = int(parent_id) if parent_id else 1
+        categories_cursor = collection.find({'parent_id': id})
+        return [c for c in categories_cursor if c['id'] not in exclude_ids]
+
 
     def get_object(self, pk):
         # Override to use id instead of _key
@@ -35,12 +31,12 @@ class CategoryViewSet(ArangoModelViewSet):
     
     def list(self, request, *args, **kwargs):
         queryset = self.get_queryset()
-        serializer = self.serializer_class(queryset, many=True, context={'request': request})
+        serializer = self.serializer_class(queryset, many=True, context={'request': request}) # serializer needs request
         return Response(serializer.data)
 
-class SourceViewSet(viewsets.ModelViewSet):
-    queryset = Source.objects.all()
-    serializer_class = SourceSerializer
+# class SourceViewSet(viewsets.ModelViewSet):
+#     queryset = Source.objects.all()
+#     serializer_class = SourceSerializer
     
     
 
@@ -51,13 +47,14 @@ class PhraseViewSet(viewsets.ReadOnlyModelViewSet):
     def get_queryset(self):
         try:
             sample = self.kwargs.get('sample', None)
-            if sample is not None:
-                breakpoint()
-                db = self.request.arangodb
-                collection = db.collection(Phrase.collection_name)
+            db = self.request.arangodb
+            collection = db.collection(Phrase.collection_name)
+            if sample is None:
+                # Return all phrases when no sample parameter
+                cursor = collection.find({})
+            else:
                 cursor = collection.find({'sample': sample})
-                return [phrase for phrase in cursor]
-            return []
+            return [phrase for phrase in cursor]
         except Exception as e:
             print(f"Error fetching phrases: {e}")
             return []
@@ -86,4 +83,51 @@ class SampleViewSet(ArangoModelViewSet):
     def create(self, request):
         return JsonResponse({'error': 'Method not allowed'}, status=405)
     
-    
+
+class SourceViewSet(ArangoModelViewSet):
+    serializer_class = SourceSerializer
+    model = Source
+    http_method_names = ['get', 'head', 'options']  # prevent post
+
+class AnswerViewSet(ArangoModelViewSet):
+    serializer_class = AnswerSerializer
+    model = Answer
+    http_method_names = ['get', 'head', 'options']  # exclude PUT, POST, DELETE
+
+    def get_queryset(self):
+        try:
+            id = self.kwargs.get('question', None)
+            db = self.request.arangodb
+            
+            if id is None:
+                # Return all answers when no question parameter
+                return []
+            else :
+                id = int(id)
+            
+            # get one question
+            question = db.collection("ResearchQuestions").find({'id': id}).next()
+            if not question:
+                raise NotFound(detail=f"Question {id} not found")
+            sample_ref = self.request.query_params.get('sample', None)
+            # Use AQL to traverse the GivesAnswer edge and get answers, with optional sample_ref filter
+            aql = "FOR v, e, p IN 1..1 OUTBOUND @question_id GivesAnswer {filter_clause} RETURN v"
+            filter_clause = ""
+            bind_vars = {'question_id': question['_id']}
+            if sample_ref:
+                filter_clause = "FILTER v.sample == @sample"
+                bind_vars['sample'] = sample_ref
+            aql = aql.format(filter_clause=filter_clause)
+            cursor = db.aql.execute(aql, bind_vars=bind_vars)
+            return [doc for doc in cursor]
+        
+        except Exception as e:
+            return []
+
+    def retrieve(self, request, pk=None):
+        # Override retrieve to return list of answers for the question (pk is question ID)
+        # Set the question parameter in kwargs for get_queryset to use
+        self.kwargs['question'] = pk
+        queryset = self.get_queryset()
+        serializer = self.serializer_class(queryset, many=True, context={'request': request})
+        return Response(serializer.data)

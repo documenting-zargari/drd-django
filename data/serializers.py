@@ -1,15 +1,27 @@
 from collections import OrderedDict
 from rest_framework import serializers
-from data.models import Category, Phrase, Sample, Source, Translation
+from data.models import Answer, Category, Phrase, Sample, Source, Translation
 from roma.serializers import ArangoModelSerializer
 
 class CategorySerializer(ArangoModelSerializer):
     has_children = serializers.SerializerMethodField()
     drill = serializers.SerializerMethodField()
+    hierarchy = serializers.SerializerMethodField()
     
     class Meta:
         model = Category
         fields = ('id', 'name', 'parent_id', 'hierarchy', 'hierarchy_ids', 'has_children', 'drill')
+    
+    def get_hierarchy(self, obj):
+        # this contains a json string - return a list
+        hierarchy = obj.get('hierarchy', [])
+        if isinstance(hierarchy, str):
+            try:
+                hierarchy = eval(hierarchy)  # Convert string representation to list
+            except Exception as e:
+                print(f"Error parsing hierarchy: {e}")
+                hierarchy = []
+        return hierarchy
     
     def get_has_children(self, obj):
         request = self.context.get('request')
@@ -74,3 +86,18 @@ class SampleSerializer(ArangoModelSerializer):
     
     def get_contact_languages(self, obj):
         return getattr(obj, 'contact_languages', None)
+
+class SourceSerializer(ArangoModelSerializer):
+    class Meta:
+        model = Source
+        fields = '__all__'
+        
+class AnswerSerializer(ArangoModelSerializer):
+    class Meta:
+        model = Answer
+        fields = '__all__'
+    
+    def to_representation(self, instance):
+        # Return all attributes from the ArangoDB document, excluding certain fields
+        exclude_fields = ['_rev', '_key']  # Add fields you want to exclude
+        return {k: v for k, v in instance.items() if k not in exclude_fields}

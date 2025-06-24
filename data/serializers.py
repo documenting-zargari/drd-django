@@ -69,6 +69,10 @@ class PhraseSerializer(ArangoModelSerializer):
         model = Phrase
         fields = ['phrase', 'phrase_ref', 'conjugated', 'english',]
 
+    def to_representation(self, instance):
+        # Return all attributes from the ArangoDB document, excluding certain fields
+        exclude_fields = ['_rev', '_key']  # Add fields you want to exclude
+        return {k: v for k, v in instance.items() if k not in exclude_fields}
 
 class SampleSerializer(ArangoModelSerializer):
     coordinates = serializers.SerializerMethodField()

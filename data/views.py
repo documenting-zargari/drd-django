@@ -55,20 +55,18 @@ class CategoryViewSet(ArangoModelViewSet):
         if not db:
             return Response({'error': 'Database not available'}, status=500)
         
-        collection = db.collection(self.model.collection_name)
-        
-        # Use case-insensitive regex search for performance
-        # AQL supports regex with case-insensitive flag
-        aql_query = """
-        FOR doc IN CategorySearch
-        SEARCH ANALYZER(LIKE(doc.name, CONCAT("%", TOKENS(@search_pattern, "text_en")[0], "%")), "text_en")
-        RETURN {  
-            "id": doc.id,
-            "name": doc.name,
-            "hierarchy": doc.hierarchy,
-            "is_leaf": doc.is_leaf 
-        }
-        """
+        # # Use case-insensitive regex search for performance
+        # # AQL supports regex with case-insensitive flag
+        # aql_query = """
+        # FOR doc IN CategorySearch
+        # SEARCH ANALYZER(LIKE(doc.name, CONCAT("%", TOKENS(@search_pattern, "text_en")[0], "%")), "text_en")
+        # RETURN {  
+        #     "id": doc.id,
+        #     "name": doc.name,
+        #     "hierarchy": doc.hierarchy,
+        #     "is_leaf": doc.is_leaf 
+        # }
+        # """
         # Without search view, use regex directly
         search_pattern = f".*{query}.*"
         aql_query = """
@@ -79,6 +77,7 @@ class CategoryViewSet(ArangoModelViewSet):
             "id": doc.id,
             "name": doc.name,
             "hierarchy": doc.hierarchy,
+            "parent_id": doc.parent_id,
             "is_leaf": doc.is_leaf 
         }
         """
@@ -99,7 +98,8 @@ class CategoryViewSet(ArangoModelViewSet):
                 results.append({
                     'id': doc['id'],
                     'name': doc['name'],
-                    'hierarchy': hierarchy[1:-1] if len(hierarchy) > 2 else [],
+                    'hierarchy': hierarchy if len(hierarchy) > 2 else [],
+                    'parent_id': doc['parent_id'],
                     'has_children': not doc.get('is_leaf', False),
                 })
             

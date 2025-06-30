@@ -2,6 +2,7 @@ from django.http import JsonResponse
 from rest_framework import viewsets
 from rest_framework.response import Response
 from rest_framework.exceptions import NotFound
+from rest_framework.decorators import action
 from data.models import Answer, Category, Phrase, Sample, Source
 from data.serializers import AnswerSerializer, CategorySerializer, SampleSerializer, PhraseSerializer, SourceSerializer
 from roma.views import ArangoModelViewSet
@@ -43,6 +44,68 @@ class CategoryViewSet(ArangoModelViewSet):
         instance = self.get_object(pk)
         serializer = self.serializer_class(instance, context={'request': request})
         return Response(serializer.data)
+    
+    @action(detail=False, methods=['get'])
+    def search(self, request):
+        query = request.query_params.get('q', '').strip()
+        if not query or len(query) < 2:
+            return Response([])
+        
+        db = request.arangodb
+        if not db:
+            return Response({'error': 'Database not available'}, status=500)
+        
+        collection = db.collection(self.model.collection_name)
+        
+        # Use case-insensitive regex search for performance
+        # AQL supports regex with case-insensitive flag
+        aql_query = """
+        FOR doc IN CategorySearch
+        SEARCH ANALYZER(LIKE(doc.name, CONCAT("%", TOKENS(@search_pattern, "text_en")[0], "%")), "text_en")
+        RETURN {  
+            "id": doc.id,
+            "name": doc.name,
+            "hierarchy": doc.hierarchy,
+            "is_leaf": doc.is_leaf 
+        }
+        """
+        # Without search view, use regex directly
+        search_pattern = f".*{query}.*"
+        aql_query = """
+        FOR doc IN Categories
+        FILTER REGEX_TEST(doc.name, @search_pattern, 'i')
+        SORT doc.id ASC
+        RETURN {  
+            "id": doc.id,
+            "name": doc.name,
+            "hierarchy": doc.hierarchy,
+            "is_leaf": doc.is_leaf 
+        }
+        """
+
+        try:
+            cursor = db.aql.execute(aql_query, bind_vars={'search_pattern': search_pattern})
+            print("Compiled AQL query:", aql_query)
+            print("Bind variables:", {'search_pattern': search_pattern})
+            results = []
+            for doc in cursor:
+                # Parse hierarchy if it's stored as string
+                hierarchy = doc.get('hierarchy', [])
+                if isinstance(hierarchy, str):
+                    try:
+                        hierarchy = eval(hierarchy)
+                    except:
+                        hierarchy = []
+                results.append({
+                    'id': doc['id'],
+                    'name': doc['name'],
+                    'hierarchy': hierarchy[1:-1] if len(hierarchy) > 2 else [],
+                    'has_children': not doc.get('is_leaf', False),
+                })
+            
+            return Response(results)
+        except Exception as e:
+            return Response({'error': f'Search failed: {str(e)}'}, status=500)
 
 # class SourceViewSet(viewsets.ModelViewSet):
 #     queryset = Source.objects.all()

@@ -14,7 +14,7 @@ class CategorySerializer(ArangoModelSerializer):
     
     def get_hierarchy(self, obj):
         # this contains a json string - return a list
-        hierarchy = obj.get('hierarchy', [])
+        hierarchy = getattr(obj, 'hierarchy', [])
         if isinstance(hierarchy, str):
             try:
                 hierarchy = eval(hierarchy)  # Convert string representation to list

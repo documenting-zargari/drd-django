@@ -4,6 +4,8 @@ from data.models import Answer, Category, Phrase, Sample, Source, Translation
 from roma.serializers import ArangoModelSerializer
 
 class CategorySerializer(ArangoModelSerializer):
+    id = serializers.IntegerField()
+    parent_id = serializers.IntegerField()
     has_children = serializers.SerializerMethodField()
     drill = serializers.SerializerMethodField()
     hierarchy = serializers.SerializerMethodField()
@@ -14,7 +16,12 @@ class CategorySerializer(ArangoModelSerializer):
     
     def get_hierarchy(self, obj):
         # this contains a json string - return a list
-        hierarchy = getattr(obj, 'hierarchy', [])
+        # Handle both dict objects (from ArangoDB) and model objects
+        if isinstance(obj, dict):
+            hierarchy = obj.get('hierarchy', [])
+        else:
+            hierarchy = getattr(obj, 'hierarchy', [])
+            
         if isinstance(hierarchy, str):
             try:
                 hierarchy = eval(hierarchy)  # Convert string representation to list
@@ -28,9 +35,15 @@ class CategorySerializer(ArangoModelSerializer):
         if not request or not hasattr(request, 'arangodb'):
             return False
         
+        # Handle both dict objects (from ArangoDB) and model objects
+        if isinstance(obj, dict):
+            obj_id = obj['id']
+        else:
+            obj_id = obj.id
+            
         db = request.arangodb
         collection = db.collection(self.Meta.model.collection_name)
-        cursor = collection.find({'parent_id': obj['id']}, limit=1)
+        cursor = collection.find({'parent_id': obj_id}, limit=1)
         return len([child for child in cursor]) > 0
     
     def get_drill(self, obj):

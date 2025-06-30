@@ -23,15 +23,25 @@ class CategoryViewSet(ArangoModelViewSet):
 
 
     def get_object(self, pk):
-        # Override to use id instead of _key
-        instance = self.model.get_by_field('id', pk)
-        if not instance:
+        # Override to use id instead of _key and return raw dict like list method
+        db = self.request.arangodb
+        collection = db.collection(self.model.collection_name)
+        if isinstance(pk, str) and pk.isdigit():
+            pk = int(pk)
+        cursor = collection.find({'id': pk}, limit=1)
+        docs = list(cursor)
+        if not docs:
             raise NotFound(detail="Category not found")
-        return instance
+        return docs[0]
     
     def list(self, request, *args, **kwargs):
         queryset = self.get_queryset()
         serializer = self.serializer_class(queryset, many=True, context={'request': request}) # serializer needs request
+        return Response(serializer.data)
+    
+    def retrieve(self, request, pk=None):
+        instance = self.get_object(pk)
+        serializer = self.serializer_class(instance, context={'request': request})
         return Response(serializer.data)
 
 # class SourceViewSet(viewsets.ModelViewSet):

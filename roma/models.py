@@ -50,6 +50,8 @@ class ArangoModel:
     @classmethod
     def get_by_field(cls, field_name, value):
         # Returns a single document by any field.
+        if isinstance(value, str) and value.isdigit():
+            value = int(value)
         query = f"FOR doc IN {cls.collection_name} FILTER doc.{field_name} == @value RETURN doc"
         cursor = cls.db().aql.execute(query, bind_vars={'value': value})
         docs = list(cursor)

@@ -249,6 +249,17 @@ class SampleViewSet(ArangoModelViewSet):
         except Exception as e:
             return []
 
+    def list(self, request, *args, **kwargs):
+        """
+        List all visible samples with proper context for serializer.
+        
+        Passes view context to serializer so it can detect list vs detail operations
+        and conditionally exclude contact_languages from list output.
+        """
+        queryset = self.get_queryset()
+        serializer = self.serializer_class(queryset, many=True, context={'request': request, 'view': self})
+        return Response(serializer.data)
+
     def create(self, request):
         return JsonResponse({'error': 'Method not allowed'}, status=405)
     

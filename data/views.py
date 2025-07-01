@@ -54,20 +54,7 @@ class CategoryViewSet(ArangoModelViewSet):
         db = request.arangodb
         if not db:
             return Response({'error': 'Database not available'}, status=500)
-        
-        # # Use case-insensitive regex search for performance
-        # # AQL supports regex with case-insensitive flag
-        # aql_query = """
-        # FOR doc IN CategorySearch
-        # SEARCH ANALYZER(LIKE(doc.name, CONCAT("%", TOKENS(@search_pattern, "text_en")[0], "%")), "text_en")
-        # RETURN {  
-        #     "id": doc.id,
-        #     "name": doc.name,
-        #     "hierarchy": doc.hierarchy,
-        #     "is_leaf": doc.is_leaf 
-        # }
-        # """
-        # Without search view, use regex directly
+
         search_pattern = f".*{query}.*"
         aql_query = """
         FOR doc IN Categories
@@ -84,8 +71,6 @@ class CategoryViewSet(ArangoModelViewSet):
 
         try:
             cursor = db.aql.execute(aql_query, bind_vars={'search_pattern': search_pattern})
-            print("Compiled AQL query:", aql_query)
-            print("Bind variables:", {'search_pattern': search_pattern})
             results = []
             for doc in cursor:
                 # Parse hierarchy if it's stored as string
@@ -178,41 +163,90 @@ class AnswerViewSet(ArangoModelViewSet):
     model = Answer
     http_method_names = ['get', 'head', 'options']  # exclude PUT, POST, DELETE
 
+    def get_object(self, pk):
+        # Override to use answer ID instead of _key
+        db = self.request.arangodb
+        collection = db.collection(self.model.collection_name)
+        if isinstance(pk, str) and pk.isdigit():
+            pk = int(pk)
+        cursor = collection.find({'id': pk}, limit=1)
+        docs = list(cursor)
+        if not docs:
+            raise NotFound(detail="Answer not found")
+        return docs[0]
+
     def get_queryset(self):
+        """Get answers filtered by question IDs and optionally by sample references"""
         try:
-            id = self.kwargs.get('question', None)
-            db = self.request.arangodb
+            question_ids = self.request.GET.getlist('q')
+            sample_refs = self.request.GET.getlist('s')
             
-            if id is None:
-                raise NotFound(detail="Question ID is required to fetch answers")
-            else :
-                id = int(id)
+            if not question_ids:
+                raise NotFound(detail="At least one question ID (q parameter) is required")
             
-            # get one question
-            question = db.collection("ResearchQuestions").find({'id': id}).next()
-            if not question:
-                raise NotFound(detail=f"Question {id} not found")
-            sample_ref = self.request.query_params.get('sample', None)
-            # Use AQL to traverse the GivesAnswer edge and get answers, with optional sample_ref filter
-            aql = "FOR v, e, p IN 1..1 OUTBOUND @question_id GivesAnswer {filter_clause} RETURN v"
-            filter_clause = ""
-            bind_vars = {'question_id': question['_id']}
-            if sample_ref:
-                filter_clause = "FILTER v.sample == @sample"
-                bind_vars['sample'] = sample_ref
-            aql = aql.format(filter_clause=filter_clause)
-            cursor = db.aql.execute(aql, bind_vars=bind_vars)
-            return [doc for doc in cursor]
+            return self.get_answers_for_questions(question_ids, sample_refs)
         except NotFound:
             raise
         except Exception as e:
             print(f"Error fetching answers: {e}")
             return []
 
-    def retrieve(self, request, pk=None):
-        # Override retrieve to return list of answers for the question (pk is question ID)
-        # Set the question parameter in kwargs for get_queryset to use
-        self.kwargs['question'] = pk
-        queryset = self.get_queryset()
-        serializer = self.serializer_class(queryset, many=True, context={'request': request})
-        return Response(serializer.data)
+    def validate_questions(self, question_ids):
+        """Validate all question IDs exist"""
+        db = self.request.arangodb
+        aql = "FOR q IN ResearchQuestions FILTER q.id IN @question_ids RETURN q.id"
+        cursor = db.aql.execute(aql, bind_vars={'question_ids': question_ids})
+        existing_questions = [qid for qid in cursor]
+        missing_questions = set(question_ids) - set(existing_questions)
+        if missing_questions:
+            raise NotFound(detail=f"Questions not found: {sorted(missing_questions)}")
+
+    def validate_samples(self, sample_refs):
+        """Validate all sample references exist"""
+        db = self.request.arangodb
+        aql = "FOR s IN Samples FILTER s.sample_ref IN @sample_refs RETURN s.sample_ref"
+        cursor = db.aql.execute(aql, bind_vars={'sample_refs': sample_refs})
+        existing_samples = [ref for ref in cursor]
+        missing_samples = set(sample_refs) - set(existing_samples)
+        if missing_samples:
+            raise NotFound(detail=f"Samples not found: {sorted(missing_samples)}")
+
+    def get_answers_for_questions(self, question_ids, sample_refs=None):
+        """Helper method to get answers for multiple question IDs and sample references"""
+        db = self.request.arangodb
+        if not question_ids:
+            raise NotFound(detail="At least one question ID is required")
+        try:
+            # Convert to integers
+            question_ids = [int(qid) for qid in question_ids]
+            
+            # Validate all inputs upfront
+            self.validate_questions(question_ids)
+            if sample_refs:
+                self.validate_samples(sample_refs)
+            
+            # Build single AQL query to get all answers for all questions
+            sample_filter = ""
+            bind_vars = {'question_ids': question_ids}
+            
+            if sample_refs:
+                sample_filter = "FILTER answer.sample IN @samples"
+                bind_vars['samples'] = sample_refs
+
+            aql = f"""
+            FOR question IN ResearchQuestions
+              FILTER question.id IN @question_ids
+              FOR answer IN 1..1 OUTBOUND question GivesAnswer
+                {sample_filter}
+                RETURN MERGE(answer, {{question_id: question.id}})
+            """
+            
+            cursor = db.aql.execute(aql, bind_vars=bind_vars)
+            answers = [doc for doc in cursor]
+            
+            return answers
+        except NotFound:
+            raise
+        except Exception as e:
+            print(f"Error fetching answers: {e}")
+            return []

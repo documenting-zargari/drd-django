@@ -99,10 +99,28 @@ class SampleSerializer(ArangoModelSerializer):
             'visible', 'migrant', 'dialect_group', 'contact_languages',
         ]
     def get_coordinates(self, obj):
-        return getattr(obj, 'coordinates', None)
+        # Handle both dict objects (from ArangoDB) and model objects
+        if isinstance(obj, dict):
+            return obj.get('coordinates', None)
+        else:
+            return getattr(obj, 'coordinates', None)
     
     def get_contact_languages(self, obj):
-        return getattr(obj, 'contact_languages', None)
+        # Handle both dict objects (from ArangoDB) and model objects
+        if isinstance(obj, dict):
+            return obj.get('contact_languages', None)
+        else:
+            return getattr(obj, 'contact_languages', None)
+    
+    def to_representation(self, instance):
+        result = super().to_representation(instance)
+        
+        # Remove contact_languages from list view only, keep it for detail view
+        view = self.context.get('view')
+        if view and hasattr(view, 'action') and view.action == 'list':
+            result.pop('contact_languages', None)
+        
+        return result
 
 class SourceSerializer(ArangoModelSerializer):
     class Meta:

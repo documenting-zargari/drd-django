@@ -9,6 +9,18 @@ from roma.views import ArangoModelViewSet
 
 
 class CategoryViewSet(ArangoModelViewSet):
+    """
+    API endpoint for browsing categories in a hierarchical structure.
+    
+    Categories are organized in a tree structure with parent-child relationships.
+    Use the parent_id parameter to navigate the hierarchy.
+    
+    Available endpoints:
+    - GET /categories/ - List root categories (parent_id=1 by default)
+    - GET /categories/?parent_id=<id> - List child categories
+    - GET /categories/<id>/ - Retrieve specific category
+    - GET /categories/search/?q=<term> - Search categories by name
+    """
     model = Category
     serializer_class = CategorySerializer
     http_method_names = ['get', 'head', 'options'] # prevent post
@@ -36,17 +48,53 @@ class CategoryViewSet(ArangoModelViewSet):
         return docs[0]
     
     def list(self, request, *args, **kwargs):
+        """
+        List categories by parent relationship.
+        
+        Query Parameters:
+        - parent_id (optional): ID of parent category to list children for.
+                               Defaults to 1 (root categories).
+        
+        Example:
+        - /categories/ - Lists root categories
+        - /categories/?parent_id=5 - Lists child categories of category 5
+        
+        Returns categories excluding system categories (IDs 2, 3).
+        """
         queryset = self.get_queryset()
         serializer = self.serializer_class(queryset, many=True, context={'request': request}) # serializer needs request
         return Response(serializer.data)
     
     def retrieve(self, request, pk=None):
+        """
+        Retrieve a specific category by ID.
+        
+        Parameters:
+        - pk: Category ID (integer)
+        
+        Example:
+        - /categories/5/ - Retrieves category with ID 5
+        
+        Returns full category details including hierarchy information.
+        """
         instance = self.get_object(pk)
         serializer = self.serializer_class(instance, context={'request': request})
         return Response(serializer.data)
     
     @action(detail=False, methods=['get'])
     def search(self, request):
+        """
+        Search categories by name using pattern matching.
+        
+        Query Parameters:
+        - q (required): Search term (minimum 2 characters)
+        
+        Example:
+        - /categories/search/?q=music - Searches for categories containing 'music'
+        
+        Returns matching categories with hierarchy information, sorted by ID.
+        Case-insensitive search using regular expressions.
+        """
         query = request.query_params.get('q', '').strip()
         if not query or len(query) < 2:
             return Response([])
@@ -99,6 +147,17 @@ class CategoryViewSet(ArangoModelViewSet):
     
 
 class PhraseViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    API endpoint for retrieving phrases associated with samples.
+    
+    Phrases are linguistic data linked to specific samples. A sample parameter
+    is required to retrieve phrases.
+    
+    Available endpoints:
+    - GET /phrases/<sample_ref>/ - Retrieve all phrases for a specific sample
+    
+    Note: Direct listing of all phrases is not supported - sample parameter is required.
+    """
     serializer_class = PhraseSerializer
     model = Phrase
 
@@ -121,6 +180,18 @@ class PhraseViewSet(viewsets.ReadOnlyModelViewSet):
             return []
     
     def retrieve(self, request, pk=None):
+        """
+        Retrieve all phrases for a specific sample.
+        
+        Parameters:
+        - pk: Sample reference (sample_ref) - REQUIRED
+        
+        Example:
+        - /phrases/AL-001/ - Retrieves all phrases for sample AL-001
+        
+        Returns a list of phrases associated with the specified sample,
+        including phrase text and translation information.
+        """
         # Override retrieve to return list of phrases for the sample (pk is the sample_ref)
         # Set the sample parameter in kwargs for get_queryset to use
         self.kwargs['sample'] = pk
@@ -129,11 +200,34 @@ class PhraseViewSet(viewsets.ReadOnlyModelViewSet):
         return Response(serializer.data)
 
 class SampleViewSet(ArangoModelViewSet):
+    """
+    API endpoint for retrieving linguistic samples.
+    
+    Samples are audio/text recordings with metadata. Only visible samples
+    are returned in listings.
+    
+    Available endpoints:
+    - GET /samples/ - List all visible samples
+    - GET /samples/<sample_ref>/ - Retrieve specific sample by reference
+    
+    Samples are identified by their sample_ref (not numeric ID).
+    """
     serializer_class = SampleSerializer
     model = Sample
     http_method_names = ['get', 'head', 'options'] # prevent post
     
     def get_object(self, pk):
+        """
+        Retrieve a specific sample by sample reference.
+        
+        Parameters:
+        - pk: Sample reference (sample_ref) - e.g., 'AL-001'
+        
+        Example:
+        - /samples/AL-001/ - Retrieves sample with reference AL-001
+        
+        Returns complete sample metadata including source information.
+        """
         # Override to use sample_ref instead of _key
         instance = self.model.get_by_field('sample_ref', pk)
         if not instance:
@@ -141,6 +235,12 @@ class SampleViewSet(ArangoModelViewSet):
         return instance
 
     def get_queryset(self):
+        """
+        Retrieve all visible samples.
+        
+        Returns only samples marked as visible='Yes' in the database.
+        Samples with other visibility settings are excluded from listings.
+        """
         try:
             db = self.request.arangodb
             collection = db.collection(self.model.collection_name)
@@ -154,16 +254,61 @@ class SampleViewSet(ArangoModelViewSet):
     
 
 class SourceViewSet(ArangoModelViewSet):
+    """
+    API endpoint for retrieving source metadata for samples.
+    
+    Sources contain information about the origin, recording conditions,
+    and metadata for linguistic samples.
+    
+    Available endpoints:
+    - GET /sources/ - List all sources
+    - GET /sources/<id>/ - Retrieve specific source by ID
+    
+    Read-only access to source information including fieldworker details,
+    recording quality, speaker information, and transcription status.
+    """
     serializer_class = SourceSerializer
     model = Source
     http_method_names = ['get', 'head', 'options']  # prevent post
 
 class AnswerViewSet(ArangoModelViewSet):
+    """
+    API endpoint for retrieving answers to research questions.
+    
+    Answers are linked to specific research questions and can be filtered
+    by sample references. At least one question ID is required for listings.
+    
+    Available endpoints:
+    - GET /answers/?q=<id>&q=<id> - List answers for specific questions (REQUIRED)
+    - GET /answers/?q=<id>&s=<ref>&s=<ref> - Filter by questions and samples
+    - GET /answers/<id>/ - Retrieve specific answer by answer ID
+    
+    Query Parameters:
+    - q (required): Question ID(s) - multiple values allowed (e.g., ?q=1&q=2&q=3)
+    - s (optional): Sample reference(s) - multiple values allowed (e.g., ?s=AL-001&s=AL-002)
+    
+    Examples:
+    - /answers/?q=1 - Answers for question 1
+    - /answers/?q=1&q=2 - Answers for questions 1 and 2
+    - /answers/?q=1&s=AL-001 - Answers for question 1 from sample AL-001
+    - /answers/123/ - Specific answer with ID 123
+    """
     serializer_class = AnswerSerializer
     model = Answer
     http_method_names = ['get', 'head', 'options']  # exclude PUT, POST, DELETE
 
     def get_object(self, pk):
+        """
+        Retrieve a specific answer by answer ID.
+        
+        Parameters:
+        - pk: Answer ID (integer)
+        
+        Example:
+        - /answers/123/ - Retrieves answer with ID 123
+        
+        Returns complete answer data including question context.
+        """
         # Override to use answer ID instead of _key
         db = self.request.arangodb
         collection = db.collection(self.model.collection_name)
@@ -176,7 +321,20 @@ class AnswerViewSet(ArangoModelViewSet):
         return docs[0]
 
     def get_queryset(self):
-        """Get answers filtered by question IDs and optionally by sample references"""
+        """
+        Get answers filtered by question IDs and optionally by sample references.
+        
+        Query Parameters:
+        - q (required): Question ID(s) - multiple values allowed
+        - s (optional): Sample reference(s) - multiple values allowed
+        
+        Examples:
+        - ?q=1&q=2 - Answers for questions 1 and 2
+        - ?q=1&s=AL-001&s=AL-002 - Answers for question 1 from specific samples
+        
+        Returns answers with question_id added for context.
+        Raises 404 if no question IDs provided or if invalid IDs/samples specified.
+        """
         try:
             question_ids = self.request.GET.getlist('q')
             sample_refs = self.request.GET.getlist('s')

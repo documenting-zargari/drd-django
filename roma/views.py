@@ -23,12 +23,12 @@ class ArangoModelViewSet(viewsets.ViewSet):
 
     def list(self, request):
         queryset = self.get_queryset()
-        serializer = self.serializer_class(queryset, many=True)
+        serializer = self.serializer_class(queryset, many=True, context={'request': request, 'view': self})
         return Response(serializer.data)
 
     def retrieve(self, request, pk=None):
         instance = self.get_object(pk)
-        serializer = self.serializer_class(instance)
+        serializer = self.serializer_class(instance, context={'request': request, 'view': self})
         return Response(serializer.data)
 
     def create(self, request):

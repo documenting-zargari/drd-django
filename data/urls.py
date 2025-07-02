@@ -8,6 +8,7 @@ router.register(r'phrases', views.PhraseViewSet, basename='phrases-all')
 router.register(r'phrases/(?P<sample>[^/.]+)', views.PhraseViewSet, basename='phrases')
 router.register(r'samples', views.SampleViewSet, basename='samples')
 router.register(r'answers', views.AnswerViewSet, basename='answers')
+router.register(r'views', views.ViewViewSet, basename='views')
 
 urlpatterns = [
     path('', include(router.urls)),

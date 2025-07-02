@@ -3,8 +3,8 @@ from rest_framework import viewsets
 from rest_framework.response import Response
 from rest_framework.exceptions import NotFound
 from rest_framework.decorators import action
-from data.models import Answer, Category, Phrase, Sample, Source
-from data.serializers import AnswerSerializer, CategorySerializer, SampleSerializer, PhraseSerializer, SourceSerializer
+from data.models import Answer, Category, Phrase, Sample, Source, View
+from data.serializers import AnswerSerializer, CategorySerializer, SampleSerializer, PhraseSerializer, SourceSerializer, ViewSerializer
 from roma.views import ArangoModelViewSet
 
 
@@ -62,7 +62,7 @@ class CategoryViewSet(ArangoModelViewSet):
         Returns categories excluding system categories (IDs 2, 3).
         """
         queryset = self.get_queryset()
-        serializer = self.serializer_class(queryset, many=True, context={'request': request}) # serializer needs request
+        serializer = self.serializer_class(queryset, many=True, context={'request': request, 'view': self})
         return Response(serializer.data)
     
     def retrieve(self, request, pk=None):
@@ -78,7 +78,7 @@ class CategoryViewSet(ArangoModelViewSet):
         Returns full category details including hierarchy information.
         """
         instance = self.get_object(pk)
-        serializer = self.serializer_class(instance, context={'request': request})
+        serializer = self.serializer_class(instance, context={'request': request, 'view': self})
         return Response(serializer.data)
     
     @action(detail=False, methods=['get'])
@@ -249,16 +249,6 @@ class SampleViewSet(ArangoModelViewSet):
         except Exception as e:
             return []
 
-    def list(self, request, *args, **kwargs):
-        """
-        List all visible samples with proper context for serializer.
-        
-        Passes view context to serializer so it can detect list vs detail operations
-        and conditionally exclude contact_languages from list output.
-        """
-        queryset = self.get_queryset()
-        serializer = self.serializer_class(queryset, many=True, context={'request': request, 'view': self})
-        return Response(serializer.data)
 
     def create(self, request):
         return JsonResponse({'error': 'Method not allowed'}, status=405)
@@ -419,3 +409,17 @@ class AnswerViewSet(ArangoModelViewSet):
         except Exception as e:
             print(f"Error fetching answers: {e}")
             return []
+
+class ViewViewSet(ArangoModelViewSet):
+    """
+    API endpoint for retrieving HTML template views.
+    
+    Views contain HTML templates with associated filenames and parent categories.
+    
+    Available endpoints:
+    - GET /views/ - List all views
+    - GET /views/<id>/ - Retrieve specific view by ID
+    """
+    model = View
+    serializer_class = ViewSerializer
+    http_method_names = ['get', 'head', 'options']  # Read-only access

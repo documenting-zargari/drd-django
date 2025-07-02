@@ -1,6 +1,6 @@
 from collections import OrderedDict
 from rest_framework import serializers
-from data.models import Answer, Category, Phrase, Sample, Source, Translation
+from data.models import Answer, Category, Phrase, Sample, Source, Translation, View
 from roma.serializers import ArangoModelSerializer
 
 class CategorySerializer(ArangoModelSerializer):
@@ -136,3 +136,40 @@ class AnswerSerializer(ArangoModelSerializer):
         # Return all attributes from the ArangoDB document, excluding certain fields
         exclude_fields = ['_rev', '_key']  # Add fields you want to exclude
         return {k: v for k, v in instance.items() if k not in exclude_fields}
+
+class ViewSerializer(ArangoModelSerializer):
+    parent_category = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = View
+        fields = ['filename', 'content', 'parent_id', 'parent_category']
+    
+    def get_parent_category(self, obj):
+        request = self.context.get('request')
+        if not request:
+            raise serializers.ValidationError("Request context is required for parent category lookup.")
+        if not request or not hasattr(request, 'arangodb'):
+            raise serializers.ValidationError("ArangoDB connection is required in the request context.")
+        
+        parent_id = obj.get('parent_id') if isinstance(obj, dict) else getattr(obj, 'parent_id', None)
+        if not parent_id:
+            raise serializers.ValidationError("Parent ID is required to fetch parent category.")
+        
+        db = request.arangodb
+        if not db:
+            raise serializers.ValidationError("ArangoDB connection is not available.")
+        collection = db.collection(Category.collection_name)
+        cursor = collection.find({'id': parent_id}, limit=1)
+        docs = list(cursor)
+        
+        if docs:
+            return CategorySerializer(docs[0], context={'request': request}).data
+        return None
+    
+    def to_representation(self, instance):
+        result = super().to_representation(instance)
+        # Handle both dict objects (from ArangoDB) and model objects
+        if isinstance(instance, dict):
+            exclude_fields = ['_rev', '_key']
+            result = {k: v for k, v in instance.items() if k not in exclude_fields}
+        return result

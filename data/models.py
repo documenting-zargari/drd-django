@@ -87,3 +87,9 @@ class Answer(ArangoModel):
 
     def _str_(self):
         return f"An answer for {self.sample}"
+
+class View(ArangoModel):
+    collection_name = 'Views'
+
+    def __str__(self):
+        return self.filename

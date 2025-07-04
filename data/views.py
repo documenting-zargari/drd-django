@@ -3,8 +3,8 @@ from rest_framework import viewsets
 from rest_framework.response import Response
 from rest_framework.exceptions import NotFound
 from rest_framework.decorators import action
-from data.models import Answer, Category, Phrase, Sample, Source, View
-from data.serializers import AnswerSerializer, CategorySerializer, SampleSerializer, PhraseSerializer, SourceSerializer, ViewSerializer
+from data.models import Answer, Category, Phrase, Sample, Source, Transcription, View
+from data.serializers import AnswerSerializer, CategorySerializer, SampleSerializer, PhraseSerializer, SourceSerializer, TranscriptionSerializer, ViewSerializer
 from roma.views import ArangoModelViewSet
 
 
@@ -146,7 +146,7 @@ class CategoryViewSet(ArangoModelViewSet):
     
     
 
-class PhraseViewSet(viewsets.ReadOnlyModelViewSet):
+class PhraseViewSet(ArangoModelViewSet):
     """
     API endpoint for retrieving phrases associated with samples.
     
@@ -154,50 +154,67 @@ class PhraseViewSet(viewsets.ReadOnlyModelViewSet):
     is required to retrieve phrases.
     
     Available endpoints:
-    - GET /phrases/<sample_ref>/ - Retrieve all phrases for a specific sample
+    - GET /phrases/?sample=<sample_ref> - List phrases for a specific sample (REQUIRED)
+    - GET /phrases/<id>/ - Retrieve specific phrase by ID
     
-    Note: Direct listing of all phrases is not supported - sample parameter is required.
+    Query Parameters:
+    - sample (required): Sample reference (e.g., sample=AL-001)
+    
+    Examples:
+    - /phrases/?sample=AL-001 - Phrases for sample AL-001
+    - /phrases/123/ - Specific phrase with ID 123
     """
-    serializer_class = PhraseSerializer
     model = Phrase
+    serializer_class = PhraseSerializer
+    http_method_names = ['get', 'head', 'options']  # Read-only access
 
     def get_queryset(self):
+        """
+        Get phrases filtered by sample reference.
+        
+        Query Parameters:
+        - sample (required): Sample reference
+        
+        Returns phrases for the specified sample.
+        Raises 404 if no sample parameter is provided.
+        """
         try:
-            sample = self.kwargs.get('sample', None)
-            db = self.request.arangodb
-            collection = db.collection(Phrase.collection_name)
-            if sample is None:
-                # Return no phrases when no sample parameter
+            sample = self.request.query_params.get('sample')
+            if not sample:
                 raise NotFound(detail="Sample parameter is required to fetch phrases")
-            else:
-                cursor = collection.find({'sample': sample})
+            
+            db = self.request.arangodb
+            collection = db.collection(self.model.collection_name)
+            cursor = collection.find({'sample': sample})
             return [phrase for phrase in cursor]
+            
         except NotFound:
-            # Re-raise NotFound exceptions so they are handled by DRF
             raise
         except Exception as e:
             print(f"Error fetching phrases: {e}")
             return []
-    
-    def retrieve(self, request, pk=None):
+
+    def get_object(self, pk):
         """
-        Retrieve all phrases for a specific sample.
+        Retrieve a specific phrase by ID.
         
         Parameters:
-        - pk: Sample reference (sample_ref) - REQUIRED
+        - pk: Phrase ID
         
         Example:
-        - /phrases/AL-001/ - Retrieves all phrases for sample AL-001
+        - /phrases/123/ - Retrieves phrase with ID 123
         
-        Returns a list of phrases associated with the specified sample,
-        including phrase text and translation information.
+        Returns complete phrase data.
         """
-        # Override retrieve to return list of phrases for the sample (pk is the sample_ref)
-        # Set the sample parameter in kwargs for get_queryset to use
-        self.kwargs['sample'] = pk
-        queryset = self.get_queryset()
-        serializer = self.serializer_class(queryset, many=True, context={'request': request})
-        return Response(serializer.data)
+        db = self.request.arangodb
+        collection = db.collection(self.model.collection_name)
+        if isinstance(pk, str) and pk.isdigit():
+            pk = int(pk)
+        cursor = collection.find({'id': pk}, limit=1)
+        docs = list(cursor)
+        if not docs:
+            raise NotFound(detail="Phrase not found")
+        return docs[0]
 
 class SampleViewSet(ArangoModelViewSet):
     """
@@ -423,3 +440,84 @@ class ViewViewSet(ArangoModelViewSet):
     model = View
     serializer_class = ViewSerializer
     http_method_names = ['get', 'head', 'options']  # Read-only access
+
+class TranscriptionViewSet(ArangoModelViewSet):
+    """
+    API endpoint for retrieving transcriptions for specific samples.
+    
+    Transcriptions are text records associated with audio samples, organized by segments.
+    A sample parameter is required to retrieve transcriptions.
+    
+    Available endpoints:
+    - GET /transcriptions/?sample=<sample_ref> - List transcriptions for a specific sample (REQUIRED)
+    - GET /transcriptions/<id>/ - Retrieve specific transcription by ID
+    
+    Query Parameters:
+    - sample (required): Sample reference (e.g., sample=AL-001)
+    
+    Examples:
+    - /transcriptions/?sample=AL-001 - Transcriptions for sample AL-001
+    - /transcriptions/123/ - Specific transcription with ID 123
+    
+    Results are sorted by segment_no in ascending order.
+    """
+    model = Transcription
+    serializer_class = TranscriptionSerializer
+    http_method_names = ['get', 'head', 'options']  # Read-only access
+
+    def get_queryset(self):
+        """
+        Get transcriptions filtered by sample reference, sorted by segment_no.
+        
+        Query Parameters:
+        - sample (required): Sample reference
+        
+        Returns transcriptions for the specified sample, ordered by segment number.
+        Raises 404 if no sample parameter is provided.
+        """
+        try:
+            sample = self.request.query_params.get('sample')
+            if not sample:
+                raise NotFound(detail="Sample parameter is required to fetch transcriptions")
+            
+            db = self.request.arangodb
+            collection = db.collection(self.model.collection_name)
+            
+            # Use AQL to sort by segment_no
+            aql_query = """
+            FOR transcription IN Transcriptions
+            FILTER transcription.sample == @sample
+            SORT transcription.segment_no ASC
+            RETURN transcription
+            """
+            
+            cursor = db.aql.execute(aql_query, bind_vars={'sample': sample})
+            return [transcription for transcription in cursor]
+            
+        except NotFound:
+            raise
+        except Exception as e:
+            print(f"Error fetching transcriptions: {e}")
+            return []
+
+    def get_object(self, pk):
+        """
+        Retrieve a specific transcription by ID.
+        
+        Parameters:
+        - pk: Transcription ID
+        
+        Example:
+        - /transcriptions/123/ - Retrieves transcription with ID 123
+        
+        Returns complete transcription data.
+        """
+        db = self.request.arangodb
+        collection = db.collection(self.model.collection_name)
+        if isinstance(pk, str) and pk.isdigit():
+            pk = int(pk)
+        cursor = collection.find({'id': pk}, limit=1)
+        docs = list(cursor)
+        if not docs:
+            raise NotFound(detail="Transcription not found")
+        return docs[0]

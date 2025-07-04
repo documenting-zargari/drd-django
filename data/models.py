@@ -93,3 +93,9 @@ class View(ArangoModel):
 
     def __str__(self):
         return self.filename
+
+class Transcription(ArangoModel):
+    collection_name = 'Transcriptions'
+
+    def __str__(self):
+        return f"Transcription for {self.sample} segment {self.segment_no}"

@@ -1,6 +1,6 @@
 from collections import OrderedDict
 from rest_framework import serializers
-from data.models import Answer, Category, Phrase, Sample, Source, Translation, View
+from data.models import Answer, Category, Phrase, Sample, Source, Translation, Transcription, View
 from roma.serializers import ArangoModelSerializer
 
 class CategorySerializer(ArangoModelSerializer):
@@ -173,3 +173,13 @@ class ViewSerializer(ArangoModelSerializer):
             exclude_fields = ['_rev', '_key']
             result = {k: v for k, v in instance.items() if k not in exclude_fields}
         return result
+
+class TranscriptionSerializer(ArangoModelSerializer):
+    class Meta:
+        model = Transcription
+        fields = '__all__'
+    
+    def to_representation(self, instance):
+        # Return all attributes from the ArangoDB document, excluding certain fields
+        exclude_fields = ['_rev', '_key']
+        return {k: v for k, v in instance.items() if k not in exclude_fields}

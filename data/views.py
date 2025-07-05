@@ -226,6 +226,7 @@ class SampleViewSet(ArangoModelViewSet):
     Available endpoints:
     - GET /samples/ - List all visible samples
     - GET /samples/<sample_ref>/ - Retrieve specific sample by reference
+    - GET /samples/with-transcriptions/ - List samples that have transcriptions with counts
     
     Samples are identified by their sample_ref (not numeric ID).
     """
@@ -269,6 +270,44 @@ class SampleViewSet(ArangoModelViewSet):
 
     def create(self, request):
         return JsonResponse({'error': 'Method not allowed'}, status=405)
+    
+    @action(detail=False, methods=['get'], url_path='with-transcriptions')
+    def with_transcriptions(self, request):
+        """
+        Get all sample references that have transcriptions with counts.
+        
+        Example:
+        - /samples/with-transcriptions/ - List samples with transcription counts
+        
+        Returns:
+        [
+            {"sample_ref": "AL-001", "transcription_count": 15},
+            {"sample_ref": "AT-001x", "transcription_count": 8},
+            ...
+        ]
+        
+        This endpoint efficiently returns sample references and their transcription
+        counts using a single optimized AQL query with COLLECT operation.
+        """
+        db = request.arangodb
+        if not db:
+            return Response({'error': 'Database not available'}, status=500)
+            
+        aql_query = """
+        FOR transcription IN Transcriptions
+            COLLECT sample = transcription.sample WITH COUNT INTO count
+            SORT sample ASC
+            RETURN {
+                sample_ref: sample,
+                transcription_count: count
+            }
+        """
+        
+        try:
+            cursor = db.aql.execute(aql_query)
+            return Response([result for result in cursor])
+        except Exception as e:
+            return Response({'error': f'Query failed: {str(e)}'}, status=500)
     
 
 class SourceViewSet(ArangoModelViewSet):

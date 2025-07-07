@@ -1,25 +1,26 @@
-from arango import ArangoClient
-from arango.http import DefaultHTTPClient
-from arango.exceptions import ArangoError
-from django.conf import settings
-from django.http import JsonResponse
-import os
 import logging
+import os
+
+from arango import ArangoClient
+from arango.exceptions import ArangoError
+from arango.http import DefaultHTTPClient
+from django.conf import settings
 
 logger = logging.getLogger(__name__)
+
 
 class ArangoDBMiddleware:
     def __init__(self, get_response):
         self.get_response = get_response
         self.connection_error = None
-        
+
         # Initialize client and attempt connection
         try:
             self.client = ArangoClient(
                 http_client=DefaultHTTPClient(
                     retry_attempts=1,
                 ),
-                hosts=os.getenv('ARANGO_HOST', settings.ARANGO_HOST),
+                hosts=os.getenv("ARANGO_HOST", settings.ARANGO_HOST),
                 request_timeout=5,
             )
             self.db = self._connect_to_arangodb()
@@ -32,9 +33,13 @@ class ArangoDBMiddleware:
         """Establish a connection to ArangoDB"""
         try:
             # Check if required settings are defined
-            if not hasattr(settings, 'ARANGO_DB_NAME') or not hasattr(settings, 'ARANGO_USERNAME') or not hasattr(settings, 'ARANGO_PASSWORD'):
+            if (
+                not hasattr(settings, "ARANGO_DB_NAME")
+                or not hasattr(settings, "ARANGO_USERNAME")
+                or not hasattr(settings, "ARANGO_PASSWORD")
+            ):
                 raise ValueError("ArangoDB settings are not properly configured")
-                
+
             connection = self.client.db(
                 settings.ARANGO_DB_NAME,
                 username=settings.ARANGO_USERNAME,
@@ -55,7 +60,7 @@ class ArangoDBMiddleware:
         # Attach the database connection (even if it's None)
         request.arangodb = self.db
         request.arango_error = self.connection_error
-        
+
         # Always proceed with the request, even if ArangoDB connection failed
         # Individual views can check request.arangodb and handle failures appropriately
         response = self.get_response(request)

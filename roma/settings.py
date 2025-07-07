@@ -10,8 +10,8 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/5.1/ref/settings/
 """
 
-from pathlib import Path
 import os
+from pathlib import Path
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -19,7 +19,9 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.1/howto/deployment/checklist/
 
-SECRET_KEY = os.environ.get("SECRET_KEY", "django-insecure-q5qhkg3q2jlgygcn@3w6xmq#8=txu9jo=jw3zx--$x9+!__!n#")
+SECRET_KEY = os.environ.get(
+    "SECRET_KEY", "django-insecure-q5qhkg3q2jlgygcn@3w6xmq#8=txu9jo=jw3zx--$x9+!__!n#"
+)
 
 # SECURITY WARNING: don't run with debug turned on in production!
 if os.environ.get("DEBUG"):
@@ -44,29 +46,29 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
-    'corsheaders',
-    'rest_framework',
-    'rest_framework.authtoken',
-    'user',
-    'data',
+    "corsheaders",
+    "rest_framework",
+    "rest_framework.authtoken",
+    "user",
+    "data",
 ]
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
-    'corsheaders.middleware.CorsMiddleware',
+    "corsheaders.middleware.CorsMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
-    'roma.middleware.arangodb_middleware.ArangoDBMiddleware',
+    "roma.middleware.arangodb_middleware.ArangoDBMiddleware",
 ]
 
-ARANGO_DB_NAME = os.getenv('ARANGO_DB_NAME', 'rms')
-ARANGO_USERNAME = os.getenv('ARANGO_USERNAME', 'root')
-ARANGO_PASSWORD = os.getenv('ARANGO_PASSWORD', 'blabla')
-ARANGO_HOST = os.getenv('ARANGO_HOST', 'http://localhost:8529')
+ARANGO_DB_NAME = os.getenv("ARANGO_DB_NAME", "rms")
+ARANGO_USERNAME = os.getenv("ARANGO_USERNAME", "root")
+ARANGO_PASSWORD = os.getenv("ARANGO_PASSWORD", "blabla")
+ARANGO_HOST = os.getenv("ARANGO_HOST", "http://localhost:8529")
 
 
 ADD_ALLOWED_ORIGINS = os.environ.get("CORS_ALLOWED_ORIGINS")
@@ -101,11 +103,11 @@ if ADD_ALLOWED_ORIGINS:
 CORS_ALLOW_CREDENTIALS = True
 
 REST_FRAMEWORK = {
-    'DEFAULT_AUTHENTICATION_CLASSES': [
-        'rest_framework.authentication.TokenAuthentication',
+    "DEFAULT_AUTHENTICATION_CLASSES": [
+        "rest_framework.authentication.TokenAuthentication",
     ],
-    'DEFAULT_PERMISSION_CLASSES': [
-#        'rest_framework.permissions.IsAuthenticated',
+    "DEFAULT_PERMISSION_CLASSES": [
+        #        'rest_framework.permissions.IsAuthenticated',
     ],
 }
 
@@ -135,24 +137,26 @@ WSGI_APPLICATION = "roma.wsgi.application"
 # https://docs.djangoproject.com/en/5.1/ref/settings/#databases
 
 DATABASES = {
-    'data': {
-        'ENGINE': 'django.db.backends.mysql',
-        'NAME': os.getenv('MYSQL_DATA_NAME', 'romani'),
-        'USER': os.getenv('MYSQL_DATA_USER', 'root'),
-        'PASSWORD': os.getenv('MYSQL_DATA_PASSWORD', ''),
-        'HOST': os.getenv('MYSQL_DATA_HOST', 'localhost'),
-        'PORT': os.getenv('MYSQL_DATA_PORT', '3306'),
+    "data": {
+        "ENGINE": "django.db.backends.mysql",
+        "NAME": os.getenv("MYSQL_DATA_NAME", "romani"),
+        "USER": os.getenv("MYSQL_DATA_USER", "root"),
+        "PASSWORD": os.getenv("MYSQL_DATA_PASSWORD", ""),
+        "HOST": os.getenv("MYSQL_DATA_HOST", "localhost"),
+        "PORT": os.getenv("MYSQL_DATA_PORT", "3306"),
     },
-    'default': {
-        'ENGINE': 'django.db.backends.mysql',
-        'NAME': os.getenv('MYSQL_DEFAULT_NAME', 'rms'),
-        'USER': os.getenv('MYSQL_DEFAULT_USER', 'root'),
-        'PASSWORD': os.getenv('MYSQL_DEFAULT_PASSWORD', ''),
-        'HOST': os.getenv('MYSQL_DEFAULT_HOST', 'localhost'),
-        'PORT': os.getenv('MYSQL_DEFAULT_PORT', '3306'),
+    "default": {
+        "ENGINE": "django.db.backends.mysql",
+        "NAME": os.getenv("MYSQL_DEFAULT_NAME", "rms"),
+        "USER": os.getenv("MYSQL_DEFAULT_USER", "root"),
+        "PASSWORD": os.getenv("MYSQL_DEFAULT_PASSWORD", ""),
+        "HOST": os.getenv("MYSQL_DEFAULT_HOST", "localhost"),
+        "PORT": os.getenv("MYSQL_DEFAULT_PORT", "3306"),
     },
 }
-DATABASE_ROUTERS = ['roma.dbrouters.DBRouter',]
+DATABASE_ROUTERS = [
+    "roma.dbrouters.DBRouter",
+]
 
 # Password validation
 # https://docs.djangoproject.com/en/5.1/ref/settings/#auth-password-validators

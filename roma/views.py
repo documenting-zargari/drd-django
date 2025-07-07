@@ -1,14 +1,16 @@
-from rest_framework import viewsets, status
-from rest_framework.response import Response
+from rest_framework import status, viewsets
 from rest_framework.exceptions import NotFound
+from rest_framework.response import Response
+
 
 class ArangoModelViewSet(viewsets.ViewSet):
     """
     A custom viewset for ArangoDB–backed models.
     Subclasses should set the 'model' and 'serializer_class' attributes.
     """
+
     serializer_class = None  # Must be set in subclass.
-    model = None             # Must be set in subclass.
+    model = None  # Must be set in subclass.
 
     def get_queryset(self):
         # Return a list of all objects.
@@ -23,12 +25,16 @@ class ArangoModelViewSet(viewsets.ViewSet):
 
     def list(self, request):
         queryset = self.get_queryset()
-        serializer = self.serializer_class(queryset, many=True, context={'request': request, 'view': self})
+        serializer = self.serializer_class(
+            queryset, many=True, context={"request": request, "view": self}
+        )
         return Response(serializer.data)
 
     def retrieve(self, request, pk=None):
         instance = self.get_object(pk)
-        serializer = self.serializer_class(instance, context={'request': request, 'view': self})
+        serializer = self.serializer_class(
+            instance, context={"request": request, "view": self}
+        )
         return Response(serializer.data)
 
     def create(self, request):
@@ -36,8 +42,7 @@ class ArangoModelViewSet(viewsets.ViewSet):
         if serializer.is_valid():
             instance = serializer.save()
             return Response(
-                self.serializer_class(instance).data,
-                status=status.HTTP_201_CREATED
+                self.serializer_class(instance).data, status=status.HTTP_201_CREATED
             )
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 

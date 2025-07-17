@@ -17,11 +17,24 @@ class ArangoModelViewSet(viewsets.ViewSet):
         return self.model.all()
 
     def get_object(self, pk):
-        # Retrieve a single object by its _key.
-        instance = self.model.get(pk)
-        if not instance:
-            raise NotFound(detail="Object not found")
-        return instance
+        # Smart lookup: try _key first (efficient), fallback to id field (backward compatible)
+        db = self.request.arangodb
+        collection = db.collection(self.model.collection_name)
+        
+        # Try _key first (most efficient)
+        doc = collection.get(pk)
+        if doc:
+            return doc
+        
+        # Fallback to id field search (less efficient but backward compatible)
+        if isinstance(pk, str) and pk.isdigit():
+            pk = int(pk)
+        cursor = collection.find({"id": pk}, limit=1)
+        docs = list(cursor)
+        if docs:
+            return docs[0]
+        
+        raise NotFound(detail="Object not found")
 
     def list(self, request):
         queryset = self.get_queryset()

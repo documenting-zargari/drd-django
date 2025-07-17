@@ -167,9 +167,13 @@ class AnswerSerializer(ArangoModelSerializer):
         fields = "__all__"
 
     def to_representation(self, instance):
-        # Return all attributes from the ArangoDB document, excluding certain fields
-        exclude_fields = ["_rev", "_key"]  # Add fields you want to exclude
-        return {k: v for k, v in instance.items() if k not in exclude_fields}
+        # Handle both dict objects (from ArangoDB) and model objects
+        if isinstance(instance, dict):
+            exclude_fields = ["_rev", "_id"]
+            return {k: v for k, v in instance.items() if k not in exclude_fields}
+        else:
+            # For model instances, use the parent serializer's method
+            return super().to_representation(instance)
 
 
 class ViewSerializer(ArangoModelSerializer):

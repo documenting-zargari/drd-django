@@ -2,6 +2,7 @@ from django.http import JsonResponse
 from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound
 from rest_framework.response import Response
+from natsort import natsorted
 
 from data.models import Answer, Category, Phrase, Sample, Source, Transcription, View
 from data.serializers import (
@@ -43,17 +44,6 @@ class CategoryViewSet(ArangoModelViewSet):
         categories_cursor = collection.find({"parent_id": id})
         return [c for c in categories_cursor if c["id"] not in exclude_ids]
 
-    def get_object(self, pk):
-        # Override to use id instead of _key and return raw dict like list method
-        db = self.request.arangodb
-        collection = db.collection(self.model.collection_name)
-        if isinstance(pk, str) and pk.isdigit():
-            pk = int(pk)
-        cursor = collection.find({"id": pk}, limit=1)
-        docs = list(cursor)
-        if not docs:
-            raise NotFound(detail="Category not found")
-        return docs[0]
 
     def list(self, request, *args, **kwargs):
         """
@@ -172,13 +162,16 @@ class PhraseViewSet(ArangoModelViewSet):
     Available endpoints:
     - GET /phrases/?sample=<sample_ref> - List phrases for a specific sample (REQUIRED)
     - GET /phrases/<id>/ - Retrieve specific phrase by ID
+    - GET /phrases/by-answer/?answer_key=<key> - Get phrases linked to an answer via phrase tags
 
     Query Parameters:
     - sample (required): Sample reference (e.g., sample=AL-001)
+    - answer_key (required for by-answer): Answer _key
 
     Examples:
     - /phrases/?sample=AL-001 - Phrases for sample AL-001
     - /phrases/123/ - Specific phrase with ID 123
+    - /phrases/by-answer/?answer_key=ABC123 - Phrases linked to answer ABC123 via phrase tags
     """
 
     model = Phrase
@@ -203,7 +196,7 @@ class PhraseViewSet(ArangoModelViewSet):
             db = self.request.arangodb
             collection = db.collection(self.model.collection_name)
             cursor = collection.find({"sample": sample})
-            return [phrase for phrase in cursor]
+            return [phrase for phrase in natsorted(cursor, key=lambda x: x["phrase_ref"])]
 
         except NotFound:
             raise
@@ -211,27 +204,78 @@ class PhraseViewSet(ArangoModelViewSet):
             print(f"Error fetching phrases: {e}")
             return []
 
-    def get_object(self, pk):
+
+    @action(detail=False, methods=["get"], url_path="by-answer")
+    def by_answer(self, request):
         """
-        Retrieve a specific phrase by ID.
-
-        Parameters:
-        - pk: Phrase ID
-
-        Example:
-        - /phrases/123/ - Retrieves phrase with ID 123
-
-        Returns complete phrase data.
+        Get phrases associated with an answer via phrase tags.
+        
+        Query Parameters:
+        - answer_key (required): Answer _key
+        
+        Returns phrases linked to the answer through phrase tags and anchors.
+        If no tag with matching ID in answer or no phrases found, returns 404.
         """
-        db = self.request.arangodb
-        collection = db.collection(self.model.collection_name)
-        if isinstance(pk, str) and pk.isdigit():
-            pk = int(pk)
-        cursor = collection.find({"id": pk}, limit=1)
-        docs = list(cursor)
-        if not docs:
-            raise NotFound(detail="Phrase not found")
-        return docs[0]
+        from rest_framework.exceptions import ValidationError
+        
+        try:
+            answer_key = request.query_params.get("answer_key")
+            
+            if not answer_key:
+                raise ValidationError("Answer key parameter is required")
+            
+            # Get the answer document by _key efficiently
+            db = request.arangodb
+            answer_collection = db.collection("Answers")
+            answer = answer_collection.get(answer_key)
+            
+            if not answer:
+                raise NotFound(detail="Answer not found")
+            
+            # Check if answer has a tag field with id
+            if "tag" not in answer or "id" not in answer.get("tag", {}):
+                raise NotFound(detail="No tag with ID found in answer")
+            
+            # Get sample from answer
+            if "sample" not in answer:
+                raise NotFound(detail="No sample found in answer")
+            
+            answer_tag_id = answer["tag"]["id"]
+            sample = answer["sample"]
+            
+            # Execute the AQL query to find phrases
+            aql = """
+            FOR phraseTag IN PhraseTags
+                FILTER phraseTag.id == @answer_tag_id
+                    FOR anchor IN 1..1 INBOUND phraseTag HasTag
+                        FOR phrase IN Phrases
+                        FILTER phrase.anchor_id == anchor.id AND phrase.sample == @sample
+                        RETURN phrase
+            """
+            
+            bind_vars = {
+                "answer_tag_id": answer_tag_id,
+                "sample": sample
+            }
+            
+            cursor = db.aql.execute(aql, bind_vars=bind_vars)
+            phrases = [phrase for phrase in cursor]
+            
+            if not phrases:
+                raise NotFound(detail="No phrases found for this answer and sample")
+            
+            # Sort phrases naturally by phrase_ref
+            phrases = natsorted(phrases, key=lambda x: x["phrase_ref"])
+            
+            # Serialize the phrases
+            serializer = self.serializer_class(phrases, many=True, context={"request": request})
+            return Response(serializer.data)
+            
+        except (NotFound, ValidationError):
+            raise
+        except Exception as e:
+            print(f"Error fetching phrases for answer: {e}")
+            raise NotFound(detail="Error retrieving phrases")
 
 
 class SampleViewSet(ArangoModelViewSet):
@@ -375,28 +419,6 @@ class AnswerViewSet(ArangoModelViewSet):
     model = Answer
     http_method_names = ["get", "head", "options"]  # exclude PUT, POST, DELETE
 
-    def get_object(self, pk):
-        """
-        Retrieve a specific answer by answer ID.
-
-        Parameters:
-        - pk: Answer ID (integer)
-
-        Example:
-        - /answers/123/ - Retrieves answer with ID 123
-
-        Returns complete answer data including question context.
-        """
-        # Override to use answer ID instead of _key
-        db = self.request.arangodb
-        collection = db.collection(self.model.collection_name)
-        if isinstance(pk, str) and pk.isdigit():
-            pk = int(pk)
-        cursor = collection.find({"id": pk}, limit=1)
-        docs = list(cursor)
-        if not docs:
-            raise NotFound(detail="Answer not found")
-        return docs[0]
 
     def get_queryset(self):
         """
@@ -568,24 +590,3 @@ class TranscriptionViewSet(ArangoModelViewSet):
             print(f"Error fetching transcriptions: {e}")
             return []
 
-    def get_object(self, pk):
-        """
-        Retrieve a specific transcription by ID.
-
-        Parameters:
-        - pk: Transcription ID
-
-        Example:
-        - /transcriptions/123/ - Retrieves transcription with ID 123
-
-        Returns complete transcription data.
-        """
-        db = self.request.arangodb
-        collection = db.collection(self.model.collection_name)
-        if isinstance(pk, str) and pk.isdigit():
-            pk = int(pk)
-        cursor = collection.find({"id": pk}, limit=1)
-        docs = list(cursor)
-        if not docs:
-            raise NotFound(detail="Transcription not found")
-        return docs[0]

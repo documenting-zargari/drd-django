@@ -146,12 +146,6 @@ class CategoryViewSet(ArangoModelViewSet):
         except Exception as e:
             return Response({"error": f"Search failed: {str(e)}"}, status=500)
 
-
-# class SourceViewSet(viewsets.ModelViewSet):
-#     queryset = Source.objects.all()
-#     serializer_class = SourceSerializer
-
-
 class PhraseViewSet(ArangoModelViewSet):
     """
     API endpoint for retrieving phrases associated with samples.
@@ -224,53 +218,27 @@ class PhraseViewSet(ArangoModelViewSet):
             if not answer_key:
                 raise ValidationError("Answer key parameter is required")
             
-            # Get the answer document by _key efficiently
+            # Get the answer document by _key
             db = request.arangodb
-            answer_collection = db.collection("Answers")
-            answer = answer_collection.get(answer_key)
-            
+            answer = db.collection("Answers").get(answer_key)
             if not answer:
                 raise NotFound(detail="Answer not found")
-            
-            # Check if answer has a tag field with id
-            if "tag" not in answer or "id" not in answer.get("tag", {}):
-                raise NotFound(detail="No tag with ID found in answer")
-            
-            # Get sample from answer
-            if "sample" not in answer:
-                raise NotFound(detail="No sample found in answer")
-            
-            answer_tag_id = answer["tag"]["id"]
-            sample = answer["sample"]
-            
+
             # Execute the AQL query to find phrases
-            aql = """
-            FOR phraseTag IN PhraseTags
-                FILTER phraseTag.id == @answer_tag_id
-                    FOR anchor IN 1..1 INBOUND phraseTag HasTag
-                        FOR phrase IN Phrases
-                        FILTER phrase.anchor_id == anchor.id AND phrase.sample == @sample
-                        RETURN phrase
-            """
-            
-            bind_vars = {
-                "answer_tag_id": answer_tag_id,
-                "sample": sample
-            }
-            
-            cursor = db.aql.execute(aql, bind_vars=bind_vars)
-            phrases = [phrase for phrase in cursor]
-            
+            phrases = list(db.aql.execute(
+                "FOR v IN 1..1 OUTBOUND @answer HasPhrase RETURN v", 
+                bind_vars={'answer': answer['_id']}))
+
             if not phrases:
                 raise NotFound(detail="No phrases found for this answer and sample")
-            
+
             # Sort phrases naturally by phrase_ref
             phrases = natsorted(phrases, key=lambda x: x["phrase_ref"])
-            
+
             # Serialize the phrases
             serializer = self.serializer_class(phrases, many=True, context={"request": request})
             return Response(serializer.data)
-            
+
         except (NotFound, ValidationError):
             raise
         except Exception as e:

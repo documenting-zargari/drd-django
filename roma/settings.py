@@ -63,7 +63,7 @@ MIDDLEWARE = [
 ]
 
 ARANGO_DB_NAME = os.getenv("ARANGO_DB_NAME", "rms")
-ARANGO_DB_NAME = "rms_test" if DEBUG else ARANGO_DB_NAME
+# ARANGO_DB_NAME = "rms_test" if DEBUG else ARANGO_DB_NAME
 ARANGO_USERNAME = os.getenv("ARANGO_USERNAME", "root")
 ARANGO_PASSWORD = os.getenv("ARANGO_PASSWORD", "blabla")
 ARANGO_HOST = os.getenv("ARANGO_HOST", "http://localhost:8529")

@@ -30,6 +30,7 @@ class CategorySerializer(ArangoModelSerializer):
             "hierarchy_ids",
             "has_children",
             "drill",
+            "path",
         )
 
     def get_hierarchy(self, obj):
@@ -79,6 +80,17 @@ class CategorySerializer(ArangoModelSerializer):
         # Remove drill field if it's null
         if result.get("drill") is None:
             result.pop("drill", None)
+        
+        # Remove path field if it's not present in the original instance
+        # Handle both dict objects (from ArangoDB) and model objects
+        if isinstance(instance, dict):
+            path_value = instance.get("path")
+        else:
+            path_value = getattr(instance, "path", None)
+        
+        if path_value is None:
+            result.pop("path", None)
+        
         return result
 
 

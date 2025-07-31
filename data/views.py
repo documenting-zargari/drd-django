@@ -1,6 +1,6 @@
 from django.http import JsonResponse
 from rest_framework.decorators import action
-from rest_framework.exceptions import NotFound
+from rest_framework.exceptions import NotFound, ValidationError
 from rest_framework.response import Response
 from natsort import natsorted
 
@@ -46,19 +46,6 @@ class CategoryViewSet(ArangoModelViewSet):
 
 
     def list(self, request, *args, **kwargs):
-        """
-        List categories by parent relationship.
-
-        Query Parameters:
-        - parent_id (optional): ID of parent category to list children for.
-                               Defaults to 1 (root categories).
-
-        Example:
-        - /categories/ - Lists root categories
-        - /categories/?parent_id=5 - Lists child categories of category 5
-
-        Returns categories excluding system categories (IDs 2, 3).
-        """
         queryset = self.get_queryset()
         serializer = self.serializer_class(
             queryset, many=True, context={"request": request, "view": self}
@@ -173,15 +160,6 @@ class PhraseViewSet(ArangoModelViewSet):
     http_method_names = ["get", "head", "options"]  # Read-only access
 
     def get_queryset(self):
-        """
-        Get phrases filtered by sample reference.
-
-        Query Parameters:
-        - sample (required): Sample reference
-
-        Returns phrases for the specified sample.
-        Raises 404 if no sample parameter is provided.
-        """
         try:
             sample = self.request.query_params.get("sample")
             if not sample:
@@ -266,17 +244,6 @@ class SampleViewSet(ArangoModelViewSet):
     http_method_names = ["get", "head", "options"]  # prevent post
 
     def get_object(self, pk):
-        """
-        Retrieve a specific sample by sample reference.
-
-        Parameters:
-        - pk: Sample reference (sample_ref) - e.g., 'AL-001'
-
-        Example:
-        - /samples/AL-001/ - Retrieves sample with reference AL-001
-
-        Returns complete sample metadata including source information.
-        """
         # Override to use sample_ref instead of _key
         instance = self.model.get_by_field("sample_ref", pk)
         if not instance:
@@ -284,12 +251,6 @@ class SampleViewSet(ArangoModelViewSet):
         return instance
 
     def get_queryset(self):
-        """
-        Retrieve all visible samples.
-
-        Returns only samples marked as visible='Yes' in the database.
-        Samples with other visibility settings are excluded from listings.
-        """
         try:
             db = self.request.arangodb
             collection = db.collection(self.model.collection_name)
@@ -364,23 +325,17 @@ class AnswerViewSet(ArangoModelViewSet):
     """
     API endpoint for retrieving answers to research questions.
 
-    Answers are linked to specific research questions and can be filtered
-    by sample references. At least one question ID is required for listings.
-
-    Available endpoints:
-    - GET /answers/?q=<id>&q=<id> - List answers for specific questions (REQUIRED)
-    - GET /answers/?q=<id>&s=<ref>&s=<ref> - Filter by questions and samples
-    - GET /answers/<id>/ - Retrieve specific answer by answer ID
-
     Query Parameters:
-    - q (required): Question ID(s) - multiple values allowed (e.g., ?q=1&q=2&q=3)
-    - s (optional): Sample reference(s) - multiple values allowed (e.g., ?s=AL-001&s=AL-002)
+    - q: Question ID(s) - multiple values allowed
+    - search: Field-based filters - "question_id,field,value" format only
+    - s: Sample reference(s) - multiple values allowed
+
+    Searchable Fields: form, marker
 
     Examples:
-    - /answers/?q=1 - Answers for question 1
-    - /answers/?q=1&q=2 - Answers for questions 1 and 2
-    - /answers/?q=1&s=AL-001 - Answers for question 1 from sample AL-001
-    - /answers/123/ - Specific answer with ID 123
+    - /answers/?q=1 - All answers for question 1
+    - /answers/?search=1,form,verbal - Answers where form=verbal
+    - /answers/?search=1,form,verbal&search=2,marker,past - Multiple field filters
     """
 
     serializer_class = AnswerSerializer
@@ -389,32 +344,45 @@ class AnswerViewSet(ArangoModelViewSet):
 
 
     def get_queryset(self):
-        """
-        Get answers filtered by question IDs and optionally by sample references.
-
-        Query Parameters:
-        - q (required): Question ID(s) - multiple values allowed
-        - s (optional): Sample reference(s) - multiple values allowed
-
-        Examples:
-        - ?q=1&q=2 - Answers for questions 1 and 2
-        - ?q=1&s=AL-001&s=AL-002 - Answers for question 1 from specific samples
-
-        Returns answers with question_id added for context.
-        Raises 404 if no question IDs provided or if invalid IDs/samples specified.
-        """
         try:
+            # Parse legacy q parameters
             question_ids = self.request.GET.getlist("q")
+            
+            # Parse new search parameters
+            search_params = self.request.GET.getlist("search")
+            search_filters = []
+            
+            for param in search_params:
+                parts = param.split(',', 2)  # Limit to 3 parts to handle commas in values
+                if len(parts) == 3:
+                    # Question ID + field + value (required format)
+                    search_filters.append({
+                        "question_id": int(parts[0]),
+                        "field": parts[1].strip(),
+                        "value": parts[2].strip()
+                    })
+                else:
+                    raise ValidationError(f"Invalid search parameter format: {param}. Use 'question_id,field,value' format")
+            
+            # Get sample filters
             sample_refs = self.request.GET.getlist("s")
-
-            if not question_ids:
+            
+            # Require at least one filter (legacy q or new search)
+            if not question_ids and not search_filters:
                 raise NotFound(
-                    detail="At least one question ID (q parameter) is required"
+                    detail="At least one question ID (q parameter) or search filter is required"
                 )
-
-            return self.get_answers_for_questions(question_ids, sample_refs)
-        except NotFound:
+            
+            # Use new search method if search parameters provided, otherwise legacy method
+            if search_filters:
+                return self.get_answers_with_field_filters(search_filters, sample_refs)
+            else:
+                return self.get_answers_for_questions(question_ids, sample_refs)
+                
+        except (NotFound, ValidationError):
             raise
+        except ValueError as e:
+            raise ValidationError(f"Invalid parameter value: {str(e)}")
         except Exception as e:
             print(f"Error fetching answers: {e}")
             return []
@@ -479,6 +447,73 @@ class AnswerViewSet(ArangoModelViewSet):
             print(f"Error fetching answers: {e}")
             return []
 
+    def get_answers_with_field_filters(self, search_filters, sample_refs=None):
+        """Get answers with field-based filtering using search parameters"""
+        # Define allowed search fields for security
+        ALLOWED_SEARCH_FIELDS = {'form', 'marker'}
+        
+        db = self.request.arangodb
+        if not search_filters:
+            raise NotFound(detail="At least one search filter is required")
+            
+        try:
+            # Validate field names and extract question IDs
+            question_ids = []
+            for filter_obj in search_filters:
+                question_ids.append(filter_obj["question_id"])
+                if filter_obj["field"] and filter_obj["field"] not in ALLOWED_SEARCH_FIELDS:
+                    raise ValidationError(f"Field '{filter_obj['field']}' is not searchable. Allowed fields: {', '.join(sorted(ALLOWED_SEARCH_FIELDS))}")
+            
+            # Validate all question IDs exist
+            question_ids = list(set(question_ids))  # Remove duplicates
+            self.validate_questions(question_ids)
+            
+            # Validate sample references if provided
+            if sample_refs:
+                self.validate_samples(sample_refs)
+            
+            # Build dynamic AQL query with OR conditions for different questions
+            conditions = []
+            bind_vars = {}
+            
+            for i, filter_obj in enumerate(search_filters):
+                qid = filter_obj["question_id"]
+                field = filter_obj["field"]
+                value = filter_obj["value"]
+                
+                # All search filters now have field/value pairs
+                condition = f"(answer.question_id == @qid_{i} AND answer.{field} == @value_{i})"
+                bind_vars[f"qid_{i}"] = qid
+                bind_vars[f"value_{i}"] = value
+                conditions.append(condition)
+            
+            # Combine all conditions with OR
+            filter_clause = " OR ".join(conditions)
+            
+            # Add sample filtering if provided
+            sample_filter = ""
+            if sample_refs:
+                sample_filter = " AND answer.sample IN @sample_refs"
+                bind_vars["sample_refs"] = sample_refs
+            
+            # Build final AQL query
+            aql = f"""
+            FOR answer IN Answers
+              FILTER ({filter_clause}){sample_filter}
+              RETURN answer
+            """
+            
+            cursor = db.aql.execute(aql, bind_vars=bind_vars)
+            answers = [doc for doc in cursor]
+            
+            return answers
+            
+        except (NotFound, ValidationError):
+            raise
+        except Exception as e:
+            print(f"Error fetching answers with field filters: {e}")
+            return []
+
 
 class ViewViewSet(ArangoModelViewSet):
     """
@@ -522,15 +557,6 @@ class TranscriptionViewSet(ArangoModelViewSet):
     http_method_names = ["get", "head", "options"]  # Read-only access
 
     def get_queryset(self):
-        """
-        Get transcriptions filtered by sample reference, sorted by segment_no.
-
-        Query Parameters:
-        - sample (required): Sample reference
-
-        Returns transcriptions for the specified sample, ordered by segment number.
-        Raises 404 if no sample parameter is provided.
-        """
         try:
             sample = self.request.query_params.get("sample")
             if not sample:

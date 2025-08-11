@@ -439,7 +439,7 @@ class AnswerViewSet(ArangoModelViewSet):
 
             cursor = db.aql.execute(aql, bind_vars=bind_vars)
             answers = [doc for doc in cursor]
-
+            answers.sort(key=lambda x: x.get("sample", ""))
             return answers
         except NotFound:
             raise
@@ -481,10 +481,10 @@ class AnswerViewSet(ArangoModelViewSet):
                 field = filter_obj["field"]
                 value = filter_obj["value"]
                 
-                # All search filters now have field/value pairs
-                condition = f"(answer.question_id == @qid_{i} AND answer.{field} == @value_{i})"
+                # Match value allowing partial matches
+                condition = f"(answer.question_id == @qid_{i} AND answer.{field} LIKE @value_{i})"
                 bind_vars[f"qid_{i}"] = qid
-                bind_vars[f"value_{i}"] = value
+                bind_vars[f"value_{i}"] = f"%{value}%"
                 conditions.append(condition)
             
             # Combine all conditions with OR
@@ -505,7 +505,8 @@ class AnswerViewSet(ArangoModelViewSet):
             
             cursor = db.aql.execute(aql, bind_vars=bind_vars)
             answers = [doc for doc in cursor]
-            
+            # sort by sample reference
+            answers.sort(key=lambda x: x.get("sample", ""))
             return answers
             
         except (NotFound, ValidationError):

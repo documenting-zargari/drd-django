@@ -105,6 +105,8 @@ class TranslationSerializer(serializers.ModelSerializer):
 
 
 class PhraseSerializer(ArangoModelSerializer):
+    has_recording = serializers.SerializerMethodField(required=False)
+
     class Meta:
         model = Phrase
         fields = [
@@ -112,12 +114,20 @@ class PhraseSerializer(ArangoModelSerializer):
             "phrase_ref",
             "conjugated",
             "english",
+            "has_recording",
         ]
+
+    def get_has_recording(self, obj):
+        # Handle both dict objects (from ArangoDB) and model objects
+        if isinstance(obj, dict):
+            return obj.get("has_recording", False)
+        return getattr(obj, "has_recording", False)
 
     def to_representation(self, instance):
         # Return all attributes from the ArangoDB document, excluding certain fields
         exclude_fields = ["_rev", "_id"]  # Add fields you want to exclude
-        return {k: v for k, v in instance.items() if k not in exclude_fields}
+        result = {k: v for k, v in instance.items() if k not in exclude_fields}
+        return result
 
 
 class SampleSerializer(ArangoModelSerializer):
@@ -129,16 +139,15 @@ class SampleSerializer(ArangoModelSerializer):
         fields = [
             "sample_ref",
             "source_type",
-            "dialect_group",
-            "self_attrib_name",
             "dialect_name",
+            "self_attrib_name",
+            "dialect_group_name",
             "location",
             "country_code",
             "live",
             "coordinates",
             "visible",
             "migrant",
-            "dialect_group",
             "contact_languages",
         ]
 

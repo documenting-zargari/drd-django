@@ -220,7 +220,7 @@ class PhraseViewSet(ArangoModelViewSet):
         except (NotFound, ValidationError):
             raise
         except Exception as e:
-            print(f"Error fetching phrases for answer: {e}")
+            print(f"Error fetching phrases for answer: {e}, {answer}")
             raise NotFound(detail="Error retrieving phrases")
 
 
@@ -542,13 +542,16 @@ class TranscriptionViewSet(ArangoModelViewSet):
     Available endpoints:
     - GET /transcriptions/?sample=<sample_ref> - List transcriptions for a specific sample (REQUIRED)
     - GET /transcriptions/<id>/ - Retrieve specific transcription by ID
+    - GET /transcriptions/by-answer/?answer_key=<key> - Get transcriptions linked to an answer
 
     Query Parameters:
     - sample (required): Sample reference (e.g., sample=AL-001)
+    - answer_key (required for by-answer): Answer _key
 
     Examples:
     - /transcriptions/?sample=AL-001 - Transcriptions for sample AL-001
     - /transcriptions/123/ - Specific transcription with ID 123
+    - /transcriptions/by-answer/?answer_key=ABC123 - Transcriptions linked to answer ABC123
 
     Results are sorted by segment_no in ascending order.
     """
@@ -584,4 +587,50 @@ class TranscriptionViewSet(ArangoModelViewSet):
         except Exception as e:
             print(f"Error fetching transcriptions: {e}")
             return []
+
+    @action(detail=False, methods=["get"], url_path="by-answer")
+    def by_answer(self, request):
+        """
+        Get transcriptions associated with an answer.
+
+        Query Parameters:
+        - answer_key (required): Answer _key
+
+        Returns transcriptions linked to the answer through HasTranscription edges.
+        If no answer found or no transcriptions found, returns 404.
+        """
+        from rest_framework.exceptions import ValidationError
+
+        try:
+            answer_key = request.query_params.get("answer_key")
+
+            if not answer_key:
+                raise ValidationError("Answer key parameter is required")
+
+            # Get the answer document by _key
+            db = request.arangodb
+            answer = db.collection("Answers").get(answer_key)
+            if not answer:
+                raise NotFound(detail="Answer not found")
+
+            # Execute the AQL query to find transcriptions
+            transcriptions = list(db.aql.execute(
+                "FOR v IN 1..1 OUTBOUND @answer HasTranscription RETURN v",
+                bind_vars={'answer': answer['_id']}))
+
+            if not transcriptions:
+                raise NotFound(detail="No transcriptions found for this answer")
+
+            # Sort transcriptions by segment_no
+            transcriptions.sort(key=lambda x: x.get("segment_no", 0))
+
+            # Serialize the transcriptions
+            serializer = self.serializer_class(transcriptions, many=True, context={"request": request})
+            return Response(serializer.data)
+
+        except (NotFound, ValidationError):
+            raise
+        except Exception as e:
+            print(f"Error fetching transcriptions for answer: {e}")
+            raise NotFound(detail="Error retrieving transcriptions")
 

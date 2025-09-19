@@ -244,11 +244,19 @@ class SampleViewSet(ArangoModelViewSet):
     http_method_names = ["get", "head", "options"]  # prevent post
 
     def get_object(self, pk):
-        # Override to use sample_ref instead of _key
-        instance = self.model.get_by_field("sample_ref", pk)
-        if not instance:
+        # Override to use sample_ref and include sources
+        db = self.request.arangodb
+        aql_query = """
+        FOR sample IN Samples
+        FILTER sample.sample_ref == @sample_ref
+        LET sources = (FOR source IN Sources FILTER source.sample == sample.sample_ref RETURN source)
+        RETURN MERGE(sample, {sources: sources})
+        """
+        cursor = db.aql.execute(aql_query, bind_vars={"sample_ref": pk})
+        docs = list(cursor)
+        if not docs:
             raise NotFound(detail="Sample not found")
-        return instance
+        return docs[0]
 
     def get_queryset(self):
         try:

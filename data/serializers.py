@@ -133,6 +133,7 @@ class PhraseSerializer(ArangoModelSerializer):
 class SampleSerializer(ArangoModelSerializer):
     coordinates = serializers.SerializerMethodField()
     contact_languages = serializers.SerializerMethodField()
+    sources = serializers.SerializerMethodField()
 
     class Meta:
         model = Sample
@@ -149,6 +150,7 @@ class SampleSerializer(ArangoModelSerializer):
             "visible",
             "migrant",
             "contact_languages",
+            "sources",
         ]
 
     def get_coordinates(self, obj):
@@ -164,6 +166,16 @@ class SampleSerializer(ArangoModelSerializer):
             return obj.get("contact_languages", None)
         else:
             return getattr(obj, "contact_languages", None)
+
+    def get_sources(self, obj):
+        # Handle both dict objects (from ArangoDB) and model objects
+        if isinstance(obj, dict):
+            sources = obj.get("sources", [])
+            # Clean up each source by removing ArangoDB internal fields
+            exclude_fields = ["_rev", "_key", "_id"]
+            return [{k: v for k, v in source.items() if k not in exclude_fields} for source in sources]
+        else:
+            return getattr(obj, "sources", [])
 
     def to_representation(self, instance):
         result = super().to_representation(instance)

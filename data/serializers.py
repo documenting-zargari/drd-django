@@ -171,9 +171,12 @@ class SampleSerializer(ArangoModelSerializer):
         # Handle both dict objects (from ArangoDB) and model objects
         if isinstance(obj, dict):
             sources = obj.get("sources", [])
-            # Clean up each source by removing ArangoDB internal fields
-            exclude_fields = ["_rev", "_key", "_id"]
-            return [{k: v for k, v in source.items() if k not in exclude_fields} for source in sources]
+            # Only include sources that have 'full_reference' field, and only show that field
+            filtered_sources = []
+            for source in sources:
+                if 'full_reference' in source:
+                    filtered_sources.append({'full_reference': source['full_reference']})
+            return filtered_sources
         else:
             return getattr(obj, "sources", [])
 

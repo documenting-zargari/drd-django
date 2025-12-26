@@ -458,7 +458,7 @@ class AnswerViewSet(ArangoModelViewSet):
     def get_answers_with_field_filters(self, search_filters, sample_refs=None):
         """Get answers with field-based filtering using search parameters"""
         # Define allowed search fields for security
-        ALLOWED_SEARCH_FIELDS = {'form', 'marker'}
+        # ALLOWED_SEARCH_FIELDS = {'form', 'marker', 'case_name'}
         
         db = self.request.arangodb
         if not search_filters:
@@ -469,8 +469,8 @@ class AnswerViewSet(ArangoModelViewSet):
             question_ids = []
             for filter_obj in search_filters:
                 question_ids.append(filter_obj["question_id"])
-                if filter_obj["field"] and filter_obj["field"] not in ALLOWED_SEARCH_FIELDS:
-                    raise ValidationError(f"Field '{filter_obj['field']}' is not searchable. Allowed fields: {', '.join(sorted(ALLOWED_SEARCH_FIELDS))}")
+                # if filter_obj["field"] and filter_obj["field"] not in ALLOWED_SEARCH_FIELDS:
+                #     raise ValidationError(f"Field '{filter_obj['field']}' is not searchable. Allowed fields: {', '.join(sorted(ALLOWED_SEARCH_FIELDS))}")
             
             # Validate all question IDs exist
             question_ids = list(set(question_ids))  # Remove duplicates

@@ -29,6 +29,7 @@ DEBUG = os.environ.get("DEBUG", "False").lower() in ("true", "1", "yes", "on")
 ADD_ALLOWED_HOST = os.environ.get("ALLOWED_HOST", "*")
 
 ALLOWED_HOSTS = [
+    "localhost",
     "127.0.0.1",
     "0.0.0.0",
     ADD_ALLOWED_HOST,

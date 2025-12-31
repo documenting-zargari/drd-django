@@ -204,11 +204,12 @@ class PhraseViewSet(ArangoModelViewSet):
 
             # Execute the AQL query to find phrases
             phrases = list(db.aql.execute(
-                "FOR v IN 1..1 OUTBOUND @answer HasPhrase RETURN v", 
+                "FOR v IN 1..1 OUTBOUND @answer HasPhrase RETURN v",
                 bind_vars={'answer': answer['_id']}))
 
+            # Return empty array if no phrases (not 404) - let frontend handle empty state
             if not phrases:
-                raise NotFound(detail="No phrases found for this answer and sample")
+                return Response([])
 
             # Sort phrases naturally by phrase_ref
             phrases = natsorted(phrases, key=lambda x: x["phrase_ref"])
@@ -626,8 +627,9 @@ class TranscriptionViewSet(ArangoModelViewSet):
                 "FOR v IN 1..1 OUTBOUND @answer HasTranscription RETURN v",
                 bind_vars={'answer': answer['_id']}))
 
+            # Return empty array if no transcriptions (not 404) - let frontend handle empty state
             if not transcriptions:
-                raise NotFound(detail="No transcriptions found for this answer")
+                return Response([])
 
             # Sort transcriptions by segment_no
             transcriptions.sort(key=lambda x: x.get("segment_no", 0))

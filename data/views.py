@@ -180,48 +180,100 @@ class PhraseViewSet(ArangoModelViewSet):
     @action(detail=False, methods=["get"], url_path="by-answer")
     def by_answer(self, request):
         """
-        Get phrases associated with an answer via phrase tags.
-        
+        Get phrases associated with an answer via sample + tag matching.
+
         Query Parameters:
         - answer_key (required): Answer _key
-        
-        Returns phrases linked to the answer through phrase tags and anchors.
-        If no tag with matching ID in answer or no phrases found, returns 404.
+
+        Returns phrases where:
+        - phrase.sample == answer.sample AND answer.tag_id IN phrase.tag_ids
+        - OR if tag_id is NULL but tag_word exists, searches phrase text and english
         """
         from rest_framework.exceptions import ValidationError
-        
+
         try:
             answer_key = request.query_params.get("answer_key")
-            
             if not answer_key:
                 raise ValidationError("Answer key parameter is required")
-            
-            # Get the answer document by _key
+
             db = request.arangodb
             answer = db.collection("Answers").get(answer_key)
             if not answer:
                 raise NotFound(detail="Answer not found")
 
-            # Execute the AQL query to find phrases
-            phrases = list(db.aql.execute(
-                "FOR v IN 1..1 OUTBOUND @answer HasPhrase RETURN v",
-                bind_vars={'answer': answer['_id']}))
+            sample = answer.get('sample')
+            if not sample:
+                return Response([])
 
-            # Return empty array if no phrases (not 404) - let frontend handle empty state
+            # Collect tag_ids and tag_words from answer
+            tag_ids = []
+            tag_words = []
+
+            # Handle single tag format
+            if 'tag' in answer and answer['tag']:
+                tag = answer['tag']
+                if tag.get('tag_id'):
+                    tag_ids.append(tag['tag_id'])
+                elif tag.get('name'):
+                    tag_words.append(tag['name'])
+
+            # Handle tags array format
+            if 'tags' in answer and answer['tags']:
+                for tag in answer['tags']:
+                    if tag.get('tag_id'):
+                        tag_ids.append(tag['tag_id'])
+                    elif tag.get('tag_word'):
+                        tag_words.append(tag['tag_word'])
+
+            phrases = []
+
+            # Query by tag_ids if available
+            if tag_ids:
+                aql = """
+                    FOR phrase IN Phrases
+                        FILTER phrase.sample == @sample
+                        FILTER LENGTH(INTERSECTION(phrase.tag_ids || [], @tag_ids)) > 0
+                        RETURN phrase
+                """
+                phrases.extend(db.aql.execute(aql, bind_vars={
+                    'sample': sample,
+                    'tag_ids': tag_ids
+                }))
+
+            # Fallback: text search by tag_words
+            if tag_words and not phrases:
+                for tag_word in tag_words:
+                    aql = """
+                        FOR phrase IN Phrases
+                            FILTER phrase.sample == @sample
+                            FILTER CONTAINS(LOWER(phrase.phrase || ''), LOWER(@tag_word))
+                                OR CONTAINS(LOWER(phrase.english || ''), LOWER(@tag_word))
+                            RETURN phrase
+                    """
+                    phrases.extend(db.aql.execute(aql, bind_vars={
+                        'sample': sample,
+                        'tag_word': tag_word
+                    }))
+
             if not phrases:
                 return Response([])
 
-            # Sort phrases naturally by phrase_ref
-            phrases = natsorted(phrases, key=lambda x: x["phrase_ref"])
+            # Deduplicate and sort
+            seen = set()
+            unique_phrases = []
+            for p in phrases:
+                if p['_key'] not in seen:
+                    seen.add(p['_key'])
+                    unique_phrases.append(p)
 
-            # Serialize the phrases
+            phrases = natsorted(unique_phrases, key=lambda x: x.get("phrase_ref", ""))
             serializer = self.serializer_class(phrases, many=True, context={"request": request})
             return Response(serializer.data)
 
         except (NotFound, ValidationError):
             raise
         except Exception as e:
-            print(f"Error fetching phrases for answer: {e}, {answer}")
+            print(f"Error fetching phrases for answer: {e}")
             raise NotFound(detail="Error retrieving phrases")
 
 
@@ -600,41 +652,70 @@ class TranscriptionViewSet(ArangoModelViewSet):
     @action(detail=False, methods=["get"], url_path="by-answer")
     def by_answer(self, request):
         """
-        Get transcriptions associated with an answer.
+        Get transcriptions associated with an answer via sample + tag matching.
 
         Query Parameters:
         - answer_key (required): Answer _key
 
-        Returns transcriptions linked to the answer through HasTranscription edges.
-        If no answer found or no transcriptions found, returns 404.
+        Returns transcriptions where:
+        - transcription.sample == answer.sample AND transcription has HasTag edge to matching tag_id
         """
         from rest_framework.exceptions import ValidationError
 
         try:
             answer_key = request.query_params.get("answer_key")
-
             if not answer_key:
                 raise ValidationError("Answer key parameter is required")
 
-            # Get the answer document by _key
             db = request.arangodb
             answer = db.collection("Answers").get(answer_key)
             if not answer:
                 raise NotFound(detail="Answer not found")
 
-            # Execute the AQL query to find transcriptions
-            transcriptions = list(db.aql.execute(
-                "FOR v IN 1..1 OUTBOUND @answer HasTranscription RETURN v",
-                bind_vars={'answer': answer['_id']}))
+            sample = answer.get('sample')
+            if not sample:
+                return Response([])
 
-            # Return empty array if no transcriptions (not 404) - let frontend handle empty state
+            # Collect tag_ids from answer
+            tag_ids = []
+
+            # Handle single tag format
+            if 'tag' in answer and answer['tag']:
+                tag = answer['tag']
+                if tag.get('tag_id'):
+                    tag_ids.append(tag['tag_id'])
+
+            # Handle tags array format
+            if 'tags' in answer and answer['tags']:
+                for tag in answer['tags']:
+                    if tag.get('tag_id'):
+                        tag_ids.append(tag['tag_id'])
+
+            transcriptions = []
+
+            if tag_ids:
+                # Find transcriptions via HasTag edges to PhraseTags
+                aql = """
+                    FOR transcription IN Transcriptions
+                        FILTER transcription.sample == @sample
+                        LET tags = (
+                            FOR tag IN 1..1 OUTBOUND transcription HasTag
+                                FILTER tag.id IN @tag_ids
+                                RETURN tag
+                        )
+                        FILTER LENGTH(tags) > 0
+                        RETURN transcription
+                """
+                transcriptions = list(db.aql.execute(aql, bind_vars={
+                    'sample': sample,
+                    'tag_ids': tag_ids
+                }))
+
             if not transcriptions:
                 return Response([])
 
-            # Sort transcriptions by segment_no
+            # Sort by segment_no
             transcriptions.sort(key=lambda x: x.get("segment_no", 0))
-
-            # Serialize the transcriptions
             serializer = self.serializer_class(transcriptions, many=True, context={"request": request})
             return Response(serializer.data)
 

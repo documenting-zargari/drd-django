@@ -240,14 +240,14 @@ class PhraseViewSet(ArangoModelViewSet):
                     'tag_ids': tag_ids
                 }))
 
-            # Fallback: text search by tag_words
+            # Fallback: text search by tag_words (whole word matching)
             if tag_words and not phrases:
                 for tag_word in tag_words:
                     aql = """
                         FOR phrase IN Phrases
                             FILTER phrase.sample == @sample
-                            FILTER CONTAINS(LOWER(phrase.phrase || ''), LOWER(@tag_word))
-                                OR CONTAINS(LOWER(phrase.english || ''), LOWER(@tag_word))
+                            FILTER REGEX_TEST(phrase.phrase || '', CONCAT('(?i)(^|[^a-zA-Z])', @tag_word, '([^a-zA-Z]|$)'))
+                                OR REGEX_TEST(phrase.english || '', CONCAT('(?i)(^|[^a-zA-Z])', @tag_word, '([^a-zA-Z]|$)'))
                             RETURN phrase
                     """
                     phrases.extend(db.aql.execute(aql, bind_vars={

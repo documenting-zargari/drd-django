@@ -240,20 +240,37 @@ class PhraseViewSet(ArangoModelViewSet):
                     'tag_ids': tag_ids
                 }))
 
-            # Fallback: text search by tag_words (whole word matching)
+            # Fallback: text search by tag_words
+            # First try exact match on english field (for tags like "be (PRES)")
+            # Then fall back to regex word matching on phrase field
             if tag_words and not phrases:
+                import re
                 for tag_word in tag_words:
-                    aql = """
+                    # Try exact case-insensitive match on english field first
+                    aql_exact = """
                         FOR phrase IN Phrases
                             FILTER phrase.sample == @sample
-                            FILTER REGEX_TEST(phrase.phrase || '', CONCAT('(?i)(^|[^a-zA-Z])', @tag_word, '([^a-zA-Z]|$)'))
-                                OR REGEX_TEST(phrase.english || '', CONCAT('(?i)(^|[^a-zA-Z])', @tag_word, '([^a-zA-Z]|$)'))
+                            FILTER LOWER(phrase.english || '') == LOWER(@tag_word)
                             RETURN phrase
                     """
-                    phrases.extend(db.aql.execute(aql, bind_vars={
+                    phrases.extend(db.aql.execute(aql_exact, bind_vars={
                         'sample': sample,
                         'tag_word': tag_word
                     }))
+
+                    # If no exact match, try regex on phrase field (escape special chars)
+                    if not phrases:
+                        escaped_tag = re.escape(tag_word)
+                        aql_regex = """
+                            FOR phrase IN Phrases
+                                FILTER phrase.sample == @sample
+                                FILTER REGEX_TEST(phrase.phrase || '', CONCAT('(?i)(^|[^a-zA-Z])', @escaped_tag, '([^a-zA-Z]|$)'))
+                                RETURN phrase
+                        """
+                        phrases.extend(db.aql.execute(aql_regex, bind_vars={
+                            'sample': sample,
+                            'escaped_tag': escaped_tag
+                        }))
 
             if not phrases:
                 return Response([])

@@ -461,6 +461,9 @@ class AnswerViewSet(ArangoModelViewSet):
     - q: Question ID(s) - multiple values allowed
     - search: Field-based filters - "question_id,field,value" format only
     - s: Sample reference(s) - multiple values allowed
+    - include_hidden: Set to "true" to include answers from non-visible samples (default: false)
+
+    By default, only answers from visible samples are returned.
 
     Searchable Fields: form, marker
 
@@ -468,6 +471,7 @@ class AnswerViewSet(ArangoModelViewSet):
     - /answers/?q=1 - All answers for question 1
     - /answers/?search=1,form,verbal - Answers where form=verbal
     - /answers/?search=1,form,verbal&search=2,marker,past - Multiple field filters
+    - /answers/?q=1&include_hidden=true - Include answers from hidden samples
     """
 
     serializer_class = AnswerSerializer
@@ -539,6 +543,16 @@ class AnswerViewSet(ArangoModelViewSet):
         if missing_samples:
             raise NotFound(detail=f"Samples not found: {sorted(missing_samples)}")
 
+    def get_visible_sample_refs(self):
+        """Get list of visible sample references for filtering."""
+        db = self.request.arangodb
+        cursor = db.aql.execute('FOR s IN Samples FILTER s.visible == "Yes" RETURN s.sample_ref')
+        return [ref for ref in cursor]
+
+    def include_hidden(self):
+        """Check if the request asks to include hidden (non-visible) samples."""
+        return self.request.GET.get("include_hidden", "").lower() in ("true", "1", "yes")
+
     def get_answers_for_questions(self, question_ids, sample_refs=None):
         """Helper method to get answers for multiple question IDs and sample references"""
         db = self.request.arangodb
@@ -554,18 +568,25 @@ class AnswerViewSet(ArangoModelViewSet):
                 self.validate_samples(sample_refs)
 
             # Build single AQL query to get all answers for all questions
-            sample_filter = ""
+            filters = []
             bind_vars = {"question_ids": question_ids}
 
             if sample_refs:
-                sample_filter = "FILTER answer.sample IN @samples"
+                filters.append("FILTER answer.sample IN @samples")
                 bind_vars["samples"] = sample_refs
+
+            if not self.include_hidden():
+                visible_refs = self.get_visible_sample_refs()
+                filters.append("FILTER answer.sample IN @visible_samples")
+                bind_vars["visible_samples"] = visible_refs
+
+            filter_clause = "\n                ".join(filters)
 
             aql = f"""
             FOR question IN ResearchQuestions
               FILTER question.id IN @question_ids
               FOR answer IN 1..1 OUTBOUND question GivesAnswer
-                {sample_filter}
+                {filter_clause}
                 RETURN MERGE(answer, {{question_id: question.id}})
             """
 
@@ -623,15 +644,20 @@ class AnswerViewSet(ArangoModelViewSet):
             filter_clause = " OR ".join(conditions)
             
             # Add sample filtering if provided
-            sample_filter = ""
+            extra_filters = ""
             if sample_refs:
-                sample_filter = " AND answer.sample IN @sample_refs"
+                extra_filters += " AND answer.sample IN @sample_refs"
                 bind_vars["sample_refs"] = sample_refs
-            
+
+            if not self.include_hidden():
+                visible_refs = self.get_visible_sample_refs()
+                extra_filters += " AND answer.sample IN @visible_samples"
+                bind_vars["visible_samples"] = visible_refs
+
             # Build final AQL query
             aql = f"""
             FOR answer IN Answers
-              FILTER ({filter_clause}){sample_filter}
+              FILTER ({filter_clause}){extra_filters}
               RETURN answer
             """
             

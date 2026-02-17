@@ -133,6 +133,60 @@ class CategoryViewSet(ArangoModelViewSet):
         except Exception as e:
             return Response({"error": f"Search failed: {str(e)}"}, status=500)
 
+    @action(detail=False, methods=["get"], url_path="search-views")
+    def search_views(self, request):
+        """
+        Return all categories that have an associated view (path field).
+        Optionally filter by name with ?q= parameter.
+        """
+        db = request.arangodb
+        if not db:
+            return Response({"error": "Database not available"}, status=500)
+
+        query = request.query_params.get("q", "").strip()
+        if query:
+            search_pattern = f".*{query}.*"
+            aql_query = """
+            FOR doc IN Categories
+            FILTER doc.path != null AND doc.path != "" AND REGEX_TEST(doc.name, @search_pattern, 'i')
+            SORT doc.id ASC
+            RETURN { "id": doc.id, "name": doc.name, "hierarchy": doc.hierarchy, "parent_id": doc.parent_id, "path": doc.path }
+            """
+            bind_vars = {"search_pattern": search_pattern}
+        else:
+            aql_query = """
+            FOR doc IN Categories
+            FILTER doc.path != null AND doc.path != ""
+            SORT doc.id ASC
+            RETURN { "id": doc.id, "name": doc.name, "hierarchy": doc.hierarchy, "parent_id": doc.parent_id, "path": doc.path }
+            """
+            bind_vars = {}
+
+        try:
+            cursor = db.aql.execute(aql_query, bind_vars=bind_vars)
+            results = []
+            for doc in cursor:
+                hierarchy = doc.get("hierarchy", [])
+                if isinstance(hierarchy, str):
+                    try:
+                        hierarchy = eval(hierarchy)
+                    except Exception as _:
+                        hierarchy = []
+                results.append(
+                    {
+                        "id": doc["id"],
+                        "name": doc["name"],
+                        "hierarchy": hierarchy if len(hierarchy) > 2 else [],
+                        "parent_id": doc["parent_id"],
+                        "path": doc["path"],
+                        "has_children": False,
+                    }
+                )
+
+            return Response(results)
+        except Exception as e:
+            return Response({"error": f"Search failed: {str(e)}"}, status=500)
+
 class PhraseViewSet(ArangoModelViewSet):
     """
     API endpoint for retrieving phrases associated with samples.

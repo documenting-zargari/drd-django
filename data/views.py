@@ -482,18 +482,51 @@ class AnswerViewSet(ArangoModelViewSet):
 
     serializer_class = AnswerSerializer
     model = Answer
-    http_method_names = ["get", "head", "options"]  # exclude PUT, POST, DELETE
+    http_method_names = ["get", "post", "head", "options"]
 
+    def create(self, request):
+        """
+        POST handler for answers - accepts question IDs and sample refs in request body.
+        Avoids URL length limitations when querying many question IDs.
+
+        Request body (JSON):
+        {
+            "question_ids": [1, 2, 3, ...],
+            "sample_refs": ["SAMPLE-001", ...],  // optional
+            "include_hidden": false               // optional
+        }
+        """
+        from rest_framework.response import Response
+
+        try:
+            body = request.data
+            question_ids = body.get("question_ids", [])
+            sample_refs = body.get("sample_refs", [])
+
+            if not question_ids:
+                raise NotFound(detail="At least one question ID is required")
+
+            answers = self.get_answers_for_questions(question_ids, sample_refs if sample_refs else None)
+            serializer = self.serializer_class(
+                answers, many=True, context={"request": request, "view": self}
+            )
+            return Response(serializer.data)
+
+        except (NotFound, ValidationError):
+            raise
+        except Exception as e:
+            print(f"Error in POST answers: {e}")
+            raise ValidationError(f"Error processing request: {str(e)}")
 
     def get_queryset(self):
         try:
             # Parse legacy q parameters
             question_ids = self.request.GET.getlist("q")
-            
+
             # Parse new search parameters
             search_params = self.request.GET.getlist("search")
             search_filters = []
-            
+
             for param in search_params:
                 parts = param.split(',', 2)  # Limit to 3 parts to handle commas in values
                 if len(parts) == 3:
@@ -505,16 +538,16 @@ class AnswerViewSet(ArangoModelViewSet):
                     })
                 else:
                     raise ValidationError(f"Invalid search parameter format: {param}. Use 'question_id,field,value' format")
-            
+
             # Get sample filters
             sample_refs = self.request.GET.getlist("s")
-            
+
             # Require at least one filter (legacy q or new search)
             if not question_ids and not search_filters:
                 raise NotFound(
                     detail="At least one question ID (q parameter) or search filter is required"
                 )
-            
+
             # Use new search method if search parameters provided, otherwise legacy method
             if search_filters:
                 return self.get_answers_with_field_filters(search_filters, sample_refs)
@@ -557,7 +590,12 @@ class AnswerViewSet(ArangoModelViewSet):
 
     def include_hidden(self):
         """Check if the request asks to include hidden (non-visible) samples."""
-        return self.request.GET.get("include_hidden", "").lower() in ("true", "1", "yes")
+        # Check GET params (for GET requests) and body (for POST requests)
+        if self.request.GET.get("include_hidden", "").lower() in ("true", "1", "yes"):
+            return True
+        if self.request.method == "POST" and hasattr(self.request, 'data'):
+            return bool(self.request.data.get("include_hidden", False))
+        return False
 
     def get_answers_for_questions(self, question_ids, sample_refs=None):
         """Helper method to get answers for multiple question IDs and sample references"""

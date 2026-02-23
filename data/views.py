@@ -296,10 +296,16 @@ class PhraseViewSet(ArangoModelViewSet):
 
             # Fallback: text search by tag_words
             # First try exact match on english field (for tags like "be (PRES)")
-            # Then fall back to regex word matching on phrase field
+            # Then fall back to regex word matching on english field
+            # Strip bracketed annotations like [<CONJ>], [PAST] before searching
             if tag_words and not phrases:
                 import re
                 for tag_word in tag_words:
+                    # Strip bracketed annotations (e.g., "did[<CONJ>]" -> "did", "put [PAST]" -> "put")
+                    clean_tag = re.sub(r'\s*\[.*?\]', '', tag_word).strip()
+                    if not clean_tag:
+                        clean_tag = tag_word
+
                     # Try exact case-insensitive match on english field first
                     aql_exact = """
                         FOR phrase IN Phrases
@@ -309,16 +315,16 @@ class PhraseViewSet(ArangoModelViewSet):
                     """
                     phrases.extend(db.aql.execute(aql_exact, bind_vars={
                         'sample': sample,
-                        'tag_word': tag_word
+                        'tag_word': clean_tag
                     }))
 
-                    # If no exact match, try regex on phrase field (escape special chars)
+                    # If no exact match, try regex word match on english field
                     if not phrases:
-                        escaped_tag = re.escape(tag_word)
+                        escaped_tag = re.escape(clean_tag)
                         aql_regex = """
                             FOR phrase IN Phrases
                                 FILTER phrase.sample == @sample
-                                FILTER REGEX_TEST(phrase.phrase || '', CONCAT('(?i)(^|[^a-zA-Z])', @escaped_tag, '([^a-zA-Z]|$)'))
+                                FILTER REGEX_TEST(phrase.english || '', CONCAT('(?i)(^|[^a-zA-Z])', @escaped_tag, '([^a-zA-Z]|$)'))
                                 RETURN phrase
                         """
                         phrases.extend(db.aql.execute(aql_regex, bind_vars={

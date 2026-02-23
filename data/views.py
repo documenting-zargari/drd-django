@@ -296,10 +296,16 @@ class PhraseViewSet(ArangoModelViewSet):
 
             # Fallback: text search by tag_words
             # First try exact match on english field (for tags like "be (PRES)")
-            # Then fall back to regex word matching on phrase field
+            # Then fall back to regex word matching on english field
+            # Strip bracketed annotations like [<CONJ>], [PAST] before searching
             if tag_words and not phrases:
                 import re
                 for tag_word in tag_words:
+                    # Strip bracketed annotations (e.g., "did[<CONJ>]" -> "did", "put [PAST]" -> "put")
+                    clean_tag = re.sub(r'\s*\[.*?\]', '', tag_word).strip()
+                    if not clean_tag:
+                        clean_tag = tag_word
+
                     # Try exact case-insensitive match on english field first
                     aql_exact = """
                         FOR phrase IN Phrases
@@ -309,16 +315,16 @@ class PhraseViewSet(ArangoModelViewSet):
                     """
                     phrases.extend(db.aql.execute(aql_exact, bind_vars={
                         'sample': sample,
-                        'tag_word': tag_word
+                        'tag_word': clean_tag
                     }))
 
-                    # If no exact match, try regex on phrase field (escape special chars)
+                    # If no exact match, try regex word match on english field
                     if not phrases:
-                        escaped_tag = re.escape(tag_word)
+                        escaped_tag = re.escape(clean_tag)
                         aql_regex = """
                             FOR phrase IN Phrases
                                 FILTER phrase.sample == @sample
-                                FILTER REGEX_TEST(phrase.phrase || '', CONCAT('(?i)(^|[^a-zA-Z])', @escaped_tag, '([^a-zA-Z]|$)'))
+                                FILTER REGEX_TEST(phrase.english || '', CONCAT('(?i)(^|[^a-zA-Z])', @escaped_tag, '([^a-zA-Z]|$)'))
                                 RETURN phrase
                         """
                         phrases.extend(db.aql.execute(aql_regex, bind_vars={
@@ -476,18 +482,51 @@ class AnswerViewSet(ArangoModelViewSet):
 
     serializer_class = AnswerSerializer
     model = Answer
-    http_method_names = ["get", "head", "options"]  # exclude PUT, POST, DELETE
+    http_method_names = ["get", "post", "head", "options"]
 
+    def create(self, request):
+        """
+        POST handler for answers - accepts question IDs and sample refs in request body.
+        Avoids URL length limitations when querying many question IDs.
+
+        Request body (JSON):
+        {
+            "question_ids": [1, 2, 3, ...],
+            "sample_refs": ["SAMPLE-001", ...],  // optional
+            "include_hidden": false               // optional
+        }
+        """
+        from rest_framework.response import Response
+
+        try:
+            body = request.data
+            question_ids = body.get("question_ids", [])
+            sample_refs = body.get("sample_refs", [])
+
+            if not question_ids:
+                raise NotFound(detail="At least one question ID is required")
+
+            answers = self.get_answers_for_questions(question_ids, sample_refs if sample_refs else None)
+            serializer = self.serializer_class(
+                answers, many=True, context={"request": request, "view": self}
+            )
+            return Response(serializer.data)
+
+        except (NotFound, ValidationError):
+            raise
+        except Exception as e:
+            print(f"Error in POST answers: {e}")
+            raise ValidationError(f"Error processing request: {str(e)}")
 
     def get_queryset(self):
         try:
             # Parse legacy q parameters
             question_ids = self.request.GET.getlist("q")
-            
+
             # Parse new search parameters
             search_params = self.request.GET.getlist("search")
             search_filters = []
-            
+
             for param in search_params:
                 parts = param.split(',', 2)  # Limit to 3 parts to handle commas in values
                 if len(parts) == 3:
@@ -499,16 +538,16 @@ class AnswerViewSet(ArangoModelViewSet):
                     })
                 else:
                     raise ValidationError(f"Invalid search parameter format: {param}. Use 'question_id,field,value' format")
-            
+
             # Get sample filters
             sample_refs = self.request.GET.getlist("s")
-            
+
             # Require at least one filter (legacy q or new search)
             if not question_ids and not search_filters:
                 raise NotFound(
                     detail="At least one question ID (q parameter) or search filter is required"
                 )
-            
+
             # Use new search method if search parameters provided, otherwise legacy method
             if search_filters:
                 return self.get_answers_with_field_filters(search_filters, sample_refs)
@@ -551,7 +590,12 @@ class AnswerViewSet(ArangoModelViewSet):
 
     def include_hidden(self):
         """Check if the request asks to include hidden (non-visible) samples."""
-        return self.request.GET.get("include_hidden", "").lower() in ("true", "1", "yes")
+        # Check GET params (for GET requests) and body (for POST requests)
+        if self.request.GET.get("include_hidden", "").lower() in ("true", "1", "yes"):
+            return True
+        if self.request.method == "POST" and hasattr(self.request, 'data'):
+            return bool(self.request.data.get("include_hidden", False))
+        return False
 
     def get_answers_for_questions(self, question_ids, sample_refs=None):
         """Helper method to get answers for multiple question IDs and sample references"""

@@ -1,6 +1,7 @@
 from django.http import JsonResponse
 from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound, ValidationError
+from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from natsort import natsorted
 
@@ -520,6 +521,7 @@ class AnswerViewSet(ArangoModelViewSet):
     serializer_class = AnswerSerializer
     model = Answer
     http_method_names = ["get", "post", "head", "options"]
+    permission_classes = [AllowAny]  # POST is used as a query method here, not for writes
 
     def create(self, request):
         """

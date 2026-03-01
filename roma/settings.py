@@ -100,15 +100,26 @@ if ADD_ALLOWED_ORIGINS:
     CORS_ALLOWED_ORIGINS.extend(ADD_ALLOWED_ORIGINS.split(","))
 
 CORS_ALLOW_CREDENTIALS = True
+CORS_ALLOW_HEADERS = [
+    "accept",
+    "authorization",
+    "content-type",
+    "origin",
+    "x-csrftoken",
+    "x-requested-with",
+    "x-project",
+]
 
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
         "rest_framework.authentication.TokenAuthentication",
     ],
     "DEFAULT_PERMISSION_CLASSES": [
-        #        'rest_framework.permissions.IsAuthenticated',
+        "user.permissions.ReadOnlyOrAuthenticated",
     ],
 }
+
+AUTH_USER_MODEL = "user.CustomUser"
 
 
 ROOT_URLCONF = "roma.urls"

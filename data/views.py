@@ -28,6 +28,7 @@ class CategoryViewSet(ArangoModelViewSet):
     - GET /categories/ - List root categories (parent_id=1 by default)
     - GET /categories/?parent_id=<id> - List child categories
     - GET /categories/<id>/ - Retrieve specific category
+    - GET /categories/batch/?ids=<id1,id2,...> - Retrieve multiple categories by ID
     - GET /categories/search/?q=<term> - Search categories by name
     """
 
@@ -132,6 +133,42 @@ class CategoryViewSet(ArangoModelViewSet):
             return Response(results)
         except Exception as e:
             return Response({"error": f"Search failed: {str(e)}"}, status=500)
+
+    @action(detail=False, methods=["get"])
+    def batch(self, request):
+        """
+        Retrieve multiple categories by ID in a single request.
+
+        Query Parameters:
+        - ids (required): Comma-separated category IDs
+
+        Example:
+        - /categories/batch/?ids=10,20,30
+        """
+        ids_param = request.query_params.get("ids", "").strip()
+        if not ids_param:
+            return Response([])
+
+        try:
+            ids = [int(x) for x in ids_param.split(",") if x.strip()]
+        except ValueError:
+            return Response({"error": "ids must be comma-separated integers"}, status=400)
+
+        if not ids:
+            return Response([])
+
+        db = request.arangodb
+        aql_query = """
+        FOR doc IN Categories
+            FILTER doc.id IN @ids
+            RETURN doc
+        """
+        cursor = db.aql.execute(aql_query, bind_vars={"ids": ids})
+        results = list(cursor)
+        serializer = self.serializer_class(
+            results, many=True, context={"request": request, "view": self}
+        )
+        return Response(serializer.data)
 
     @action(detail=False, methods=["get"], url_path="search-views")
     def search_views(self, request):
@@ -726,12 +763,25 @@ class ViewViewSet(ArangoModelViewSet):
 
     Available endpoints:
     - GET /views/ - List all views
-    - GET /views/<id>/ - Retrieve specific view by ID
+    - GET /views/?filename=<filename> - Retrieve a specific view by filename
+    - GET /views/<_key>/ - Retrieve specific view by _key
     """
 
     model = View
     serializer_class = ViewSerializer
     http_method_names = ["get", "head", "options"]  # Read-only access
+
+    def list(self, request):
+        filename = request.query_params.get("filename")
+        if filename:
+            doc = View.get_by_field("filename", filename)
+            if not doc:
+                raise NotFound(detail=f"View not found for filename: {filename}")
+            serializer = self.serializer_class(
+                doc, context={"request": request, "view": self}
+            )
+            return Response([serializer.data])
+        return super().list(request)
 
 
 class TranscriptionViewSet(ArangoModelViewSet):

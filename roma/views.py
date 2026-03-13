@@ -12,6 +12,12 @@ class ArangoModelViewSet(viewsets.ViewSet):
     serializer_class = None  # Must be set in subclass.
     model = None  # Must be set in subclass.
 
+    def get_serializer(self, *args, **kwargs):
+        if self.serializer_class is not None:
+            kwargs.setdefault("context", {"request": self.request, "view": self})
+            return self.serializer_class(*args, **kwargs)
+        return None
+
     def get_queryset(self):
         # Return a list of all objects.
         return self.model.all()

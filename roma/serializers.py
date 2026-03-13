@@ -10,7 +10,7 @@ class ArangoModelSerializer(serializers.Serializer):
         super().__init__(*args, **kwargs)
         # Check if the serializer subclass has a Meta with a 'fields' attribute.
         meta = getattr(self, "Meta", None)
-        if meta and hasattr(meta, "fields"):
+        if meta and hasattr(meta, "fields") and meta.fields != "__all__":
             for field_name in meta.fields:
                 if field_name in self.fields:
                     continue  # Field already defined (e.g. _key)

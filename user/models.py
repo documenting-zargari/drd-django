@@ -27,6 +27,21 @@ class CustomUser(AbstractUser):
 
 
 class UserProjectRole(models.Model):
+    """
+    Represents the role of a user within a specific project, including their permissions and allowed samples.
+
+    Attributes:
+        user (ForeignKey): Reference to the CustomUser assigned to this role.
+        project (CharField): The name or identifier of the project.
+        role (CharField): The user's role in the project (viewer, editor, admin).
+        allowed_samples (TextField): Comma-separated list of sample references the user is allowed to access. Empty means access to all samples.
+
+    Meta:
+        unique_together: Ensures a user can have only one role per project.
+
+    Properties:
+        sample_list (list): Returns a list of allowed sample references, parsed from allowed_samples.
+    """
     ROLE_CHOICES = [
         ("viewer", "Viewer"),
         ("editor", "Editor"),

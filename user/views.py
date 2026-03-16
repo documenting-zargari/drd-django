@@ -1,4 +1,4 @@
-from rest_framework import status, viewsets
+from rest_framework import serializers, status, viewsets
 from rest_framework.authtoken.models import Token
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
@@ -131,6 +131,15 @@ class UserViewSet(viewsets.ModelViewSet):
             if err:
                 return err
         return super().partial_update(request, *args, **kwargs)
+
+    def perform_destroy(self, instance):
+        if instance.is_global_admin:
+            remaining = CustomUser.objects.filter(is_global_admin=True).exclude(pk=instance.pk).count()
+            if remaining == 0:
+                raise serializers.ValidationError(
+                    {"error": "Cannot delete the last global admin."}
+                )
+        instance.delete()
 
     def get_serializer_context(self):
         ctx = super().get_serializer_context()

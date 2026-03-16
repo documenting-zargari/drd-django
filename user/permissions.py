@@ -63,6 +63,40 @@ class IsGlobalOrProjectAdmin(BasePermission):
         return request.user.get_role_for_project(project) == "admin"
 
 
+class CanEditSample(BasePermission):
+    """
+    Write permission for sample-scoped data.
+    Safe methods are always allowed (public read access).
+    Write methods require editor+ role for the project, and if the user
+    has sample restrictions, the target sample must be in their allowed list.
+
+    Views using this permission must provide a `get_sample_ref(request)` method
+    that extracts the target sample_ref from the request.
+    """
+
+    def has_permission(self, request, view):
+        if request.method in SAFE_METHODS:
+            return True
+        if not request.user or not request.user.is_authenticated:
+            return False
+        project = get_project_from_request(request)
+        # Must be at least editor
+        role = request.user.get_role_for_project(project)
+        if role not in ("editor", "admin"):
+            return False
+        # Admins can edit any sample
+        if role == "admin" or request.user.is_global_admin:
+            return True
+        # Editor with possible sample restrictions
+        allowed = request.user.get_allowed_samples_for_project(project)
+        if not allowed:
+            return True  # empty = unrestricted
+        sample_ref = getattr(view, "get_sample_ref", lambda r: None)(request)
+        if sample_ref is None:
+            return False  # can't determine sample — deny
+        return sample_ref in allowed
+
+
 class IsAdminOrSelf(BasePermission):
     """
     Object-level: allows global admin, project admin, or the user themselves.

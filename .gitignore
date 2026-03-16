@@ -1,8 +1,14 @@
 .DS_Store
 .env
+.env.prod
 **/__pycache__/
 media
 
 .vscode/*
 .history
 .claude/
+
+db-settings
+static/
+staticfiles/
+venv/

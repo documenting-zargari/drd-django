@@ -18,13 +18,13 @@ Including another URLconf
 from django.contrib import admin
 from django.urls import include, path
 from rest_framework import routers
-from rest_framework.authtoken.views import obtain_auth_token
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework.reverse import reverse
 
 import data.urls
 import user.urls
+from user.views import CustomObtainAuthToken, logout_view
 
 router = routers.DefaultRouter()
 router.registry.extend(data.urls.router.registry)
@@ -67,6 +67,7 @@ def api_root(request, format=None):
             },
             "authentication": {
                 "token": reverse("api_token_auth", request=request, format=format),
+                "logout": reverse("api_logout", request=request, format=format),
                 "description": "Obtain authentication token with username/password",
             },
         }
@@ -77,5 +78,6 @@ urlpatterns = [
     path("", include(router.urls)),
     path("admin/", admin.site.urls),
     path("api-auth/", include("rest_framework.urls", namespace="rest_framework")),
-    path("api/token/", obtain_auth_token, name="api_token_auth"),
+    path("api/token/", CustomObtainAuthToken.as_view(), name="api_token_auth"),
+    path("api/logout/", logout_view, name="api_logout"),
 ]

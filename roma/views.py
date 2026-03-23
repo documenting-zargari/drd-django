@@ -2,6 +2,8 @@ from rest_framework import status, viewsets
 from rest_framework.exceptions import NotFound
 from rest_framework.response import Response
 
+from roma.pagination import ArangoPageNumberPagination
+
 
 class ArangoModelViewSet(viewsets.ViewSet):
     """
@@ -11,6 +13,24 @@ class ArangoModelViewSet(viewsets.ViewSet):
 
     serializer_class = None  # Must be set in subclass.
     model = None  # Must be set in subclass.
+    pagination_class = ArangoPageNumberPagination
+
+    @property
+    def paginator(self):
+        if not hasattr(self, '_paginator'):
+            if self.pagination_class is None:
+                self._paginator = None
+            else:
+                self._paginator = self.pagination_class()
+        return self._paginator
+
+    def paginate_queryset(self, queryset):
+        if self.paginator is None:
+            return None
+        return self.paginator.paginate_queryset(queryset, self.request, view=self)
+
+    def get_paginated_response(self, data):
+        return self.paginator.get_paginated_response(data)
 
     def get_serializer(self, *args, **kwargs):
         if self.serializer_class is not None:
@@ -47,6 +67,11 @@ class ArangoModelViewSet(viewsets.ViewSet):
         serializer = self.serializer_class(
             queryset, many=True, context={"request": request, "view": self}
         )
+        # Paginate only if page param is present (backward compatible)
+        if 'page' in request.query_params:
+            page = self.paginate_queryset(serializer.data)
+            if page is not None:
+                return self.get_paginated_response(page)
         return Response(serializer.data)
 
     def retrieve(self, request, pk=None):

@@ -180,15 +180,6 @@ class SampleSerializer(ArangoModelSerializer):
         else:
             return getattr(obj, "sources", [])
 
-    def to_representation(self, instance):
-        result = super().to_representation(instance)
-
-        # Remove contact_languages from list view only, keep it for detail view
-        view = self.context.get("view")
-        if view and hasattr(view, "action") and view.action == "list":
-            result.pop("contact_languages", None)
-
-        return result
 
 
 class SourceSerializer(ArangoModelSerializer):

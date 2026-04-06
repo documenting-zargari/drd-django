@@ -236,6 +236,7 @@ class PhraseViewSet(ArangoModelViewSet):
     - GET /phrases/?sample=<sample_ref> - List phrases for a specific sample (REQUIRED)
     - GET /phrases/<id>/ - Retrieve specific phrase by ID
     - GET /phrases/by-answer/?answer_key=<key> - Get phrases linked to an answer via phrase tags
+    - POST /phrases/search/ - Search phrases across multiple samples
 
     Query Parameters:
     - sample (required): Sample reference (e.g., sample=AL-001)
@@ -245,11 +246,13 @@ class PhraseViewSet(ArangoModelViewSet):
     - /phrases/?sample=AL-001 - Phrases for sample AL-001
     - /phrases/123/ - Specific phrase with ID 123
     - /phrases/by-answer/?answer_key=ABC123 - Phrases linked to answer ABC123 via phrase tags
+    - POST /phrases/search/ {"query": "brother", "sample_refs": ["AL-001"]}
     """
 
     model = Phrase
     serializer_class = PhraseSerializer
-    http_method_names = ["get", "head", "options"]  # Read-only access
+    http_method_names = ["get", "post", "head", "options"]
+    permission_classes = [AllowAny]  # POST is used as a query method here, not for writes
 
     def get_queryset(self):
         try:
@@ -390,6 +393,105 @@ class PhraseViewSet(ArangoModelViewSet):
         except Exception as e:
             print(f"Error fetching phrases for answer: {e}")
             raise NotFound(detail="Error retrieving phrases")
+
+    @action(detail=False, methods=["post"], url_path="search")
+    def search(self, request):
+        """
+        Search phrases across multiple samples.
+
+        Request Body:
+        - query (required, min 2 chars): Search term
+        - sample_refs (optional): List of sample refs to limit search
+        - sort (optional, default 'phrase_ref'): Sort field — 'phrase_ref' or 'sample'
+        - page (optional, default 1): Page number
+        - page_size (optional, default 50, max 200): Results per page
+        """
+        query = request.data.get("query", "").strip()
+        if not query or len(query) < 2:
+            raise ValidationError("Query must be at least 2 characters")
+
+        sample_refs = request.data.get("sample_refs", [])
+        sort = request.data.get("sort", "phrase_ref")
+        page = int(request.data.get("page", 1))
+        page_size = min(int(request.data.get("page_size", 50)), 200)
+        offset = (page - 1) * page_size
+
+        db = request.arangodb
+        query_lower = query.lower()
+
+        # Natural sort for phrase_ref: extract leading number, then sort by that numerically,
+        # then by the remaining suffix (e.g. "80a" → 80, "a")
+        natsort_expr = "TO_NUMBER(REGEX_REPLACE(phrase.phrase_ref, '[^0-9].*$', '')), REGEX_REPLACE(phrase.phrase_ref, '^[0-9]+', '')"
+        sort_clauses = {
+            "phrase_ref": f"SORT {natsort_expr}, phrase.sample",
+            "sample": f"SORT phrase.sample, {natsort_expr}",
+        }
+        sort_aql = sort_clauses.get(sort, sort_clauses["phrase_ref"])
+
+        # Resolve visible sample refs upfront (once) instead of a subquery per phrase
+        if not sample_refs:
+            visible_cursor = db.aql.execute(
+                "FOR s IN Samples FILTER s.visible == 'Yes' RETURN s.sample_ref"
+            )
+            sample_refs = list(visible_cursor)
+
+        # Uses PhraseSearch ArangoSearch view with norm_lower analyzer for fast
+        # case-insensitive substring matching via LIKE with wildcards
+        search_filter = """SEARCH ANALYZER(
+                    LIKE(phrase.phrase, CONCAT("%", @query, "%"))
+                    OR LIKE(phrase.english, CONCAT("%", @query, "%")),
+                    "norm_lower"
+                )"""
+
+        # Count query
+        count_aql = f"""
+            FOR phrase IN PhraseSearch
+                {search_filter}
+                FILTER phrase.sample IN @sample_refs
+                COLLECT WITH COUNT INTO total
+                RETURN total
+        """
+
+        # Results query — build sample label lookup once instead of per-row subquery
+        results_aql = f"""
+            LET sample_lookup = (
+                FOR s IN Samples
+                    RETURN {{ref: s.sample_ref, label: CONCAT_SEPARATOR(', ', s.dialect_name, s.location)}}
+            )
+            LET sample_map = ZIP(sample_lookup[*].ref, sample_lookup[*].label)
+            FOR phrase IN PhraseSearch
+                {search_filter}
+                FILTER phrase.sample IN @sample_refs
+                {sort_aql}
+                LIMIT @offset, @page_size
+                RETURN MERGE(phrase, {{
+                    sample_label: sample_map[phrase.sample]
+                }})
+        """
+
+        count_bind = {"query": query_lower, "sample_refs": sample_refs}
+        results_bind = {"query": query_lower, "sample_refs": sample_refs, "offset": offset, "page_size": page_size}
+
+        try:
+            count_cursor = db.aql.execute(count_aql, bind_vars=count_bind)
+            total = next(count_cursor, 0)
+
+            results_cursor = db.aql.execute(results_aql, bind_vars=results_bind)
+            results = list(results_cursor)
+
+            serializer = self.serializer_class(
+                results, many=True, context={"request": request}
+            )
+
+            return Response({
+                "count": total,
+                "page": page,
+                "page_size": page_size,
+                "results": serializer.data,
+            })
+        except Exception as e:
+            print(f"Error searching phrases: {e}")
+            raise ValidationError(f"Search failed: {str(e)}")
 
 
 class SampleViewSet(ArangoModelViewSet):

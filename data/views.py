@@ -1,4 +1,5 @@
 from django.http import JsonResponse
+from rest_framework import status
 from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound, ValidationError
 from rest_framework.permissions import AllowAny
@@ -16,6 +17,7 @@ from data.serializers import (
     ViewSerializer,
 )
 from roma.views import ArangoModelViewSet
+from user.permissions import CanEditSample, IsProjectEditor
 
 
 class CategoryViewSet(ArangoModelViewSet):
@@ -251,8 +253,49 @@ class PhraseViewSet(ArangoModelViewSet):
 
     model = Phrase
     serializer_class = PhraseSerializer
-    http_method_names = ["get", "post", "head", "options"]
-    permission_classes = [AllowAny]  # POST is used as a query method here, not for writes
+    http_method_names = ["get", "post", "patch", "head", "options"]
+    permission_classes = [AllowAny]  # GET and search POST are public; PATCH uses per-action override
+
+    EDITABLE_FIELDS = {"phrase", "english", "conjugated"}
+
+    def get_permissions(self):
+        if self.request.method == "PATCH":
+            return [CanEditSample()]
+        return [AllowAny()]
+
+    def get_sample_ref(self, request):
+        """Required by CanEditSample to resolve the target sample."""
+        pk = self.kwargs.get("pk")
+        if not pk:
+            return None
+        db = request.arangodb
+        doc = db.collection(self.model.collection_name).get(pk)
+        return doc.get("sample") if doc else None
+
+    def partial_update(self, request, pk=None):
+        """
+        PATCH /phrases/{key}/ — update editable fields on a phrase.
+        Requires editor+ role. Editors with sample restrictions may only
+        edit phrases belonging to their allowed samples.
+
+        Allowed fields: phrase, english, conjugated
+        """
+        db = request.arangodb
+        doc = db.collection(self.model.collection_name).get(pk)
+        if not doc:
+            raise NotFound(detail="Phrase not found")
+
+        updates = {k: v for k, v in request.data.items() if k in self.EDITABLE_FIELDS}
+        if not updates:
+            return Response(
+                {"error": f"No editable fields provided. Allowed: {sorted(self.EDITABLE_FIELDS)}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        db.collection(self.model.collection_name).update({"_key": pk, **updates})
+        updated = db.collection(self.model.collection_name).get(pk)
+        serializer = self.serializer_class(updated, context={"request": request})
+        return Response(serializer.data)
 
     def get_queryset(self):
         try:
@@ -412,6 +455,7 @@ class PhraseViewSet(ArangoModelViewSet):
 
         sample_refs = request.data.get("sample_refs", [])
         sort = request.data.get("sort", "phrase_ref")
+        field = request.data.get("field", "both")  # 'romani', 'english', or 'both'
         page = int(request.data.get("page", 1))
         page_size = min(int(request.data.get("page_size", 50)), 200)
         offset = (page - 1) * page_size
@@ -437,11 +481,13 @@ class PhraseViewSet(ArangoModelViewSet):
 
         # Uses PhraseSearch ArangoSearch view with norm_lower analyzer for fast
         # case-insensitive substring matching via LIKE with wildcards
-        search_filter = """SEARCH ANALYZER(
-                    LIKE(phrase.phrase, CONCAT("%", @query, "%"))
-                    OR LIKE(phrase.english, CONCAT("%", @query, "%")),
-                    "norm_lower"
-                )"""
+        if field == "romani":
+            like_expr = 'LIKE(phrase.phrase, CONCAT("%", @query, "%"))'
+        elif field == "english":
+            like_expr = 'LIKE(phrase.english, CONCAT("%", @query, "%"))'
+        else:
+            like_expr = 'LIKE(phrase.phrase, CONCAT("%", @query, "%")) OR LIKE(phrase.english, CONCAT("%", @query, "%"))'
+        search_filter = f'SEARCH ANALYZER({like_expr}, "norm_lower")'
 
         # Count query
         count_aql = f"""
@@ -511,7 +557,52 @@ class SampleViewSet(ArangoModelViewSet):
 
     serializer_class = SampleSerializer
     model = Sample
-    http_method_names = ["get", "head", "options"]  # prevent post
+    http_method_names = ["get", "patch", "head", "options"]
+
+    EDITABLE_FIELDS = {
+        "dialect_name", "self_attrib_name", "dialect_group_name",
+        "location", "country_code", "coordinates", "visible",
+        "migrant", "contact_languages",
+    }
+
+    def get_permissions(self):
+        if self.request.method == "PATCH":
+            return [IsProjectEditor()]
+        return [AllowAny()]
+
+    def partial_update(self, request, pk=None):
+        """
+        PATCH /samples/{sample_ref}/ — update editable metadata fields.
+        Requires editor+ role.
+
+        Allowed fields: dialect_name, self_attrib_name, dialect_group_name,
+        location, country_code, coordinates, visible, migrant, contact_languages
+        """
+        db = request.arangodb
+        # Look up by sample_ref
+        cursor = db.collection(self.model.collection_name).find({"sample_ref": pk}, limit=1)
+        docs = list(cursor)
+        if not docs:
+            raise NotFound(detail="Sample not found")
+        doc = docs[0]
+
+        updates = {k: v for k, v in request.data.items() if k in self.EDITABLE_FIELDS}
+        if not updates:
+            return Response(
+                {"error": f"No editable fields provided. Allowed: {sorted(self.EDITABLE_FIELDS)}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        db.collection(self.model.collection_name).update({"_key": doc["_key"], **updates})
+        updated_cursor = db.aql.execute("""
+            FOR sample IN Samples
+            FILTER sample.sample_ref == @sample_ref
+            LET sources = (FOR source IN Sources FILTER source.sample == sample.sample_ref RETURN source)
+            RETURN MERGE(sample, {sources: sources})
+        """, bind_vars={"sample_ref": pk})
+        updated = next(updated_cursor, None)
+        serializer = self.serializer_class(updated, context={"request": request})
+        return Response(serializer.data)
 
     def get_object(self, pk):
         # Override to use sample_ref and include sources
@@ -622,8 +713,50 @@ class AnswerViewSet(ArangoModelViewSet):
 
     serializer_class = AnswerSerializer
     model = Answer
-    http_method_names = ["get", "post", "head", "options"]
-    permission_classes = [AllowAny]  # POST is used as a query method here, not for writes
+    http_method_names = ["get", "post", "patch", "head", "options"]
+    permission_classes = [AllowAny]  # GET and query POST are public; PATCH uses per-action override
+
+    # Fields that carry linguistic content — safe to edit
+    EDITABLE_FIELDS = {"form", "marker", "inflection", "case_name", "comment"}
+
+    def get_permissions(self):
+        if self.request.method == "PATCH":
+            return [CanEditSample()]
+        return [AllowAny()]
+
+    def get_sample_ref(self, request):
+        """Required by CanEditSample to resolve the target sample."""
+        pk = self.kwargs.get("pk")
+        if not pk:
+            return None
+        db = request.arangodb
+        doc = db.collection(self.model.collection_name).get(pk)
+        return doc.get("sample") if doc else None
+
+    def partial_update(self, request, pk=None):
+        """
+        PATCH /answers/{key}/ — update editable fields on an answer.
+        Requires editor+ role. Editors with sample restrictions may only
+        edit answers belonging to their allowed samples.
+
+        Allowed fields: form, marker, inflection, case_name, comment
+        """
+        db = request.arangodb
+        doc = db.collection(self.model.collection_name).get(pk)
+        if not doc:
+            raise NotFound(detail="Answer not found")
+
+        updates = {k: v for k, v in request.data.items() if k in self.EDITABLE_FIELDS}
+        if not updates:
+            return Response(
+                {"error": f"No editable fields provided. Allowed: {sorted(self.EDITABLE_FIELDS)}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        db.collection(self.model.collection_name).update({"_key": pk, **updates})
+        updated = db.collection(self.model.collection_name).get(pk)
+        serializer = self.serializer_class(updated, context={"request": request})
+        return Response(serializer.data)
 
     def create(self, request):
         """

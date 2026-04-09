@@ -142,8 +142,8 @@ urlpatterns = [
     path("api-auth/", include("rest_framework.urls", namespace="rest_framework")),
     path("api/token/", CustomObtainAuthToken.as_view(), name="api_token_auth"),
     path("api/logout/", logout_view, name="api_logout"),
-    path("backup/create/", backup_create, name="backup_create"),
-    path("backup/list/", backup_list, name="backup_list"),
-    path("backup/restore/", backup_restore, name="backup_restore"),
-    path("backup/delete/", backup_delete, name="backup_delete"),
+    path("api/backup/create/", backup_create, name="backup_create"),
+    path("api/backup/list/", backup_list, name="backup_list"),
+    path("api/backup/restore/", backup_restore, name="backup_restore"),
+    path("api/backup/delete/", backup_delete, name="backup_delete"),
 ]

@@ -539,6 +539,74 @@ class PhraseViewSet(ArangoModelViewSet):
             print(f"Error searching phrases: {e}")
             raise ValidationError(f"Search failed: {str(e)}")
 
+    @action(detail=False, methods=["post"], url_path="export")
+    def export(self, request):
+        """
+        Export all matching phrases (no pagination) for download.
+
+        Same parameters as search (query, sample_refs, sort, field) but returns
+        all results with a fixed set of fields suitable for CSV/JSON export.
+        """
+        query = request.data.get("query", "").strip()
+        if not query or len(query) < 2:
+            raise ValidationError("Query must be at least 2 characters")
+
+        sample_refs = request.data.get("sample_refs", [])
+        sort = request.data.get("sort", "phrase_ref")
+        field = request.data.get("field", "both")
+
+        db = request.arangodb
+        query_lower = query.lower()
+
+        natsort_expr = "TO_NUMBER(REGEX_REPLACE(phrase.phrase_ref, '[^0-9].*$', '')), REGEX_REPLACE(phrase.phrase_ref, '^[0-9]+', '')"
+        sort_clauses = {
+            "phrase_ref": f"SORT {natsort_expr}, phrase.sample",
+            "sample": f"SORT phrase.sample, {natsort_expr}",
+        }
+        sort_aql = sort_clauses.get(sort, sort_clauses["phrase_ref"])
+
+        if not sample_refs:
+            visible_cursor = db.aql.execute(
+                "FOR s IN Samples FILTER s.visible == 'Yes' RETURN s.sample_ref"
+            )
+            sample_refs = list(visible_cursor)
+
+        if field == "romani":
+            like_expr = 'LIKE(phrase.phrase, CONCAT("%", @query, "%"))'
+        elif field == "english":
+            like_expr = 'LIKE(phrase.english, CONCAT("%", @query, "%"))'
+        else:
+            like_expr = 'LIKE(phrase.phrase, CONCAT("%", @query, "%")) OR LIKE(phrase.english, CONCAT("%", @query, "%"))'
+        search_filter = f'SEARCH ANALYZER({like_expr}, "norm_lower")'
+
+        export_aql = f"""
+            LET sample_lookup = (
+                FOR s IN Samples
+                    RETURN {{ref: s.sample_ref, label: CONCAT_SEPARATOR(', ', s.dialect_name, s.location)}}
+            )
+            LET sample_map = ZIP(sample_lookup[*].ref, sample_lookup[*].label)
+            FOR phrase IN PhraseSearch
+                {search_filter}
+                FILTER phrase.sample IN @sample_refs
+                {sort_aql}
+                RETURN {{
+                    phrase_ref: phrase.phrase_ref,
+                    sample: phrase.sample,
+                    sample_label: sample_map[phrase.sample],
+                    phrase: phrase.phrase,
+                    english: phrase.english,
+                    conjugated: phrase.conjugated,
+                    has_recording: phrase.has_recording
+                }}
+        """
+
+        try:
+            cursor = db.aql.execute(export_aql, bind_vars={"query": query_lower, "sample_refs": sample_refs})
+            return Response(list(cursor))
+        except Exception as e:
+            print(f"Error exporting phrases: {e}")
+            raise ValidationError(f"Export failed: {str(e)}")
+
 
 class SampleViewSet(ArangoModelViewSet):
     """

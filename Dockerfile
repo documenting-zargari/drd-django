@@ -7,6 +7,16 @@ RUN apt-get update && apt-get install -y \
     vim \
     build-essential \
     pkg-config \
+    curl \
+    gnupg \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install ArangoDB client tools (arangodump, arangorestore)
+RUN curl -fsSL https://download.arangodb.com/arangodb312/DEBIAN/Release.key | gpg --dearmor -o /usr/share/keyrings/arangodb.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/arangodb.gpg] https://download.arangodb.com/arangodb312/DEBIAN/ /" > /etc/apt/sources.list.d/arangodb.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends arangodb3-client \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 RUN ln -sf /dev/stdout /var/log/nginx/access.log \

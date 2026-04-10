@@ -1,4 +1,7 @@
-import requests as http_requests
+import json
+import os
+import shutil
+from datetime import datetime
 
 from django.conf import settings
 from django.http import JsonResponse
@@ -1228,7 +1231,7 @@ class TranscriptionViewSet(ArangoModelViewSet):
 
 class BackupViewSet(ViewSet):
     """
-    API endpoint for ArangoDB hot backup management.
+    API endpoint for ArangoDB backup management using arangodump/arangorestore.
 
     GET    /backups/              — list all backups
     POST   /backups/              — create a backup  {"label": "optional"}
@@ -1238,37 +1241,86 @@ class BackupViewSet(ViewSet):
     permission_classes = [IsGlobalOrProjectAdmin]
     lookup_value_regex = r"[^/]+"
 
-    def _arango_request(self, path, body=None):
-        url = f"{settings.ARANGO_HOST}/_admin/backup/{path}"
-        auth = (settings.ARANGO_USERNAME.strip(), settings.ARANGO_PASSWORD)
-        return http_requests.post(url, auth=auth, json=body or {}, timeout=60)
+    BACKUP_DIR = os.environ.get("BACKUP_DIR", os.path.join(settings.BASE_DIR, "backups"))
+
+    def _arango_args(self):
+        """Common arangodump/arangorestore connection arguments."""
+        return [
+            "--server.endpoint", settings.ARANGO_HOST.replace("http://", "tcp://").replace("https://", "ssl://"),
+            "--server.username", settings.ARANGO_USERNAME.strip(),
+            "--server.password", settings.ARANGO_PASSWORD,
+            "--server.database", settings.ARANGO_DB_NAME,
+        ]
+
+    def _read_meta(self, backup_path):
+        """Read metadata for a single backup directory."""
+        meta_path = os.path.join(backup_path, "meta.json")
+        if os.path.exists(meta_path):
+            with open(meta_path) as f:
+                return json.loads(f.read())
+        return None
 
     def list(self, request):
-        resp = self._arango_request("list")
-        if resp.status_code == 200:
-            result = resp.json().get("result", {})
-            backups = list(result.get("list", {}).values())
-            backups.sort(key=lambda b: b.get("datetime", ""), reverse=True)
-            return Response(backups)
-        return Response(resp.json(), status=resp.status_code)
+        os.makedirs(self.BACKUP_DIR, exist_ok=True)
+        backups = []
+        for name in os.listdir(self.BACKUP_DIR):
+            path = os.path.join(self.BACKUP_DIR, name)
+            if not os.path.isdir(path):
+                continue
+            meta = self._read_meta(path)
+            if meta:
+                backups.append(meta)
+            else:
+                backups.append({
+                    "id": name,
+                    "datetime": datetime.fromtimestamp(os.path.getctime(path)).isoformat(),
+                })
+        backups.sort(key=lambda b: b.get("datetime", ""), reverse=True)
+        return Response(backups)
 
     def create(self, request):
+        import subprocess
         label = request.data.get("label", "manual")
-        resp = self._arango_request("create", {"label": label, "timeout": 30})
-        if resp.status_code in (200, 201):
-            return Response(resp.json().get("result", resp.json()), status=status.HTTP_201_CREATED)
-        return Response(resp.json(), status=resp.status_code)
+        now = datetime.now()
+        backup_id = f"{now.strftime('%Y-%m-%dT%H.%M.%S')}_{label}"
+        backup_path = os.path.join(self.BACKUP_DIR, backup_id)
+        os.makedirs(backup_path, exist_ok=True)
+
+        cmd = ["arangodump", "--output-directory", backup_path, "--overwrite", "true"] + self._arango_args()
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if result.returncode != 0:
+            shutil.rmtree(backup_path, ignore_errors=True)
+            return Response(
+                {"error": f"arangodump failed: {result.stderr}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        meta = {"id": backup_id, "datetime": now.isoformat(), "label": label}
+        with open(os.path.join(backup_path, "meta.json"), "w") as f:
+            f.write(json.dumps(meta))
+
+        return Response(meta, status=status.HTTP_201_CREATED)
 
     def destroy(self, request, pk=None):
-        resp = self._arango_request("delete", {"id": pk})
-        if resp.status_code == 200:
-            return Response({"deleted": pk}, status=status.HTTP_204_NO_CONTENT)
-        return Response(resp.json(), status=resp.status_code)
+        backup_path = os.path.join(self.BACKUP_DIR, pk)
+        if not os.path.isdir(backup_path):
+            raise NotFound(detail="Backup not found")
+        shutil.rmtree(backup_path)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=True, methods=["post"])
     def restore(self, request, pk=None):
-        resp = self._arango_request("restore", {"id": pk})
-        if resp.status_code == 200:
-            return Response(resp.json().get("result", resp.json()))
-        return Response(resp.json(), status=resp.status_code)
+        import subprocess
+        backup_path = os.path.join(self.BACKUP_DIR, pk)
+        if not os.path.isdir(backup_path):
+            raise NotFound(detail="Backup not found")
+
+        cmd = ["arangorestore", "--input-directory", backup_path, "--overwrite", "true"] + self._arango_args()
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if result.returncode != 0:
+            return Response(
+                {"error": f"arangorestore failed: {result.stderr}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        return Response({"restored": pk})
 

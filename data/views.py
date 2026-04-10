@@ -1,9 +1,13 @@
+import requests as http_requests
+
+from django.conf import settings
 from django.http import JsonResponse
 from rest_framework import status
 from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound, ValidationError
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
+from rest_framework.viewsets import ViewSet
 from natsort import natsorted
 
 from data.models import Answer, Category, Phrase, Sample, Source, Transcription, View
@@ -17,7 +21,7 @@ from data.serializers import (
     ViewSerializer,
 )
 from roma.views import ArangoModelViewSet
-from user.permissions import CanEditSample, IsProjectEditor
+from user.permissions import CanEditSample, IsGlobalOrProjectAdmin, IsProjectEditor
 
 
 class CategoryViewSet(ArangoModelViewSet):
@@ -1220,4 +1224,59 @@ class TranscriptionViewSet(ArangoModelViewSet):
         except Exception as e:
             print(f"Error fetching transcriptions for answer: {e}")
             raise NotFound(detail="Error retrieving transcriptions")
+
+
+class BackupViewSet(ViewSet):
+    """
+    API endpoint for ArangoDB hot backup management.
+    All actions require admin permissions.
+    """
+    permission_classes = [IsGlobalOrProjectAdmin]
+
+    def _arango_request(self, path, body=None):
+        url = f"{settings.ARANGO_HOST}/_admin/backup/{path}"
+        auth = (settings.ARANGO_USERNAME.strip(), settings.ARANGO_PASSWORD)
+        return http_requests.post(url, auth=auth, json=body or {}, timeout=60)
+
+    @action(detail=False, methods=["get"])
+    def list_backups(self, request):
+        """List all available hot backups."""
+        resp = self._arango_request("list")
+        if resp.status_code == 200:
+            result = resp.json().get("result", {})
+            backups = list(result.get("list", {}).values())
+            backups.sort(key=lambda b: b.get("datetime", ""), reverse=True)
+            return Response(backups)
+        return Response(resp.json(), status=resp.status_code)
+
+    @action(detail=False, methods=["post"])
+    def create_backup(self, request):
+        """Create a hot backup. Body: {"label": "optional-label"}"""
+        label = request.data.get("label", "manual")
+        resp = self._arango_request("create", {"label": label, "timeout": 30})
+        if resp.status_code in (200, 201):
+            return Response(resp.json().get("result", resp.json()))
+        return Response(resp.json(), status=resp.status_code)
+
+    @action(detail=False, methods=["post"])
+    def restore_backup(self, request):
+        """Restore a backup. Body: {"id": "backup-id"}"""
+        backup_id = request.data.get("id")
+        if not backup_id:
+            return Response({"error": "id is required"}, status=status.HTTP_400_BAD_REQUEST)
+        resp = self._arango_request("restore", {"id": backup_id})
+        if resp.status_code == 200:
+            return Response(resp.json().get("result", resp.json()))
+        return Response(resp.json(), status=resp.status_code)
+
+    @action(detail=False, methods=["post"])
+    def delete_backup(self, request):
+        """Delete a backup. Body: {"id": "backup-id"}"""
+        backup_id = request.data.get("id")
+        if not backup_id:
+            return Response({"error": "id is required"}, status=status.HTTP_400_BAD_REQUEST)
+        resp = self._arango_request("delete", {"id": backup_id})
+        if resp.status_code == 200:
+            return Response({"deleted": backup_id})
+        return Response(resp.json(), status=resp.status_code)
 

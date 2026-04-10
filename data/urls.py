@@ -12,6 +12,7 @@ router.register(r"views", views.ViewViewSet, basename="views")
 router.register(
     r"transcriptions", views.TranscriptionViewSet, basename="transcriptions"
 )
+router.register(r"backups", views.BackupViewSet, basename="backups")
 
 urlpatterns = [
     path("", include(router.urls)),

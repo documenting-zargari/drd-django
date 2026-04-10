@@ -1236,6 +1236,7 @@ class BackupViewSet(ViewSet):
     POST   /backups/{id}/restore/ — restore a backup
     """
     permission_classes = [IsGlobalOrProjectAdmin]
+    lookup_value_regex = r"[^/]+"
 
     def _arango_request(self, path, body=None):
         url = f"{settings.ARANGO_HOST}/_admin/backup/{path}"

@@ -4,6 +4,16 @@ import shutil
 from datetime import datetime
 
 from django.conf import settings
+
+
+def user_sees_hidden_samples(user):
+    """True if the authenticated user has opted in to see non-visible samples."""
+    return bool(
+        user
+        and user.is_authenticated
+        and getattr(user, "is_global_admin", False)
+        and getattr(user, "show_hidden_samples", False)
+    )
 from django.http import JsonResponse
 from rest_framework import status
 from rest_framework.decorators import action
@@ -479,12 +489,18 @@ class PhraseViewSet(ArangoModelViewSet):
         }
         sort_aql = sort_clauses.get(sort, sort_clauses["phrase_ref"])
 
-        # Resolve visible sample refs upfront (once) instead of a subquery per phrase
+        # Resolve sample refs upfront (once) instead of a subquery per phrase
         if not sample_refs:
-            visible_cursor = db.aql.execute(
-                "FOR s IN Samples FILTER s.visible == 'Yes' RETURN s.sample_ref"
-            )
-            sample_refs = list(visible_cursor)
+            if user_sees_hidden_samples(request.user):
+                all_cursor = db.aql.execute(
+                    "FOR s IN Samples RETURN s.sample_ref"
+                )
+                sample_refs = list(all_cursor)
+            else:
+                visible_cursor = db.aql.execute(
+                    "FOR s IN Samples FILTER s.visible == 'Yes' RETURN s.sample_ref"
+                )
+                sample_refs = list(visible_cursor)
 
         # Uses PhraseSearch ArangoSearch view with norm_lower analyzer for fast
         # case-insensitive substring matching via LIKE with wildcards
@@ -573,10 +589,16 @@ class PhraseViewSet(ArangoModelViewSet):
         sort_aql = sort_clauses.get(sort, sort_clauses["phrase_ref"])
 
         if not sample_refs:
-            visible_cursor = db.aql.execute(
-                "FOR s IN Samples FILTER s.visible == 'Yes' RETURN s.sample_ref"
-            )
-            sample_refs = list(visible_cursor)
+            if user_sees_hidden_samples(request.user):
+                all_cursor = db.aql.execute(
+                    "FOR s IN Samples RETURN s.sample_ref"
+                )
+                sample_refs = list(all_cursor)
+            else:
+                visible_cursor = db.aql.execute(
+                    "FOR s IN Samples FILTER s.visible == 'Yes' RETURN s.sample_ref"
+                )
+                sample_refs = list(visible_cursor)
 
         if field == "romani":
             like_expr = 'LIKE(phrase.phrase, CONCAT("%", @query, "%"))'
@@ -698,7 +720,10 @@ class SampleViewSet(ArangoModelViewSet):
         try:
             db = self.request.arangodb
             collection = db.collection(self.model.collection_name)
-            cursor = collection.find({"visible": "Yes"})
+            if user_sees_hidden_samples(self.request.user):
+                cursor = collection.all()
+            else:
+                cursor = collection.find({"visible": "Yes"})
             return [sample for sample in cursor]
         except Exception:
             return []
@@ -939,6 +964,9 @@ class AnswerViewSet(ArangoModelViewSet):
 
     def include_hidden(self):
         """Check if the request asks to include hidden (non-visible) samples."""
+        # Global admin preference takes precedence
+        if user_sees_hidden_samples(self.request.user):
+            return True
         # Check GET params (for GET requests) and body (for POST requests)
         if self.request.GET.get("include_hidden", "").lower() in ("true", "1", "yes"):
             return True

@@ -28,6 +28,7 @@ class UserSerializer(serializers.ModelSerializer):
             "last_name",
             "name",
             "is_global_admin",
+            "show_hidden_samples",
             "project_roles",
         ]
 
@@ -56,10 +57,23 @@ class UserWriteSerializer(serializers.ModelSerializer):
             "first_name",
             "last_name",
             "is_global_admin",
+            "show_hidden_samples",
             "password",
             "project_roles",
         ]
         read_only_fields = ["id"]
+
+    def validate(self, attrs):
+        # show_hidden_samples only applies to global admins
+        is_global = attrs.get("is_global_admin", getattr(self.instance, "is_global_admin", False))
+        if attrs.get("show_hidden_samples") and not is_global:
+            raise serializers.ValidationError(
+                {"show_hidden_samples": "Only global admins can enable this."}
+            )
+        # If the user is no longer a global admin, force the flag off
+        if "is_global_admin" in attrs and not attrs["is_global_admin"]:
+            attrs["show_hidden_samples"] = False
+        return attrs
 
     def create(self, validated_data):
         roles_data = validated_data.pop("project_roles", [])

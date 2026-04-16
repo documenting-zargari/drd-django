@@ -7,6 +7,10 @@ class CustomUser(AbstractUser):
         default=False,
         help_text="Admin for all projects. Overrides per-project roles.",
     )
+    show_hidden_samples = models.BooleanField(
+        default=False,
+        help_text="Global admin preference: include samples marked as not visible in listings and queries.",
+    )
 
     def get_role_for_project(self, project):
         if self.is_global_admin:

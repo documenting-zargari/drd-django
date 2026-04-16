@@ -1134,6 +1134,8 @@ class TranscriptionViewSet(ArangoModelViewSet):
     Available endpoints:
     - GET /transcriptions/?sample=<sample_ref> - List transcriptions for a specific sample (REQUIRED)
     - GET /transcriptions/<id>/ - Retrieve specific transcription by ID
+    - POST /transcriptions/search/ - Search transcriptions across multiple samples
+    - POST /transcriptions/export/ - Export matching transcriptions (no pagination)
     - GET /transcriptions/by-answer/?answer_key=<key> - Get transcriptions linked to an answer
 
     Query Parameters:
@@ -1150,7 +1152,7 @@ class TranscriptionViewSet(ArangoModelViewSet):
 
     model = Transcription
     serializer_class = TranscriptionSerializer
-    http_method_names = ["get", "head", "options"]  # Read-only access
+    http_method_names = ["get", "post", "head", "options"]
 
     def get_queryset(self):
         try:
@@ -1255,6 +1257,168 @@ class TranscriptionViewSet(ArangoModelViewSet):
         except Exception as e:
             print(f"Error fetching transcriptions for answer: {e}")
             raise NotFound(detail="Error retrieving transcriptions")
+
+    def _get_visible_sample_refs(self, request):
+        """Get sample refs respecting the show_hidden_samples preference."""
+        db = request.arangodb
+        if user_sees_hidden_samples(request.user):
+            cursor = db.aql.execute("FOR s IN Samples RETURN s.sample_ref")
+        else:
+            cursor = db.aql.execute("FOR s IN Samples FILTER s.visible == 'Yes' RETURN s.sample_ref")
+        return list(cursor)
+
+    @action(detail=False, methods=["post"], url_path="search")
+    def search(self, request):
+        """
+        Search transcriptions across multiple samples.
+
+        Request Body:
+        - query (required, min 2 chars): Search term
+        - sample_refs (optional): List of sample refs to limit search
+        - sort (optional, default 'segment_no'): Sort field — 'segment_no' or 'sample'
+        - page (optional, default 1): Page number
+        - page_size (optional, default 50, max 200): Results per page
+        - field (optional, default 'both'): 'romani', 'english', or 'both'
+        """
+        query = request.data.get("query", "").strip()
+        if not query or len(query) < 2:
+            raise ValidationError("Query must be at least 2 characters")
+
+        sample_refs = request.data.get("sample_refs", [])
+        sort = request.data.get("sort", "segment_no")
+        field = request.data.get("field", "both")
+        page = int(request.data.get("page", 1))
+        page_size = min(int(request.data.get("page_size", 50)), 200)
+        offset = (page - 1) * page_size
+
+        db = request.arangodb
+        query_lower = query.lower()
+
+        sort_clauses = {
+            "segment_no": "SORT t.sample, t.segment_no",
+            "sample": "SORT t.sample, t.segment_no",
+        }
+        sort_aql = sort_clauses.get(sort, sort_clauses["segment_no"])
+
+        if not sample_refs:
+            sample_refs = self._get_visible_sample_refs(request)
+
+        if field == "romani":
+            like_expr = 'LIKE(t.transcription, CONCAT("%", @query, "%"))'
+        elif field == "english":
+            like_expr = 'LIKE(t.english, CONCAT("%", @query, "%"))'
+        else:
+            like_expr = 'LIKE(t.transcription, CONCAT("%", @query, "%")) OR LIKE(t.english, CONCAT("%", @query, "%"))'
+        search_filter = f'SEARCH ANALYZER({like_expr}, "norm_lower")'
+
+        count_aql = f"""
+            FOR t IN TranscriptionSearch
+                {search_filter}
+                FILTER t.sample IN @sample_refs
+                COLLECT WITH COUNT INTO total
+                RETURN total
+        """
+
+        results_aql = f"""
+            LET sample_lookup = (
+                FOR s IN Samples
+                    RETURN {{ref: s.sample_ref, label: CONCAT_SEPARATOR(', ', s.dialect_name, s.location)}}
+            )
+            LET sample_map = ZIP(sample_lookup[*].ref, sample_lookup[*].label)
+            FOR t IN TranscriptionSearch
+                {search_filter}
+                FILTER t.sample IN @sample_refs
+                {sort_aql}
+                LIMIT @offset, @page_size
+                RETURN MERGE(t, {{
+                    sample_label: sample_map[t.sample]
+                }})
+        """
+
+        count_bind = {"query": query_lower, "sample_refs": sample_refs}
+        results_bind = {"query": query_lower, "sample_refs": sample_refs, "offset": offset, "page_size": page_size}
+
+        try:
+            count_cursor = db.aql.execute(count_aql, bind_vars=count_bind)
+            total = next(count_cursor, 0)
+
+            results_cursor = db.aql.execute(results_aql, bind_vars=results_bind)
+            results = list(results_cursor)
+
+            serializer = self.serializer_class(
+                results, many=True, context={"request": request}
+            )
+
+            return Response({
+                "count": total,
+                "page": page,
+                "page_size": page_size,
+                "results": serializer.data,
+            })
+        except Exception as e:
+            print(f"Error searching transcriptions: {e}")
+            raise ValidationError(f"Search failed: {str(e)}")
+
+    @action(detail=False, methods=["post"], url_path="export")
+    def export(self, request):
+        """
+        Export all matching transcriptions (no pagination) for download.
+        Same parameters as search but returns all results.
+        """
+        query = request.data.get("query", "").strip()
+        if not query or len(query) < 2:
+            raise ValidationError("Query must be at least 2 characters")
+
+        sample_refs = request.data.get("sample_refs", [])
+        sort = request.data.get("sort", "segment_no")
+        field = request.data.get("field", "both")
+
+        db = request.arangodb
+        query_lower = query.lower()
+
+        sort_clauses = {
+            "segment_no": "SORT t.sample, t.segment_no",
+            "sample": "SORT t.sample, t.segment_no",
+        }
+        sort_aql = sort_clauses.get(sort, sort_clauses["segment_no"])
+
+        if not sample_refs:
+            sample_refs = self._get_visible_sample_refs(request)
+
+        if field == "romani":
+            like_expr = 'LIKE(t.transcription, CONCAT("%", @query, "%"))'
+        elif field == "english":
+            like_expr = 'LIKE(t.english, CONCAT("%", @query, "%"))'
+        else:
+            like_expr = 'LIKE(t.transcription, CONCAT("%", @query, "%")) OR LIKE(t.english, CONCAT("%", @query, "%"))'
+        search_filter = f'SEARCH ANALYZER({like_expr}, "norm_lower")'
+
+        export_aql = f"""
+            LET sample_lookup = (
+                FOR s IN Samples
+                    RETURN {{ref: s.sample_ref, label: CONCAT_SEPARATOR(', ', s.dialect_name, s.location)}}
+            )
+            LET sample_map = ZIP(sample_lookup[*].ref, sample_lookup[*].label)
+            FOR t IN TranscriptionSearch
+                {search_filter}
+                FILTER t.sample IN @sample_refs
+                {sort_aql}
+                RETURN {{
+                    sample: t.sample,
+                    sample_label: sample_map[t.sample],
+                    segment_no: t.segment_no,
+                    transcription: t.transcription,
+                    english: t.english,
+                    gloss: t.gloss
+                }}
+        """
+
+        try:
+            cursor = db.aql.execute(export_aql, bind_vars={"query": query_lower, "sample_refs": sample_refs})
+            return Response(list(cursor))
+        except Exception as e:
+            print(f"Error exporting transcriptions: {e}")
+            raise ValidationError(f"Export failed: {str(e)}")
 
 
 class BackupViewSet(ViewSet):

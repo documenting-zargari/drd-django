@@ -1153,6 +1153,7 @@ class TranscriptionViewSet(ArangoModelViewSet):
     model = Transcription
     serializer_class = TranscriptionSerializer
     http_method_names = ["get", "post", "head", "options"]
+    permission_classes = [AllowAny]  # GET and search POST are public
 
     def get_queryset(self):
         try:

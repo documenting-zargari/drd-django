@@ -1,3 +1,5 @@
+from django.conf import settings
+from cryptography.fernet import InvalidToken
 from rest_framework import serializers
 
 from data.models import (
@@ -168,15 +170,35 @@ class SampleSerializer(ArangoModelSerializer):
             return getattr(obj, "contact_languages", None)
 
     def get_sources(self, obj):
-        # Handle both dict objects (from ArangoDB) and model objects
         if isinstance(obj, dict):
             sources = obj.get("sources", [])
-            # Only include sources that have 'full_reference' field, and only show that field
-            filtered_sources = []
+            arango_internal = {'_id', '_key', '_rev'}
+            request = self.context.get('request')
+            is_admin = (
+                request is not None
+                and request.user.is_authenticated
+                and getattr(request.user, 'is_global_admin', False)
+            )
+            result = []
             for source in sources:
-                if 'full_reference' in source:
-                    filtered_sources.append({'full_reference': source['full_reference']})
-            return filtered_sources
+                cleaned = {}
+                for k, v in source.items():
+                    if k in arango_internal:
+                        continue
+                    if isinstance(v, str) and v.startswith('ENC:'):
+                        if is_admin and settings.FIELD_FERNET:
+                            try:
+                                cleaned[k] = settings.FIELD_FERNET.decrypt(
+                                    v[4:].encode()
+                                ).decode()
+                            except InvalidToken:
+                                cleaned[k] = 'ENC:'
+                        else:
+                            cleaned[k] = 'ENC:'
+                    else:
+                        cleaned[k] = v
+                result.append(cleaned)
+            return result
         else:
             return getattr(obj, "sources", [])
 

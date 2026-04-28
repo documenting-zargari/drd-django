@@ -1,4 +1,5 @@
 asgiref==3.8.1
+cryptography>=42.0.0
 attrs==25.3.0
 Automat==24.8.1
 black==24.10.0

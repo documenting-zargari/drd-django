@@ -105,4 +105,3 @@ jobs:
       POSTGRES_ENABLED: ${{ needs.setup_workflow_env.outputs.POSTGRES_ENABLED == 'true'}}
       default_port: "${{ needs.setup_workflow_env.outputs.default_port}}"
       submodules: ${{ needs.setup_workflow_env.outputs.submodules }}
-      K8S_SECRET_RMS_ENCRYPT_KEY: ${{ secrets.RMS_ENCRYPT_KEY }}

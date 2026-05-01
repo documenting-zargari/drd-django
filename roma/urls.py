@@ -46,8 +46,12 @@ def api_root(request, format=None):
                 "description": "Hierarchical categories for organizing linguistic data",
             },
             "phrases": {
-                "url": reverse("phrases-all-list", request=request, format=format),
+                "url": reverse("phrases-list", request=request, format=format),
                 "description": "Linguistic phrases linked to samples and research data",
+                "phrase_list": reverse("phrases-phrase-list", request=request, format=format),
+                "search": reverse("phrases-search", request=request, format=format),
+                "export": reverse("phrases-export", request=request, format=format),
+                "by_answer": reverse("phrases-by-answer", request=request, format=format),
             },
             "samples": {
                 "url": reverse("samples-list", request=request, format=format),

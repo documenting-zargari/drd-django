@@ -248,17 +248,18 @@ class PhraseViewSet(ArangoModelViewSet):
     """
     API endpoint for retrieving phrases associated with samples.
 
-    Phrases are linguistic data linked to specific samples. A sample parameter
-    is required to retrieve phrases.
+    Phrases are linguistic data linked to specific samples.
 
     Available endpoints:
-    - GET /phrases/?sample=<sample_ref> - List phrases for a specific sample (REQUIRED)
+    - GET /phrases/?sample=<sample_ref> - List phrases for a specific sample
+    - GET /phrases/list/ - Unique phrase list for the phrase picker (phrase_ref + english only)
     - GET /phrases/<id>/ - Retrieve specific phrase by ID
     - GET /phrases/by-answer/?answer_key=<key> - Get phrases linked to an answer via phrase tags
-    - POST /phrases/search/ - Search phrases across multiple samples
+    - POST /phrases/search/ - Search phrases (see that endpoint for parameters)
+    - POST /phrases/export/ - Export matching phrases without pagination (see that endpoint for parameters)
 
     Query Parameters:
-    - sample (required): Sample reference (e.g., sample=AL-001)
+    - sample (required for list): Sample reference (e.g., sample=AL-001)
     - answer_key (required for by-answer): Answer _key
 
     Examples:
@@ -266,7 +267,6 @@ class PhraseViewSet(ArangoModelViewSet):
     - /phrases/list/ - Unique phrase list for picker (phrase_ref + english only)
     - /phrases/123/ - Specific phrase with ID 123
     - /phrases/by-answer/?answer_key=ABC123 - Phrases linked to answer ABC123 via phrase tags
-    - POST /phrases/search/ {"query": "brother", "sample_refs": ["AL-001"]}
     """
 
     model = Phrase
@@ -480,14 +480,19 @@ class PhraseViewSet(ArangoModelViewSet):
         Search phrases across multiple samples.
 
         Request Body:
-        - query (required, min 2 chars): Search term
+        - query (required unless phrase_ref given, min 2 chars): Free-text search term
+        - phrase_ref (optional): Exact phrase reference (e.g. "80a"). When provided, bypasses
+          full-text search and returns all samples' entries for that specific phrase via index lookup.
+          query is not required when phrase_ref is given.
         - sample_refs (optional): List of sample refs to limit search
         - sort (optional, default 'phrase_ref'): Sort field — 'phrase_ref' or 'sample'
-        - page (optional, default 1): Page number
-        - page_size (optional, default 50, max 200): Results per page
+        - field (optional, default 'both'): Text search field — 'romani', 'english', or 'both'. Ignored when phrase_ref is given.
+        - page (optional, default 1): Page number. Ignored when phrase_ref is given (all results returned).
+        - page_size (optional, default 50, max 200): Results per page. Ignored when phrase_ref is given.
         """
+        phrase_ref = request.data.get("phrase_ref", "").strip()
         query = request.data.get("query", "").strip()
-        if not query or len(query) < 2:
+        if not phrase_ref and (not query or len(query) < 2):
             raise ValidationError("Query must be at least 2 characters")
 
         sample_refs = request.data.get("sample_refs", [])
@@ -498,7 +503,6 @@ class PhraseViewSet(ArangoModelViewSet):
         offset = (page - 1) * page_size
 
         db = request.arangodb
-        query_lower = query.lower()
 
         # Natural sort for phrase_ref: extract leading number, then sort by that numerically,
         # then by the remaining suffix (e.g. "80a" → 80, "a")
@@ -509,57 +513,77 @@ class PhraseViewSet(ArangoModelViewSet):
         }
         sort_aql = sort_clauses.get(sort, sort_clauses["phrase_ref"])
 
-        # Resolve sample refs upfront (once) instead of a subquery per phrase
-        if not sample_refs:
-            if user_sees_hidden_samples(request.user):
-                all_cursor = db.aql.execute(
-                    "FOR s IN Samples RETURN s.sample_ref"
-                )
-                sample_refs = list(all_cursor)
-            else:
-                visible_cursor = db.aql.execute(
-                    "FOR s IN Samples FILTER s.visible == 'Yes' RETURN s.sample_ref"
-                )
-                sample_refs = list(visible_cursor)
-
-        # Uses PhraseSearch ArangoSearch view with norm_lower analyzer for fast
-        # case-insensitive substring matching via LIKE with wildcards
-        if field == "romani":
-            like_expr = 'LIKE(phrase.phrase, CONCAT("%", @query, "%"))'
-        elif field == "english":
-            like_expr = 'LIKE(phrase.english, CONCAT("%", @query, "%"))'
+        if phrase_ref:
+            # Exact phrase_ref match via persistent index — no text search, no sample_refs resolution.
+            # Visibility and sample label resolved per-row via inline Samples lookup.
+            see_hidden = user_sees_hidden_samples(request.user)
+            visibility_filter = "" if see_hidden else "FILTER s.visible == 'Yes'"
+            sample_filter = "FILTER phrase.sample IN @sample_refs" if sample_refs else ""
+            bind: dict = {"phrase_ref": phrase_ref}
+            if sample_refs:
+                bind["sample_refs"] = sample_refs
+            results_aql = f"""
+                FOR phrase IN Phrases
+                    FILTER phrase.phrase_ref == @phrase_ref
+                    {sample_filter}
+                    FOR s IN Samples
+                        FILTER s.sample_ref == phrase.sample
+                        {visibility_filter}
+                        {sort_aql}
+                        RETURN MERGE(phrase, {{
+                            sample_label: CONCAT_SEPARATOR(', ', s.dialect_name, s.location)
+                        }})
+            """
+            try:
+                results = list(db.aql.execute(results_aql, bind_vars=bind))
+                serializer = self.serializer_class(results, many=True, context={"request": request})
+                return Response({"count": len(results), "page": 1, "page_size": len(results), "results": serializer.data})
+            except Exception as e:
+                print(f"Error searching phrases by phrase_ref: {e}")
+                raise ValidationError(f"Search failed: {str(e)}")
         else:
-            like_expr = 'LIKE(phrase.phrase, CONCAT("%", @query, "%")) OR LIKE(phrase.english, CONCAT("%", @query, "%"))'
-        search_filter = f'SEARCH ANALYZER({like_expr}, "norm_lower")'
+            # Resolve sample refs upfront (once) instead of a subquery per phrase
+            if not sample_refs:
+                if user_sees_hidden_samples(request.user):
+                    sample_refs = list(db.aql.execute("FOR s IN Samples RETURN s.sample_ref"))
+                else:
+                    sample_refs = list(db.aql.execute("FOR s IN Samples FILTER s.visible == 'Yes' RETURN s.sample_ref"))
 
-        # Count query
-        count_aql = f"""
-            FOR phrase IN PhraseSearch
-                {search_filter}
-                FILTER phrase.sample IN @sample_refs
-                COLLECT WITH COUNT INTO total
-                RETURN total
-        """
+            # Uses PhraseSearch ArangoSearch view with norm_lower analyzer for fast
+            # case-insensitive substring matching via LIKE with wildcards
+            query_lower = query.lower()
+            if field == "romani":
+                like_expr = 'LIKE(phrase.phrase, CONCAT("%", @query, "%"))'
+            elif field == "english":
+                like_expr = 'LIKE(phrase.english, CONCAT("%", @query, "%"))'
+            else:
+                like_expr = 'LIKE(phrase.phrase, CONCAT("%", @query, "%")) OR LIKE(phrase.english, CONCAT("%", @query, "%"))'
+            search_filter = f'SEARCH ANALYZER({like_expr}, "norm_lower")'
 
-        # Results query — build sample label lookup once instead of per-row subquery
-        results_aql = f"""
-            LET sample_lookup = (
-                FOR s IN Samples
-                    RETURN {{ref: s.sample_ref, label: CONCAT_SEPARATOR(', ', s.dialect_name, s.location)}}
-            )
-            LET sample_map = ZIP(sample_lookup[*].ref, sample_lookup[*].label)
-            FOR phrase IN PhraseSearch
-                {search_filter}
-                FILTER phrase.sample IN @sample_refs
-                {sort_aql}
-                LIMIT @offset, @page_size
-                RETURN MERGE(phrase, {{
-                    sample_label: sample_map[phrase.sample]
-                }})
-        """
-
-        count_bind = {"query": query_lower, "sample_refs": sample_refs}
-        results_bind = {"query": query_lower, "sample_refs": sample_refs, "offset": offset, "page_size": page_size}
+            count_aql = f"""
+                FOR phrase IN PhraseSearch
+                    {search_filter}
+                    FILTER phrase.sample IN @sample_refs
+                    COLLECT WITH COUNT INTO total
+                    RETURN total
+            """
+            results_aql = f"""
+                LET sample_lookup = (
+                    FOR s IN Samples
+                        RETURN {{ref: s.sample_ref, label: CONCAT_SEPARATOR(', ', s.dialect_name, s.location)}}
+                )
+                LET sample_map = ZIP(sample_lookup[*].ref, sample_lookup[*].label)
+                FOR phrase IN PhraseSearch
+                    {search_filter}
+                    FILTER phrase.sample IN @sample_refs
+                    {sort_aql}
+                    LIMIT @offset, @page_size
+                    RETURN MERGE(phrase, {{
+                        sample_label: sample_map[phrase.sample]
+                    }})
+            """
+            count_bind = {"query": query_lower, "sample_refs": sample_refs}
+            results_bind = {"query": query_lower, "sample_refs": sample_refs, "offset": offset, "page_size": page_size}
 
         try:
             count_cursor = db.aql.execute(count_aql, bind_vars=count_bind)
@@ -587,11 +611,17 @@ class PhraseViewSet(ArangoModelViewSet):
         """
         Export all matching phrases (no pagination) for download.
 
-        Same parameters as search (query, sample_refs, sort, field) but returns
-        all results with a fixed set of fields suitable for CSV/JSON export.
+        Same parameters as search but always returns all results without pagination.
+        - query (required unless phrase_ref given, min 2 chars): Free-text search term
+        - phrase_ref (optional): Exact phrase reference (e.g. "80a"). When provided, exports
+          all samples' entries for that specific phrase via index lookup.
+        - sample_refs (optional): List of sample refs to limit results
+        - sort (optional, default 'phrase_ref'): Sort field — 'phrase_ref' or 'sample'
+        - field (optional, default 'both'): Text search field — 'romani', 'english', or 'both'. Ignored when phrase_ref is given.
         """
+        phrase_ref = request.data.get("phrase_ref", "").strip()
         query = request.data.get("query", "").strip()
-        if not query or len(query) < 2:
+        if not phrase_ref and (not query or len(query) < 2):
             raise ValidationError("Query must be at least 2 characters")
 
         sample_refs = request.data.get("sample_refs", [])
@@ -599,7 +629,6 @@ class PhraseViewSet(ArangoModelViewSet):
         field = request.data.get("field", "both")
 
         db = request.arangodb
-        query_lower = query.lower()
 
         natsort_expr = "TO_NUMBER(REGEX_REPLACE(phrase.phrase_ref, '[^0-9].*$', '')), REGEX_REPLACE(phrase.phrase_ref, '^[0-9]+', '')"
         sort_clauses = {
@@ -608,49 +637,68 @@ class PhraseViewSet(ArangoModelViewSet):
         }
         sort_aql = sort_clauses.get(sort, sort_clauses["phrase_ref"])
 
-        if not sample_refs:
-            if user_sees_hidden_samples(request.user):
-                all_cursor = db.aql.execute(
-                    "FOR s IN Samples RETURN s.sample_ref"
-                )
-                sample_refs = list(all_cursor)
-            else:
-                visible_cursor = db.aql.execute(
-                    "FOR s IN Samples FILTER s.visible == 'Yes' RETURN s.sample_ref"
-                )
-                sample_refs = list(visible_cursor)
-
-        if field == "romani":
-            like_expr = 'LIKE(phrase.phrase, CONCAT("%", @query, "%"))'
-        elif field == "english":
-            like_expr = 'LIKE(phrase.english, CONCAT("%", @query, "%"))'
-        else:
-            like_expr = 'LIKE(phrase.phrase, CONCAT("%", @query, "%")) OR LIKE(phrase.english, CONCAT("%", @query, "%"))'
-        search_filter = f'SEARCH ANALYZER({like_expr}, "norm_lower")'
-
-        export_aql = f"""
-            LET sample_lookup = (
-                FOR s IN Samples
-                    RETURN {{ref: s.sample_ref, label: CONCAT_SEPARATOR(', ', s.dialect_name, s.location)}}
-            )
-            LET sample_map = ZIP(sample_lookup[*].ref, sample_lookup[*].label)
-            FOR phrase IN PhraseSearch
-                {search_filter}
-                FILTER phrase.sample IN @sample_refs
-                {sort_aql}
-                RETURN {{
-                    phrase_ref: phrase.phrase_ref,
-                    sample: phrase.sample,
-                    sample_label: sample_map[phrase.sample],
-                    phrase: phrase.phrase,
-                    english: phrase.english,
-                    conjugated: phrase.conjugated,
-                    has_recording: phrase.has_recording
-                }}
+        export_fields = """
+            RETURN {
+                phrase_ref: phrase.phrase_ref,
+                sample: phrase.sample,
+                sample_label: sample_label,
+                phrase: phrase.phrase,
+                english: phrase.english,
+                conjugated: phrase.conjugated,
+                has_recording: phrase.has_recording
+            }
         """
 
+        if phrase_ref:
+            see_hidden = user_sees_hidden_samples(request.user)
+            visibility_filter = "" if see_hidden else "FILTER s.visible == 'Yes'"
+            sample_filter = "FILTER phrase.sample IN @sample_refs" if sample_refs else ""
+            bind: dict = {"phrase_ref": phrase_ref}
+            if sample_refs:
+                bind["sample_refs"] = sample_refs
+            export_aql = f"""
+                FOR phrase IN Phrases
+                    FILTER phrase.phrase_ref == @phrase_ref
+                    {sample_filter}
+                    FOR s IN Samples
+                        FILTER s.sample_ref == phrase.sample
+                        {visibility_filter}
+                        LET sample_label = CONCAT_SEPARATOR(', ', s.dialect_name, s.location)
+                        {sort_aql}
+                        {export_fields}
+            """
+        else:
+            if not sample_refs:
+                if user_sees_hidden_samples(request.user):
+                    sample_refs = list(db.aql.execute("FOR s IN Samples RETURN s.sample_ref"))
+                else:
+                    sample_refs = list(db.aql.execute("FOR s IN Samples FILTER s.visible == 'Yes' RETURN s.sample_ref"))
+
+            query_lower = query.lower()
+            if field == "romani":
+                like_expr = 'LIKE(phrase.phrase, CONCAT("%", @query, "%"))'
+            elif field == "english":
+                like_expr = 'LIKE(phrase.english, CONCAT("%", @query, "%"))'
+            else:
+                like_expr = 'LIKE(phrase.phrase, CONCAT("%", @query, "%")) OR LIKE(phrase.english, CONCAT("%", @query, "%"))'
+            search_filter = f'SEARCH ANALYZER({like_expr}, "norm_lower")'
+            bind = {"query": query_lower, "sample_refs": sample_refs}
+            export_aql = f"""
+                LET sample_lookup = (
+                    FOR s IN Samples
+                        RETURN {{ref: s.sample_ref, label: CONCAT_SEPARATOR(', ', s.dialect_name, s.location)}}
+                )
+                LET sample_map = ZIP(sample_lookup[*].ref, sample_lookup[*].label)
+                FOR phrase IN PhraseSearch
+                    {search_filter}
+                    FILTER phrase.sample IN @sample_refs
+                    {sort_aql}
+                    LET sample_label = sample_map[phrase.sample]
+                    {export_fields}
+            """
+
         try:
-            cursor = db.aql.execute(export_aql, bind_vars={"query": query_lower, "sample_refs": sample_refs})
+            cursor = db.aql.execute(export_aql, bind_vars=bind)
             return Response(list(cursor))
         except Exception as e:
             print(f"Error exporting phrases: {e}")

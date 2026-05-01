@@ -45,6 +45,7 @@ class ArangoDBMiddleware:
                 username=settings.ARANGO_USERNAME,
                 password=settings.ARANGO_PASSWORD,
             )
+            self._ensure_indexes(connection)
             return connection
         except ArangoError as e:
             logger.error(f"ArangoDB connection error: {str(e)}")
@@ -54,6 +55,13 @@ class ArangoDBMiddleware:
             logger.error(f"Unexpected error connecting to ArangoDB: {str(e)}")
             self.connection_error = str(e)
             return None
+
+    def _ensure_indexes(self, db):
+        try:
+            db.collection("Phrases").add_persistent_index(fields=["phrase_ref"])
+            db.collection("Samples").add_persistent_index(fields=["sample_ref"])
+        except Exception as e:
+            logger.warning(f"Could not ensure ArangoDB indexes: {e}")
 
     def __call__(self, request):
         """Attach ArangoDB connection to request"""

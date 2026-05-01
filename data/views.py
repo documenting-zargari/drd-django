@@ -263,6 +263,7 @@ class PhraseViewSet(ArangoModelViewSet):
 
     Examples:
     - /phrases/?sample=AL-001 - Phrases for sample AL-001
+    - /phrases/list/ - Unique phrase list for picker (phrase_ref + english only)
     - /phrases/123/ - Specific phrase with ID 123
     - /phrases/by-answer/?answer_key=ABC123 - Phrases linked to answer ABC123 via phrase tags
     - POST /phrases/search/ {"query": "brother", "sample_refs": ["AL-001"]}
@@ -330,6 +331,25 @@ class PhraseViewSet(ArangoModelViewSet):
         except Exception as e:
             print(f"Error fetching phrases: {e}")
             return []
+
+    @action(detail=False, methods=["get"], url_path="list")
+    def phrase_list(self, request):
+        """
+        GET /phrases/list/ — unique phrases for the phrase picker.
+        Returns one record per phrase_ref (deduplicated across samples),
+        with only phrase_ref and english fields, sorted naturally by phrase_ref.
+        """
+        db = request.arangodb
+        aql = """
+            FOR p IN Phrases
+                COLLECT ref = p.phrase_ref INTO g
+                LET doc = FIRST(g[*].p)
+                SORT ref
+                RETURN { phrase_ref: doc.phrase_ref, english: doc.english }
+        """
+        cursor = db.aql.execute(aql)
+        results = natsorted(list(cursor), key=lambda x: x["phrase_ref"])
+        return Response(results)
 
 
     @action(detail=False, methods=["get"], url_path="by-answer")

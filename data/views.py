@@ -352,6 +352,20 @@ class PhraseViewSet(ArangoModelViewSet):
         return Response(results)
 
 
+    @action(detail=False, methods=["get"], url_path="tags")
+    def tags(self, request):
+        """
+        GET /phrases/tags/ — all phrase tags for client-side hierarchy display.
+        Returns: [{ "id": 1, "tag": "go", "parent_id": 5 }, ...]
+        """
+        db = request.arangodb
+        aql = """
+            FOR tag IN PhraseTags
+                RETURN { id: tag.id, tag: tag.tag, parent_id: tag.parent_id }
+        """
+        cursor = db.aql.execute(aql)
+        return Response(list(cursor))
+
     @action(detail=False, methods=["get"], url_path="by-answer")
     def by_answer(self, request):
         """

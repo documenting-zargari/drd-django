@@ -3,7 +3,7 @@ from rest_framework.permissions import BasePermission, SAFE_METHODS
 
 def get_project_from_request(request):
     """Extract project identifier from request. Defaults to 'rms'."""
-    return request.headers.get("X-Project", "rms")
+    return request.headers.get("X-Project", "rlb")
 
 
 class ReadOnlyOrAuthenticated(BasePermission):

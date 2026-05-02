@@ -280,5 +280,5 @@ class TranscriptionSerializer(ArangoModelSerializer):
 
     def to_representation(self, instance):
         # Return all attributes from the ArangoDB document, excluding certain fields
-        exclude_fields = ["_rev", "_key"]
+        exclude_fields = ["_rev", "_id"]
         return {k: v for k, v in instance.items() if k not in exclude_fields}

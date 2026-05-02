@@ -274,7 +274,7 @@ class PhraseViewSet(ArangoModelViewSet):
     http_method_names = ["get", "post", "patch", "head", "options"]
     permission_classes = [AllowAny]  # GET and search POST are public; PATCH uses per-action override
 
-    EDITABLE_FIELDS = {"phrase", "english", "conjugated"}
+    EDITABLE_FIELDS = {"phrase", "english", "conjugated", "tag_ids"}
 
     def get_permissions(self):
         if self.request.method == "PATCH":
@@ -1220,8 +1220,49 @@ class TranscriptionViewSet(ArangoModelViewSet):
 
     model = Transcription
     serializer_class = TranscriptionSerializer
-    http_method_names = ["get", "post", "head", "options"]
-    permission_classes = [AllowAny]  # GET and search POST are public
+    http_method_names = ["get", "post", "patch", "head", "options"]
+    permission_classes = [AllowAny]  # GET and search POST are public; PATCH uses per-action override
+
+    EDITABLE_FIELDS = {"transcription", "english", "gloss", "segment_no"}
+
+    def get_permissions(self):
+        if self.request.method == "PATCH":
+            return [CanEditSample()]
+        return [AllowAny()]
+
+    def get_sample_ref(self, request):
+        """Required by CanEditSample to resolve the target sample."""
+        pk = self.kwargs.get("pk")
+        if not pk:
+            return None
+        db = request.arangodb
+        doc = db.collection(self.model.collection_name).get(pk)
+        return doc.get("sample") if doc else None
+
+    def partial_update(self, request, pk=None):
+        """
+        PATCH /transcriptions/{key}/ — update editable fields on a transcription.
+        Requires editor+ role. Editors with sample restrictions may only
+        edit transcriptions belonging to their allowed samples.
+
+        Allowed fields: transcription, english, gloss, segment_no
+        """
+        db = request.arangodb
+        doc = db.collection(self.model.collection_name).get(pk)
+        if not doc:
+            raise NotFound(detail="Transcription not found")
+
+        updates = {k: v for k, v in request.data.items() if k in self.EDITABLE_FIELDS}
+        if not updates:
+            return Response(
+                {"error": f"No editable fields provided. Allowed: {sorted(self.EDITABLE_FIELDS)}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        db.collection(self.model.collection_name).update({"_key": pk, **updates})
+        updated = db.collection(self.model.collection_name).get(pk)
+        serializer = self.serializer_class(updated, context={"request": request})
+        return Response(serializer.data)
 
     def get_queryset(self):
         try:

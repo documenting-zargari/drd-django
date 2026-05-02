@@ -741,7 +741,7 @@ class SampleViewSet(ArangoModelViewSet):
     EDITABLE_FIELDS = {
         "dialect_name", "self_attrib_name", "dialect_group_name",
         "location", "country_code", "coordinates", "visible",
-        "migrant", "contact_languages",
+        "migrant", "contact_languages", "annotations",
     }
 
     def get_permissions(self):
@@ -772,7 +772,15 @@ class SampleViewSet(ArangoModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        db.collection(self.model.collection_name).update({"_key": doc["_key"], **updates})
+        if "annotations" in updates:
+            ann = updates["annotations"]
+            if not isinstance(ann, dict):
+                return Response({"error": "annotations must be an object"}, status=status.HTTP_400_BAD_REQUEST)
+            for k, v in ann.items():
+                if not isinstance(k, str) or not isinstance(v, str):
+                    return Response({"error": "annotation keys and values must be strings"}, status=status.HTTP_400_BAD_REQUEST)
+
+        db.collection(self.model.collection_name).update({"_key": doc["_key"], **updates}, merge=False)
         updated_cursor = db.aql.execute("""
             FOR sample IN Samples
             FILTER sample.sample_ref == @sample_ref

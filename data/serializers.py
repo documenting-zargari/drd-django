@@ -136,6 +136,7 @@ class SampleSerializer(ArangoModelSerializer):
     coordinates = serializers.SerializerMethodField()
     contact_languages = serializers.SerializerMethodField()
     sources = serializers.SerializerMethodField()
+    annotations = serializers.SerializerMethodField()
 
     class Meta:
         model = Sample
@@ -153,6 +154,7 @@ class SampleSerializer(ArangoModelSerializer):
             "migrant",
             "contact_languages",
             "sources",
+            "annotations",
         ]
 
     def get_coordinates(self, obj):
@@ -168,6 +170,11 @@ class SampleSerializer(ArangoModelSerializer):
             return obj.get("contact_languages", None)
         else:
             return getattr(obj, "contact_languages", None)
+
+    def get_annotations(self, obj):
+        if isinstance(obj, dict):
+            return obj.get("annotations", {}) or {}
+        return getattr(obj, "annotations", {}) or {}
 
     def get_sources(self, obj):
         if isinstance(obj, dict):

@@ -903,19 +903,21 @@ class AnswerViewSet(ArangoModelViewSet):
 
     serializer_class = AnswerSerializer
     model = Answer
-    http_method_names = ["get", "post", "patch", "head", "options"]
-    permission_classes = [AllowAny]  # GET and query POST are public; PATCH uses per-action override
+    http_method_names = ["get", "post", "patch", "put", "delete", "head", "options"]
+    permission_classes = [AllowAny]  # GET and query POST are public; write methods use per-action override
 
-    # Fields that carry linguistic content — safe to edit
-    EDITABLE_FIELDS = {"form", "marker", "inflection", "case_name", "comment"}
+    # Structural fields that must never be overwritten via the API
+    PROTECTED_FIELDS = {"_key", "_id", "_rev", "sample", "question_id", "category", "tag", "tags", "tag_id", "tag_ids"}
 
     def get_permissions(self):
-        if self.request.method == "PATCH":
+        if self.action in ("partial_update", "create_answer", "destroy") or self.request.method in ("PATCH", "PUT", "DELETE"):
             return [CanEditSample()]
         return [AllowAny()]
 
     def get_sample_ref(self, request):
         """Required by CanEditSample to resolve the target sample."""
+        if self.action == "create_answer":
+            return request.data.get("sample")
         pk = self.kwargs.get("pk")
         if not pk:
             return None
@@ -929,24 +931,112 @@ class AnswerViewSet(ArangoModelViewSet):
         Requires editor+ role. Editors with sample restrictions may only
         edit answers belonging to their allowed samples.
 
-        Allowed fields: form, marker, inflection, case_name, comment
+        Allowed fields: any non-structural field (see PROTECTED_FIELDS for what cannot be changed).
         """
         db = request.arangodb
         doc = db.collection(self.model.collection_name).get(pk)
         if not doc:
             raise NotFound(detail="Answer not found")
 
-        updates = {k: v for k, v in request.data.items() if k in self.EDITABLE_FIELDS}
+        updates = {k: v for k, v in request.data.items() if k not in self.PROTECTED_FIELDS}
         if not updates:
             return Response(
-                {"error": f"No editable fields provided. Allowed: {sorted(self.EDITABLE_FIELDS)}"},
+                {"error": "No updatable fields provided."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        db.collection(self.model.collection_name).update({"_key": pk, **updates})
+        db.collection(self.model.collection_name).update({"_key": pk, **updates}, keep_none=False)
         updated = db.collection(self.model.collection_name).get(pk)
         serializer = self.serializer_class(updated, context={"request": request})
         return Response(serializer.data)
+
+    @action(detail=False, methods=["put"], url_path="create")
+    def create_answer(self, request):
+        """
+        PUT /answers/create/ — create a new answer for a question+sample.
+        Requires editor+ role.
+
+        Body: { question_id, sample, field, value }
+        """
+        db = request.arangodb
+        question_id = request.data.get("question_id")
+        sample = request.data.get("sample")
+        field = request.data.get("field")
+        value = request.data.get("value", "")
+
+        if not question_id or not sample or not field:
+            return Response(
+                {"error": "question_id, sample, and field are required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if field in self.PROTECTED_FIELDS:
+            return Response(
+                {"error": f"Field '{field}' cannot be set."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            question_id = int(question_id)
+        except (TypeError, ValueError):
+            return Response({"error": "question_id must be an integer"}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Find the question document
+        cursor = db.aql.execute(
+            "FOR q IN ResearchQuestions FILTER q.id == @id RETURN q",
+            bind_vars={"id": question_id},
+        )
+        questions = list(cursor)
+        if not questions:
+            raise NotFound(detail=f"Question {question_id} not found")
+        question = questions[0]
+
+        # Reject if an answer already exists for this question+sample
+        existing_cursor = db.aql.execute(
+            """
+            FOR q IN ResearchQuestions FILTER q.id == @qid
+              FOR a IN 1..1 OUTBOUND q GivesAnswer
+                FILTER a.sample == @sample
+                RETURN a._key
+            """,
+            bind_vars={"qid": question_id, "sample": sample},
+        )
+        if list(existing_cursor):
+            return Response(
+                {"error": "An answer already exists for this question and sample"},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        # Insert the new answer document
+        new_doc = {"sample": sample, field: value}
+        result = db.collection("Answers").insert(new_doc, return_new=True)
+        answer_doc = result["new"]
+
+        # Create the GivesAnswer edge from question → answer
+        db.collection("GivesAnswer").insert({
+            "_from": question["_id"],
+            "_to": answer_doc["_id"],
+        })
+
+        return Response({**answer_doc, "question_id": question_id}, status=status.HTTP_201_CREATED)
+
+    def destroy(self, request, pk=None):
+        """
+        DELETE /answers/{key}/ — delete an answer document and its GivesAnswer edge.
+        Requires editor+ role.
+        """
+        db = request.arangodb
+        doc = db.collection(self.model.collection_name).get(pk)
+        if not doc:
+            raise NotFound(detail="Answer not found")
+
+        # Remove the GivesAnswer edge(s) pointing to this answer
+        db.aql.execute(
+            "FOR e IN GivesAnswer FILTER e._to == @id REMOVE e IN GivesAnswer",
+            bind_vars={"id": doc["_id"]},
+        )
+
+        db.collection(self.model.collection_name).delete(pk)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     def create(self, request):
         """

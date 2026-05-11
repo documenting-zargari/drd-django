@@ -1007,7 +1007,7 @@ class AnswerViewSet(ArangoModelViewSet):
             )
 
         # Insert the new answer document
-        new_doc = {"sample": sample, field: value}
+        new_doc = {"sample": sample, "question_id": question_id, field: value}
         result = db.collection("Answers").insert(new_doc, return_new=True)
         answer_doc = result["new"]
 
@@ -1017,7 +1017,7 @@ class AnswerViewSet(ArangoModelViewSet):
             "_to": answer_doc["_id"],
         })
 
-        return Response({**answer_doc, "question_id": question_id}, status=status.HTTP_201_CREATED)
+        return Response(answer_doc, status=status.HTTP_201_CREATED)
 
     def destroy(self, request, pk=None):
         """

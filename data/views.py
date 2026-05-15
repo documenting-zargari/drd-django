@@ -37,6 +37,36 @@ from roma.views import ArangoModelViewSet
 from user.permissions import CanEditSample, IsGlobalOrProjectAdmin, IsProjectEditor
 
 
+def _resolve_tag_ids(db, answer):
+    """
+    Return (tag_ids, tag_words) for an answer.
+
+    Prefers tag_ids stored on the parent ResearchQuestion (set by the
+    copy_tags_to_questions migration). Falls back to reading answer.tags
+    directly for the 65 questions where answers carry per-answer tags.
+    """
+    question_id = answer.get('question_id')
+    if question_id is not None:
+        cursor = db.aql.execute(
+            "FOR q IN ResearchQuestions FILTER q.id == @id RETURN q",
+            bind_vars={"id": question_id},
+        )
+        questions = list(cursor)
+        if questions and questions[0].get('tag_ids'):
+            return list(questions[0]['tag_ids']), []
+
+    # Fallback: read from answer.tags (always an array after normalisation)
+    tag_ids, tag_words = [], []
+    for tag in answer.get('tags') or []:
+        if tag.get('tag_id'):
+            tag_ids.append(tag['tag_id'])
+        elif tag.get('tag_word'):
+            tag_words.append(tag['tag_word'])
+        elif tag.get('name'):
+            tag_words.append(tag['name'])
+    return tag_ids, tag_words
+
+
 class CategoryViewSet(ArangoModelViewSet):
     """
     API endpoint for browsing categories in a hierarchical structure.
@@ -394,26 +424,7 @@ class PhraseViewSet(ArangoModelViewSet):
             if not sample:
                 return Response([])
 
-            # Collect tag_ids and tag_words from answer
-            tag_ids = []
-            tag_words = []
-
-            # Handle single tag format
-            if 'tag' in answer and answer['tag']:
-                tag = answer['tag']
-                if tag.get('tag_id'):
-                    tag_ids.append(tag['tag_id'])
-                elif tag.get('name'):
-                    tag_words.append(tag['name'])
-
-            # Handle tags array format
-            if 'tags' in answer and answer['tags']:
-                for tag in answer['tags']:
-                    if tag.get('tag_id'):
-                        tag_ids.append(tag['tag_id'])
-                    elif tag.get('tag_word'):
-                        tag_words.append(tag['tag_word'])
-
+            tag_ids, tag_words = _resolve_tag_ids(db, answer)
             phrases = []
 
             # Query by tag_ids if available
@@ -907,7 +918,7 @@ class AnswerViewSet(ArangoModelViewSet):
     permission_classes = [AllowAny]  # GET and query POST are public; write methods use per-action override
 
     # Structural fields that must never be overwritten via the API
-    PROTECTED_FIELDS = {"_key", "_id", "_rev", "sample", "question_id", "category", "tag", "tags", "tag_id", "tag_ids"}
+    PROTECTED_FIELDS = {"_key", "_id", "_rev", "sample", "question_id", "category"}
 
     def get_permissions(self):
         if self.action in ("partial_update", "create_answer", "destroy") or self.request.method in ("PATCH", "PUT", "DELETE"):
@@ -1431,21 +1442,7 @@ class TranscriptionViewSet(ArangoModelViewSet):
             if not sample:
                 return Response([])
 
-            # Collect tag_ids from answer
-            tag_ids = []
-
-            # Handle single tag format
-            if 'tag' in answer and answer['tag']:
-                tag = answer['tag']
-                if tag.get('tag_id'):
-                    tag_ids.append(tag['tag_id'])
-
-            # Handle tags array format
-            if 'tags' in answer and answer['tags']:
-                for tag in answer['tags']:
-                    if tag.get('tag_id'):
-                        tag_ids.append(tag['tag_id'])
-
+            tag_ids, _ = _resolve_tag_ids(db, answer)
             transcriptions = []
 
             if tag_ids:

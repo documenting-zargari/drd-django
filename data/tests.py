@@ -2,11 +2,17 @@ import json
 from unittest.mock import MagicMock, patch
 
 from django.contrib.auth.models import AnonymousUser
-from django.test import RequestFactory, TestCase
+from django.test import RequestFactory, SimpleTestCase
 from rest_framework.exceptions import ValidationError
 from rest_framework.request import Request
 
-from user.models import CustomUser
+
+def _mock_user(is_admin=False, show_hidden=False):
+    user = MagicMock()
+    user.is_authenticated = True
+    user.is_global_admin = is_admin
+    user.show_hidden_samples = show_hidden
+    return user
 
 
 ALL_SAMPLES = [
@@ -59,14 +65,12 @@ def _drf_request(user, method="get", path="/samples/", query=None, data=None):
     return req
 
 
-class SampleViewSetQuerysetTests(TestCase):
+class SampleViewSetQuerysetTests(SimpleTestCase):
     """Unit test SampleViewSet.get_queryset() visibility logic."""
 
     def setUp(self):
-        self.admin = CustomUser.objects.create_user(
-            username="admin", password="pw", is_global_admin=True
-        )
-        self.regular = CustomUser.objects.create_user(username="u", password="pw")
+        self.admin = _mock_user(is_admin=True, show_hidden=False)
+        self.regular = _mock_user()
 
     def _make_viewset(self, user):
         from data.views import SampleViewSet
@@ -87,28 +91,24 @@ class SampleViewSetQuerysetTests(TestCase):
 
     def test_admin_without_flag_sees_only_visible(self):
         self.admin.show_hidden_samples = False
-        self.admin.save()
         vs = self._make_viewset(self.admin)
         refs = [s["sample_ref"] for s in vs.get_queryset()]
         self.assertNotIn("HIDDEN-01", refs)
 
     def test_admin_with_flag_sees_all(self):
         self.admin.show_hidden_samples = True
-        self.admin.save()
         vs = self._make_viewset(self.admin)
         refs = [s["sample_ref"] for s in vs.get_queryset()]
         self.assertIn("AL-001", refs)
         self.assertIn("HIDDEN-01", refs)
 
 
-class AnswerIncludeHiddenTests(TestCase):
+class AnswerIncludeHiddenTests(SimpleTestCase):
     """Unit test AnswerViewSet.include_hidden()."""
 
     def setUp(self):
-        self.admin = CustomUser.objects.create_user(
-            username="admin", password="pw", is_global_admin=True
-        )
-        self.regular = CustomUser.objects.create_user(username="u", password="pw")
+        self.admin = _mock_user(is_admin=True, show_hidden=False)
+        self.regular = _mock_user()
 
     def _make_viewset(self, user, method="get", query=None, data=None):
         from data.views import AnswerViewSet
@@ -126,13 +126,11 @@ class AnswerIncludeHiddenTests(TestCase):
 
     def test_admin_with_flag_true(self):
         self.admin.show_hidden_samples = True
-        self.admin.save()
         vs = self._make_viewset(self.admin)
         self.assertTrue(vs.include_hidden())
 
     def test_admin_without_flag_false(self):
         self.admin.show_hidden_samples = False
-        self.admin.save()
         vs = self._make_viewset(self.admin)
         self.assertFalse(vs.include_hidden())
 
@@ -253,10 +251,10 @@ def _phrase_viewset(user, method="get", data=None, query=None):
 # GET /phrases/?sample= — get_queryset
 # ---------------------------------------------------------------------------
 
-class PhraseGetQuerysetTests(TestCase):
+class PhraseGetQuerysetTests(SimpleTestCase):
 
     def setUp(self):
-        self.user = CustomUser.objects.create_user(username="u", password="pw")
+        self.user = _mock_user()
 
     def test_returns_phrases_for_sample(self):
         vs = _phrase_viewset(self.user, query={"sample": "AL-001"})
@@ -281,10 +279,10 @@ class PhraseGetQuerysetTests(TestCase):
 # GET /phrases/list/ — phrase_list action
 # ---------------------------------------------------------------------------
 
-class PhraseListActionTests(TestCase):
+class PhraseListActionTests(SimpleTestCase):
 
     def setUp(self):
-        self.user = CustomUser.objects.create_user(username="u", password="pw")
+        self.user = _mock_user()
 
     def _call(self):
         from data.views import PhraseViewSet
@@ -315,13 +313,11 @@ class PhraseListActionTests(TestCase):
 # POST /phrases/search/ — text search path
 # ---------------------------------------------------------------------------
 
-class PhraseSearchTextTests(TestCase):
+class PhraseSearchTextTests(SimpleTestCase):
 
     def setUp(self):
-        self.user = CustomUser.objects.create_user(username="u", password="pw")
-        self.admin = CustomUser.objects.create_user(
-            username="admin", password="pw", is_global_admin=True, show_hidden_samples=True
-        )
+        self.user = _mock_user()
+        self.admin = _mock_user(is_admin=True, show_hidden=True)
 
     def _search(self, user, data):
         from data.views import PhraseViewSet
@@ -376,13 +372,11 @@ class PhraseSearchTextTests(TestCase):
 # POST /phrases/search/ — phrase_ref path
 # ---------------------------------------------------------------------------
 
-class PhraseSearchByRefTests(TestCase):
+class PhraseSearchByRefTests(SimpleTestCase):
 
     def setUp(self):
-        self.user = CustomUser.objects.create_user(username="u", password="pw")
-        self.admin = CustomUser.objects.create_user(
-            username="admin", password="pw", is_global_admin=True, show_hidden_samples=True
-        )
+        self.user = _mock_user()
+        self.admin = _mock_user(is_admin=True, show_hidden=True)
 
     def _search(self, user, data):
         from data.views import PhraseViewSet
@@ -441,13 +435,11 @@ class PhraseSearchByRefTests(TestCase):
 # POST /phrases/export/
 # ---------------------------------------------------------------------------
 
-class PhraseExportTests(TestCase):
+class PhraseExportTests(SimpleTestCase):
 
     def setUp(self):
-        self.user = CustomUser.objects.create_user(username="u", password="pw")
-        self.admin = CustomUser.objects.create_user(
-            username="admin", password="pw", is_global_admin=True, show_hidden_samples=True
-        )
+        self.user = _mock_user()
+        self.admin = _mock_user(is_admin=True, show_hidden=True)
 
     def _export(self, user, data):
         from data.views import PhraseViewSet
@@ -499,3 +491,239 @@ class PhraseExportTests(TestCase):
         for row in response.data:
             for field in ("phrase_ref", "sample", "phrase", "english", "has_recording"):
                 self.assertIn(field, row)
+
+
+# ---------------------------------------------------------------------------
+# _resolve_tag_ids helper
+# ---------------------------------------------------------------------------
+
+def _make_resolve_db(question=None):
+    """Mock db for _resolve_tag_ids: aql.execute returns the question document."""
+    db = MagicMock()
+    db.aql.execute.return_value = iter([question] if question else [])
+    return db
+
+
+class ResolveTagIdsTests(SimpleTestCase):
+    """Unit tests for the _resolve_tag_ids helper in data.views."""
+
+    def setUp(self):
+        from data.views import _resolve_tag_ids
+        self.resolve = _resolve_tag_ids
+
+    def test_returns_question_tag_ids_when_present(self):
+        answer = {"question_id": 42, "tags": [{"tag_id": 999}]}
+        question = {"id": 42, "tag_ids": [7, 8]}
+        db = _make_resolve_db(question)
+        tag_ids, tag_words = self.resolve(db, answer)
+        self.assertEqual(tag_ids, [7, 8])
+        self.assertEqual(tag_words, [])
+
+    def test_ignores_answer_tags_when_question_has_tag_ids(self):
+        # Answer has a different tag — should be ignored
+        answer = {"question_id": 42, "tags": [{"tag_id": 999}]}
+        question = {"id": 42, "tag_ids": [7]}
+        db = _make_resolve_db(question)
+        tag_ids, _ = self.resolve(db, answer)
+        self.assertNotIn(999, tag_ids)
+
+    def test_falls_back_to_answer_tags_when_question_has_no_tag_ids(self):
+        answer = {"question_id": 42, "tags": [{"tag_id": 5}, {"tag_id": 6}]}
+        question = {"id": 42}  # no tag_ids field
+        db = _make_resolve_db(question)
+        tag_ids, _ = self.resolve(db, answer)
+        self.assertEqual(sorted(tag_ids), [5, 6])
+
+    def test_falls_back_to_answer_tags_when_question_not_found(self):
+        answer = {"question_id": 99, "tags": [{"tag_id": 3}]}
+        db = _make_resolve_db(question=None)
+        tag_ids, _ = self.resolve(db, answer)
+        self.assertEqual(tag_ids, [3])
+
+    def test_returns_tag_words_from_answer_fallback(self):
+        answer = {"question_id": 42, "tags": [{"tag_word": "walked"}]}
+        question = {"id": 42}  # no tag_ids
+        db = _make_resolve_db(question)
+        _, tag_words = self.resolve(db, answer)
+        self.assertEqual(tag_words, ["walked"])
+
+    def test_returns_empty_when_no_tags_anywhere(self):
+        answer = {"question_id": 42}
+        question = {"id": 42}
+        db = _make_resolve_db(question)
+        tag_ids, tag_words = self.resolve(db, answer)
+        self.assertEqual(tag_ids, [])
+        self.assertEqual(tag_words, [])
+
+    def test_no_question_id_falls_back_to_answer_tags(self):
+        answer = {"tags": [{"tag_id": 11}]}  # no question_id
+        db = _make_resolve_db(question=None)
+        tag_ids, _ = self.resolve(db, answer)
+        self.assertEqual(tag_ids, [11])
+
+
+# ---------------------------------------------------------------------------
+# GET /phrases/by-answer/
+# ---------------------------------------------------------------------------
+
+def _by_answer_db(answer, question=None, phrases=None):
+    """
+    Mock db for by_answer tests.
+    Routes aql.execute calls by inspecting the query string.
+    """
+    phrases = phrases or []
+
+    def aql_execute(query, bind_vars=None):
+        if "ResearchQuestions" in query:
+            return iter([question] if question else [])
+        if "Phrases" in query:
+            return iter(phrases)
+        return iter([])
+
+    col = MagicMock()
+    col.get.return_value = answer
+
+    db = MagicMock()
+    db.aql.execute.side_effect = aql_execute
+    db.collection.return_value = col
+    return db
+
+
+def _by_answer_request(user, answer_key, db):
+    factory = RequestFactory()
+    raw = factory.get("/phrases/by-answer/", {"answer_key": answer_key})
+    req = Request(raw)
+    req.user = user
+    req.arangodb = db
+    req.arango_error = None
+    return req
+
+
+class PhrasesByAnswerTests(SimpleTestCase):
+
+    def setUp(self):
+        self.user = _mock_user()
+
+    def _call(self, answer, question=None, phrases=None):
+        from data.views import PhraseViewSet
+        db = _by_answer_db(answer, question=question, phrases=phrases)
+        vs = PhraseViewSet()
+        vs.request = _by_answer_request(self.user, answer.get("_key", "k1"), db)
+        vs.kwargs = {}
+        vs.format_kwarg = None
+        vs.action = "by_answer"
+        return vs.by_answer(vs.request)
+
+    def test_uses_question_tag_ids_when_present(self):
+        phrase = {"_key": "p1", "phrase_ref": "1", "phrase": "phrako",
+                  "english": "brother", "sample": "AL-001"}
+        answer = {"_key": "a1", "sample": "AL-001", "question_id": 10,
+                  "tags": [{"tag_id": 999}]}  # different tag on answer
+        question = {"id": 10, "tag_ids": [7]}
+        response = self._call(answer, question=question, phrases=[phrase])
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+
+    def test_falls_back_to_answer_tags_when_question_has_no_tag_ids(self):
+        phrase = {"_key": "p1", "phrase_ref": "1", "phrase": "phrako",
+                  "english": "brother", "sample": "AL-001"}
+        answer = {"_key": "a1", "sample": "AL-001", "question_id": 10,
+                  "tags": [{"tag_id": 5}]}
+        question = {"id": 10}  # no tag_ids
+        response = self._call(answer, question=question, phrases=[phrase])
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+
+    def test_returns_empty_when_no_tags_anywhere(self):
+        answer = {"_key": "a1", "sample": "AL-001", "question_id": 10}
+        question = {"id": 10}
+        response = self._call(answer, question=question, phrases=[])
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(list(response.data), [])
+
+    def test_missing_answer_key_raises_400(self):
+        from data.views import PhraseViewSet
+        from rest_framework.exceptions import ValidationError
+        db = _by_answer_db(answer=None)
+        factory = RequestFactory()
+        raw = factory.get("/phrases/by-answer/")  # no answer_key param
+        req = Request(raw)
+        req.user = self.user
+        req.arangodb = db
+        req.arango_error = None
+        vs = PhraseViewSet()
+        vs.request = req
+        vs.kwargs = {}
+        vs.format_kwarg = None
+        with self.assertRaises((ValidationError, Exception)):
+            vs.by_answer(req)
+
+
+# ---------------------------------------------------------------------------
+# GET /transcriptions/by-answer/
+# ---------------------------------------------------------------------------
+
+def _transcription_by_answer_db(answer, question=None, transcriptions=None):
+    transcriptions = transcriptions or []
+
+    def aql_execute(query, bind_vars=None):
+        if "ResearchQuestions" in query:
+            return iter([question] if question else [])
+        if "Transcriptions" in query:
+            return iter(transcriptions)
+        return iter([])
+
+    col = MagicMock()
+    col.get.return_value = answer
+
+    db = MagicMock()
+    db.aql.execute.side_effect = aql_execute
+    db.collection.return_value = col
+    return db
+
+
+class TranscriptionsByAnswerTests(SimpleTestCase):
+
+    def setUp(self):
+        self.user = _mock_user()
+
+    def _call(self, answer, question=None, transcriptions=None):
+        from data.views import TranscriptionViewSet
+        db = _transcription_by_answer_db(answer, question=question, transcriptions=transcriptions)
+        factory = RequestFactory()
+        raw = factory.get("/transcriptions/by-answer/", {"answer_key": answer.get("_key", "k1")})
+        req = Request(raw)
+        req.user = self.user
+        req.arangodb = db
+        req.arango_error = None
+        vs = TranscriptionViewSet()
+        vs.request = req
+        vs.kwargs = {}
+        vs.format_kwarg = None
+        vs.action = "by_answer"
+        return vs.by_answer(req)
+
+    def test_uses_question_tag_ids_when_present(self):
+        transcription = {"_key": "t1", "sample": "AL-001", "segment_no": 1}
+        answer = {"_key": "a1", "sample": "AL-001", "question_id": 10,
+                  "tags": [{"tag_id": 999}]}
+        question = {"id": 10, "tag_ids": [7]}
+        response = self._call(answer, question=question, transcriptions=[transcription])
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+
+    def test_falls_back_to_answer_tags_when_question_has_no_tag_ids(self):
+        transcription = {"_key": "t1", "sample": "AL-001", "segment_no": 1}
+        answer = {"_key": "a1", "sample": "AL-001", "question_id": 10,
+                  "tags": [{"tag_id": 5}]}
+        question = {"id": 10}  # no tag_ids
+        response = self._call(answer, question=question, transcriptions=[transcription])
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+
+    def test_returns_empty_when_no_tags_anywhere(self):
+        answer = {"_key": "a1", "sample": "AL-001", "question_id": 10}
+        question = {"id": 10}
+        response = self._call(answer, question=question)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(list(response.data), [])

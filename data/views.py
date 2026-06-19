@@ -920,11 +920,13 @@ class SampleViewSet(ArangoModelViewSet):
         """)
         phrases = natsorted(list(cursor), key=lambda x: x["phrase_ref"])
 
-        output = io.StringIO()
-        writer = csv.writer(output)
+        output = io.BytesIO()
+        wrapper = io.TextIOWrapper(output, encoding="utf-8-sig", newline="")
+        writer = csv.writer(wrapper)
         writer.writerow(["phrase_ref", "english", "phrase", "conjugated"])
         for p in phrases:
             writer.writerow([p.get("phrase_ref", ""), p.get("english", ""), "", ""])
+        wrapper.flush()
 
         response = HttpResponse(output.getvalue(), content_type="text/csv; charset=utf-8")
         response["Content-Disposition"] = 'attachment; filename="sample_import_template.csv"'
@@ -975,21 +977,18 @@ class SampleViewSet(ArangoModelViewSet):
             return Response({"error": "CSV file is required"}, status=400)
 
         raw = csv_file.read()
-        for encoding in ("utf-8-sig", "cp1252", "latin-1"):
+        for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
             try:
                 text = raw.decode(encoding)
                 break
             except (UnicodeDecodeError, LookupError):
                 continue
-        else:
-            return Response({"error": "Could not decode the uploaded file. Please save as UTF-8 CSV and try again."}, status=400)
 
         try:
-            sample = text[:4096]
             try:
-                dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+                dialect = csv.Sniffer().sniff(text[:4096], delimiters=",;\t|")
             except csv.Error:
-                dialect = csv.excel  # fall back to comma
+                dialect = csv.excel
             reader = csv.DictReader(io.StringIO(text), dialect=dialect)
             rows = list(reader)
             fieldnames = reader.fieldnames or []

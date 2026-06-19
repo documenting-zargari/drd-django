@@ -1,9 +1,13 @@
+import csv
+import io
 import json
 import os
 import shutil
+import uuid
 from datetime import datetime
 
 from django.conf import settings
+from django.http import HttpResponse
 
 
 def user_sees_hidden_samples(user):
@@ -747,7 +751,7 @@ class SampleViewSet(ArangoModelViewSet):
 
     serializer_class = SampleSerializer
     model = Sample
-    http_method_names = ["get", "patch", "head", "options"]
+    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
 
     EDITABLE_FIELDS = {
         "dialect_name", "self_attrib_name", "dialect_group_name",
@@ -869,6 +873,411 @@ class SampleViewSet(ArangoModelViewSet):
             return Response([result for result in cursor])
         except Exception as e:
             return Response({"error": f"Query failed: {str(e)}"}, status=500)
+
+    @action(detail=False, methods=["get"], url_path="check")
+    def check_sample_ref(self, request):
+        """
+        GET /samples/check/?ref=XY-042 — check whether a sample_ref exists and return
+        its metadata and phrase count. Admin only.
+        """
+        if not IsGlobalOrProjectAdmin().has_permission(request, self):
+            return Response({"error": "Admin access required"}, status=403)
+
+        ref = (request.query_params.get("ref") or "").strip()
+        if not ref:
+            return Response({"error": "ref parameter is required"}, status=400)
+
+        db = request.arangodb
+        cursor = list(db.collection("Samples").find({"sample_ref": ref}, limit=1))
+        if not cursor:
+            return Response({"exists": False, "phrase_count": 0})
+
+        sample = cursor[0]
+        phrase_count = next(db.aql.execute(
+            "FOR p IN Phrases FILTER p.sample == @s COLLECT WITH COUNT INTO n RETURN n",
+            bind_vars={"s": ref},
+        ), 0)
+
+        arango_internal = {"_id", "_key", "_rev"}
+        sample_data = {k: v for k, v in sample.items() if k not in arango_internal}
+        return Response({"exists": True, "phrase_count": phrase_count, "sample": sample_data})
+
+    @action(detail=False, methods=["get"], url_path="import-template")
+    def import_template(self, request):
+        """
+        GET /samples/import-template/ — download a CSV pre-filled with all canonical phrase_refs.
+        Admin only.
+        """
+        if not IsGlobalOrProjectAdmin().has_permission(request, self):
+            return Response({"error": "Admin access required"}, status=403)
+
+        db = request.arangodb
+        cursor = db.aql.execute("""
+            FOR p IN Phrases
+                COLLECT ref = p.phrase_ref INTO g
+                LET doc = FIRST(g[*].p)
+                RETURN { phrase_ref: doc.phrase_ref, english: doc.english }
+        """)
+        phrases = natsorted(list(cursor), key=lambda x: x["phrase_ref"])
+
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["phrase_ref", "english", "phrase", "conjugated"])
+        for p in phrases:
+            writer.writerow([p.get("phrase_ref", ""), p.get("english", ""), "", ""])
+
+        response = HttpResponse(output.getvalue(), content_type="text/csv; charset=utf-8")
+        response["Content-Disposition"] = 'attachment; filename="sample_import_template.csv"'
+        return response
+
+    @action(detail=False, methods=["post"], url_path="import")
+    def import_sample(self, request):
+        """
+        POST /samples/import/ — create a new sample from a CSV file + metadata form fields.
+        Full validation pass before any writes; rejects with per-row errors on failure.
+        Admin only.
+        """
+        if not IsGlobalOrProjectAdmin().has_permission(request, self):
+            return Response({"error": "Admin access required"}, status=403)
+
+        sample_ref = (request.data.get("sample_ref") or "").strip()
+        if not sample_ref:
+            return Response({"error": "sample_ref is required"}, status=400)
+
+        db = request.arangodb
+
+        try:
+            existing = list(db.collection("Samples").find({"sample_ref": sample_ref}, limit=1))
+        except Exception as exc:
+            return Response({"error": f"Database error checking sample_ref: {exc}"}, status=500)
+
+        upgrade = request.data.get("upgrade") in ("true", "1", "yes")
+
+        if existing and not upgrade:
+            try:
+                existing_phrase_count = next(db.aql.execute(
+                    "FOR p IN Phrases FILTER p.sample == @s COLLECT WITH COUNT INTO n RETURN n",
+                    bind_vars={"s": sample_ref},
+                ), 0)
+            except Exception as exc:
+                return Response({"error": f"Database error checking existing phrases: {exc}"}, status=500)
+
+            if existing_phrase_count == 0:
+                upgrade = True  # sample shell exists but has no phrases — proceed silently
+            else:
+                return Response({
+                    "exists": True,
+                    "existing_phrase_count": existing_phrase_count,
+                }, status=400)
+
+        csv_file = request.FILES.get("file")
+        if not csv_file:
+            return Response({"error": "CSV file is required"}, status=400)
+
+        raw = csv_file.read()
+        for encoding in ("utf-8-sig", "cp1252", "latin-1"):
+            try:
+                text = raw.decode(encoding)
+                break
+            except (UnicodeDecodeError, LookupError):
+                continue
+        else:
+            return Response({"error": "Could not decode the uploaded file. Please save as UTF-8 CSV and try again."}, status=400)
+
+        try:
+            sample = text[:4096]
+            try:
+                dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+            except csv.Error:
+                dialect = csv.excel  # fall back to comma
+            reader = csv.DictReader(io.StringIO(text), dialect=dialect)
+            rows = list(reader)
+            fieldnames = reader.fieldnames or []
+        except Exception as exc:
+            return Response({"error": f"Could not parse CSV: {exc}"}, status=400)
+
+        if not fieldnames:
+            return Response({"error": "CSV file appears to be empty or has no header row"}, status=400)
+
+        required_cols = {"phrase_ref", "phrase"}
+        missing = required_cols - set(fieldnames)
+        if missing:
+            return Response({
+                "error": f"CSV is missing required column(s): {', '.join(sorted(missing))}. "
+                         f"Found columns: {', '.join(fieldnames)}"
+            }, status=400)
+
+        try:
+            canonical_refs = set(db.aql.execute(
+                "FOR p IN Phrases COLLECT ref = p.phrase_ref RETURN ref"
+            ))
+        except Exception as exc:
+            return Response({"error": f"Database error loading phrase references: {exc}"}, status=500)
+
+        errors = []
+        phrases_to_create = []
+
+        for i, row in enumerate(rows, start=2):
+            phrase_ref = (row.get("phrase_ref") or "").strip()
+            phrase = (row.get("phrase") or "").strip()
+            english = (row.get("english") or "").strip()
+            conjugated_raw = (row.get("conjugated") or "").strip().lower()
+
+            if not phrase_ref:
+                errors.append({"row": i, "phrase_ref": "", "message": "phrase_ref is empty"})
+                continue
+            if phrase_ref not in canonical_refs:
+                errors.append({
+                    "row": i,
+                    "phrase_ref": phrase_ref,
+                    "message": f"phrase_ref '{phrase_ref}' does not exist in the canonical phrase list",
+                })
+                continue
+            if not phrase:
+                if request.data.get("skip_empty") in ("true", "1", "yes"):
+                    continue
+                errors.append({
+                    "row": i,
+                    "phrase_ref": phrase_ref,
+                    "message": "phrase column is empty — Romani text is required (or enable 'Skip empty phrases')",
+                })
+                continue
+
+            conjugated = None
+            if conjugated_raw in ("y", "yes", "true", "1"):
+                conjugated = True
+            elif conjugated_raw in ("n", "no", "false", "0"):
+                conjugated = False
+            elif conjugated_raw:
+                errors.append({
+                    "row": i,
+                    "phrase_ref": phrase_ref,
+                    "message": f"conjugated value '{row.get('conjugated', '')}' is not recognised — use Y, N, or leave blank",
+                })
+                continue
+
+            phrases_to_create.append({
+                "phrase_ref": phrase_ref,
+                "phrase": phrase,
+                "english": english,
+                "conjugated": conjugated,
+                "sample": sample_ref,
+            })
+
+        if errors:
+            return Response({"errors": errors}, status=400)
+
+        skipped_empty_count = len(rows) - len(phrases_to_create) - len(errors)
+
+        if not phrases_to_create:
+            return Response({"error": "CSV contains no phrase rows after the header"}, status=400)
+
+        batch_id = str(uuid.uuid4())
+        now = datetime.utcnow().isoformat()
+
+        # ── Create mode ──────────────────────────────────────────────────────
+        if not upgrade:
+            sample_doc = {
+                "sample_ref": sample_ref,
+                "dialect_name": (request.data.get("dialect_name") or "").strip(),
+                "self_attrib_name": (request.data.get("self_attrib_name") or "").strip(),
+                "dialect_group_name": (request.data.get("dialect_group_name") or "").strip(),
+                "location": (request.data.get("location") or "").strip(),
+                "country_code": (request.data.get("country_code") or "").strip(),
+                "visible": request.data.get("visible", "No"),
+                "migrant": request.data.get("migrant", "No"),
+                "source_type": (request.data.get("source_type") or "").strip(),
+                "import_batch_id": batch_id,
+            }
+            try:
+                db.collection("Samples").insert(sample_doc)
+            except Exception as exc:
+                return Response({"error": f"Failed to insert sample document: {exc}"}, status=500)
+
+            for p in phrases_to_create:
+                p["import_batch_id"] = batch_id
+
+            try:
+                db.collection("Phrases").insert_many(phrases_to_create)
+            except Exception as exc:
+                try:
+                    db.aql.execute(
+                        "FOR s IN Samples FILTER s.import_batch_id == @bid REMOVE s IN Samples",
+                        bind_vars={"bid": batch_id},
+                    )
+                except Exception:
+                    pass
+                return Response({"error": f"Failed to insert phrases: {exc}"}, status=500)
+
+            inserted_count = len(phrases_to_create)
+            updated_count = 0
+            rollback_updates = []
+
+        # ── Upgrade mode ─────────────────────────────────────────────────────
+        else:
+            # Load existing phrases for this sample keyed by phrase_ref
+            try:
+                existing_cursor = db.aql.execute(
+                    "FOR p IN Phrases FILTER p.sample == @s "
+                    "RETURN {phrase_ref: p.phrase_ref, _key: p._key, "
+                    "phrase: p.phrase, english: p.english, conjugated: p.conjugated}",
+                    bind_vars={"s": sample_ref},
+                )
+                existing_by_ref = {p["phrase_ref"]: p for p in existing_cursor}
+            except Exception as exc:
+                return Response({"error": f"Database error loading existing phrases: {exc}"}, status=500)
+
+            to_insert = []
+            to_update = []
+            rollback_updates = []  # stores old values so rollback can restore them
+
+            for p in phrases_to_create:
+                ref = p["phrase_ref"]
+                if ref in existing_by_ref:
+                    old = existing_by_ref[ref]
+                    rollback_updates.append({
+                        "_key": old["_key"],
+                        "phrase": old.get("phrase"),
+                        "english": old.get("english"),
+                        "conjugated": old.get("conjugated"),
+                    })
+                    to_update.append({"_key": old["_key"], "phrase": p["phrase"],
+                                      "english": p["english"], "conjugated": p["conjugated"],
+                                      "import_batch_id": batch_id})
+                else:
+                    p["import_batch_id"] = batch_id
+                    to_insert.append(p)
+
+            try:
+                if to_insert:
+                    db.collection("Phrases").insert_many(to_insert)
+                for upd in to_update:
+                    db.collection("Phrases").update(upd)
+            except Exception as exc:
+                return Response({"error": f"Failed to write phrases: {exc}"}, status=500)
+
+            inserted_count = len(to_insert)
+            updated_count = len(to_update)
+
+        batch_record = {
+            "batch_id": batch_id,
+            "sample_ref": sample_ref,
+            "phrase_count": inserted_count,
+            "updated_count": updated_count,
+            "skipped_empty_count": skipped_empty_count,
+            "created_at": now,
+            "created_by": request.user.username,
+            "upgrade": upgrade,
+            "rolled_back": False,
+            "rollback_updates": rollback_updates,
+        }
+        try:
+            db.collection("ImportBatches").insert(batch_record)
+        except Exception:
+            pass
+
+        return Response({
+            "batch_id": batch_id,
+            "sample_ref": sample_ref,
+            "phrase_count": inserted_count,
+            "updated_count": updated_count,
+            "skipped_count": skipped_empty_count,
+            "created_at": now,
+        }, status=201)
+
+    @action(
+        detail=False,
+        methods=["delete"],
+        url_path=r"import-batch/(?P<batch_id>[^/.]+)",
+    )
+    def rollback_import_batch(self, request, batch_id=None):
+        """
+        DELETE /samples/import-batch/{batch_id}/ — delete a sample and all its phrases
+        created by a specific import batch. Admin only.
+        """
+        if not IsGlobalOrProjectAdmin().has_permission(request, self):
+            return Response({"error": "Admin access required"}, status=403)
+
+        db = request.arangodb
+
+        # Load batch record to get stored old values for updated phrases
+        try:
+            batch_cursor = db.aql.execute(
+                "FOR b IN ImportBatches FILTER b.batch_id == @bid RETURN b",
+                bind_vars={"bid": batch_id},
+            )
+            batch_docs = list(batch_cursor)
+        except Exception:
+            batch_docs = []
+
+        batch_doc = batch_docs[0] if batch_docs else {}
+
+        if batch_doc.get("rolled_back"):
+            return Response({"error": "This import has already been rolled back"}, status=400)
+
+        # Delete newly inserted phrases (tagged with batch_id)
+        phrases_cursor = db.aql.execute(
+            "FOR p IN Phrases FILTER p.import_batch_id == @bid REMOVE p IN Phrases RETURN 1",
+            bind_vars={"bid": batch_id},
+        )
+        deleted_phrases = len(list(phrases_cursor))
+
+        # Restore previously updated phrases to their old values
+        restored_count = 0
+        for old in batch_doc.get("rollback_updates", []):
+            try:
+                db.collection("Phrases").update({
+                    "_key": old["_key"],
+                    "phrase": old.get("phrase"),
+                    "english": old.get("english"),
+                    "conjugated": old.get("conjugated"),
+                })
+                restored_count += 1
+            except Exception:
+                pass
+
+        # Delete the sample document (only present in non-upgrade imports)
+        sample_cursor = db.aql.execute(
+            "FOR s IN Samples FILTER s.import_batch_id == @bid REMOVE s IN Samples RETURN s.sample_ref",
+            bind_vars={"bid": batch_id},
+        )
+        deleted_samples = list(sample_cursor)
+
+        if not batch_docs and not deleted_samples and deleted_phrases == 0:
+            return Response({"error": "Import batch not found"}, status=404)
+
+        try:
+            db.aql.execute(
+                "FOR b IN ImportBatches FILTER b.batch_id == @bid "
+                "UPDATE b WITH {rolled_back: true, rolled_back_at: @ts} IN ImportBatches",
+                bind_vars={"bid": batch_id, "ts": datetime.utcnow().isoformat()},
+            )
+        except Exception:
+            pass
+
+        return Response({
+            "deleted_sample": deleted_samples[0] if deleted_samples else None,
+            "deleted_phrases": deleted_phrases,
+            "restored_phrases": restored_count,
+        })
+
+    @action(detail=False, methods=["get"], url_path="import-history")
+    def import_history(self, request):
+        """
+        GET /samples/import-history/ — list all import batches, newest first.
+        Admin only.
+        """
+        if not IsGlobalOrProjectAdmin().has_permission(request, self):
+            return Response({"error": "Admin access required"}, status=403)
+
+        db = request.arangodb
+        try:
+            cursor = db.aql.execute(
+                "FOR b IN ImportBatches SORT b.created_at DESC RETURN b"
+            )
+            return Response(list(cursor))
+        except Exception:
+            return Response([])
 
 
 class SourceViewSet(ArangoModelViewSet):

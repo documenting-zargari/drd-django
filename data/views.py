@@ -1479,7 +1479,10 @@ class AnswerViewSet(ArangoModelViewSet):
             if not question_ids:
                 raise NotFound(detail="At least one question ID is required")
 
-            answers = self.get_answers_for_questions(question_ids, sample_refs if sample_refs else None)
+            operator = body.get("operator", "OR").upper()
+            if operator not in ("AND", "OR"):
+                operator = "OR"
+            answers = self.get_answers_for_questions(question_ids, sample_refs if sample_refs else None, operator)
             serializer = self.serializer_class(
                 answers, many=True, context={"request": request, "view": self}
             )
@@ -1515,6 +1518,11 @@ class AnswerViewSet(ArangoModelViewSet):
             # Get sample filters
             sample_refs = self.request.GET.getlist("s")
 
+            # AND/OR operator for combining multiple search criteria (default: OR)
+            operator = self.request.GET.get("operator", "OR").upper()
+            if operator not in ("AND", "OR"):
+                operator = "OR"
+
             # Require at least one filter (legacy q or new search)
             if not question_ids and not search_filters:
                 raise NotFound(
@@ -1523,9 +1531,9 @@ class AnswerViewSet(ArangoModelViewSet):
 
             # Use new search method if search parameters provided, otherwise legacy method
             if search_filters:
-                return self.get_answers_with_field_filters(search_filters, sample_refs)
+                return self.get_answers_with_field_filters(search_filters, sample_refs, operator)
             else:
-                return self.get_answers_for_questions(question_ids, sample_refs)
+                return self.get_answers_for_questions(question_ids, sample_refs, operator)
                 
         except (NotFound, ValidationError):
             raise
@@ -1573,7 +1581,7 @@ class AnswerViewSet(ArangoModelViewSet):
             return bool(self.request.data.get("include_hidden", False))
         return False
 
-    def get_answers_for_questions(self, question_ids, sample_refs=None):
+    def get_answers_for_questions(self, question_ids, sample_refs=None, operator="OR"):
         """Helper method to get answers for multiple question IDs and sample references"""
         db = self.request.arangodb
         if not question_ids:
@@ -1602,13 +1610,34 @@ class AnswerViewSet(ArangoModelViewSet):
 
             filter_clause = "\n                ".join(filters)
 
-            aql = f"""
-            FOR question IN ResearchQuestions
-              FILTER question.id IN @question_ids
-              FOR answer IN 1..1 OUTBOUND question GivesAnswer
-                {filter_clause}
-                RETURN MERGE(answer, {{question_id: question.id}})
-            """
+            if operator == "AND" and len(question_ids) > 1:
+                # Only return answers for samples that have answers to ALL selected questions
+                aql = f"""
+                LET all_answers = (
+                  FOR question IN ResearchQuestions
+                    FILTER question.id IN @question_ids
+                    FOR answer IN 1..1 OUTBOUND question GivesAnswer
+                      {filter_clause}
+                      RETURN MERGE(answer, {{question_id: question.id}})
+                )
+                LET qualified_samples = (
+                  FOR a IN all_answers
+                    COLLECT sample = a.sample INTO grp
+                    FILTER LENGTH(UNIQUE(grp[*].a.question_id)) == LENGTH(@question_ids)
+                    RETURN sample
+                )
+                FOR a IN all_answers
+                  FILTER a.sample IN qualified_samples
+                  RETURN a
+                """
+            else:
+                aql = f"""
+                FOR question IN ResearchQuestions
+                  FILTER question.id IN @question_ids
+                  FOR answer IN 1..1 OUTBOUND question GivesAnswer
+                    {filter_clause}
+                    RETURN MERGE(answer, {{question_id: question.id}})
+                """
 
             cursor = db.aql.execute(aql, bind_vars=bind_vars)
             answers = [doc for doc in cursor]
@@ -1620,7 +1649,7 @@ class AnswerViewSet(ArangoModelViewSet):
             print(f"Error fetching answers: {e}")
             return []
 
-    def get_answers_with_field_filters(self, search_filters, sample_refs=None):
+    def get_answers_with_field_filters(self, search_filters, sample_refs=None, operator="OR"):
         """Get answers with field-based filtering using search parameters"""
         # Define allowed search fields for security
         # ALLOWED_SEARCH_FIELDS = {'form', 'marker', 'case_name'}
@@ -1660,8 +1689,9 @@ class AnswerViewSet(ArangoModelViewSet):
                 bind_vars[f"value_{i}"] = f"%{value}%"
                 conditions.append(condition)
             
-            # Combine all conditions with OR
-            filter_clause = " OR ".join(conditions)
+            # Combine all conditions with AND or OR
+            joiner = f" {operator} "
+            filter_clause = joiner.join(conditions)
             
             # Add sample filtering if provided
             extra_filters = ""

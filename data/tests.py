@@ -137,91 +137,157 @@ class AnswerIncludeHiddenTests(SimpleTestCase):
 
 # ---------------------------------------------------------------------------
 # Phrase test fixtures
+#
+# The Phrases collection was replaced by MasterPhrases (one doc per
+# phrase_ref, carrying english/conjugated/question_ids/category_ids) plus
+# SamplePhrases (one doc per sample recording, keyed by "{sample}_{phrase_ref}").
+# See extract/master_phrases_migration/PLAN.md.
 # ---------------------------------------------------------------------------
 
-PHRASES = [
-    {"_key": "1", "phrase_ref": "80a", "phrase": "phrako",  "english": "brother", "sample": "AL-001", "has_recording": True},
-    {"_key": "2", "phrase_ref": "80a", "phrase": "phral",   "english": "brother", "sample": "AL-002", "has_recording": False},
-    {"_key": "3", "phrase_ref": "80a", "phrase": "phralo",  "english": "brother", "sample": "HIDDEN-01", "has_recording": False},
-    {"_key": "4", "phrase_ref": "81",  "phrase": "phen",    "english": "sister",  "sample": "AL-001", "has_recording": True},
-    {"_key": "5", "phrase_ref": "81",  "phrase": "pheni",   "english": "sister",  "sample": "AL-002", "has_recording": False},
+MASTER_PHRASES = [
+    {"phrase_ref": "80a", "english": "brother", "conjugated": False, "question_ids": [], "category_ids": []},
+    {"phrase_ref": "81", "english": "sister", "conjugated": False, "question_ids": [], "category_ids": []},
+]
+
+SAMPLE_PHRASES = [
+    {"_key": "AL-001_80a", "phrase_ref": "80a", "phrase": "phrako", "sample": "AL-001", "has_recording": True},
+    {"_key": "AL-002_80a", "phrase_ref": "80a", "phrase": "phral", "sample": "AL-002", "has_recording": False},
+    {"_key": "HIDDEN-01_80a", "phrase_ref": "80a", "phrase": "phralo", "sample": "HIDDEN-01", "has_recording": False},
+    {"_key": "AL-001_81", "phrase_ref": "81", "phrase": "phen", "sample": "AL-001", "has_recording": True},
+    {"_key": "AL-002_81", "phrase_ref": "81", "phrase": "pheni", "sample": "AL-002", "has_recording": False},
 ]
 
 VISIBLE_REFS = ["AL-001", "AL-002"]
 ALL_REFS     = ["AL-001", "AL-002", "HIDDEN-01"]
 
 
-def _phrase_db(phrases=None):
-    """Mock ArangoDB for phrase search/export tests.
-    Inspects the AQL string to route to the appropriate fixture data.
+class _FakePhraseDB:
     """
-    phrases = phrases or PHRASES
+    Fake ArangoDB for the phrase list/search/export endpoints. Rather than
+    parsing real AQL, dispatches on distinctive substrings of the query
+    text (same approach the pre-migration mock used) and computes the
+    answer directly against in-memory MasterPhrases/SamplePhrases fixtures
+    — mirrors exactly what the real AQL in data/views.py does for the
+    DOCUMENT()-based joins between the two collections.
+    """
 
-    def _label(sample):
-        return f"Label {sample}"
+    def __init__(self, master_phrases=None, sample_phrases=None, samples=None):
+        self.master_phrases = {m["phrase_ref"]: m for m in (master_phrases if master_phrases is not None else MASTER_PHRASES)}
+        self.sample_phrases = {sp["_key"]: sp for sp in (sample_phrases if sample_phrases is not None else SAMPLE_PHRASES)}
+        self.samples = samples if samples is not None else ALL_SAMPLES
 
-    def aql_execute(query, bind_vars=None):
+    def _merged(self, sp, sample_label=None):
+        m = self.master_phrases.get(sp["phrase_ref"], {})
+        out = {
+            **sp,
+            "english": m.get("english"),
+            "conjugated": m.get("conjugated"),
+            "question_ids": m.get("question_ids"),
+            "category_ids": m.get("category_ids"),
+        }
+        if sample_label is not None:
+            out["sample_label"] = sample_label
+        return out
+
+    def _export_row(self, sp, sample_label):
+        m = self.master_phrases.get(sp["phrase_ref"], {})
+        return {
+            "phrase_ref": sp["phrase_ref"],
+            "sample": sp["sample"],
+            "sample_label": sample_label,
+            "phrase": sp["phrase"],
+            "english": m.get("english"),
+            "conjugated": m.get("conjugated"),
+            "has_recording": sp.get("has_recording"),
+        }
+
+    def collection(self, name):
+        col = MagicMock()
+        store = {"SamplePhrases": self.sample_phrases, "MasterPhrases": self.master_phrases}.get(name, {})
+        col.find.side_effect = lambda q: iter([v for v in store.values() if all(v.get(k) == val for k, val in q.items())])
+        return col
+
+    def aql_execute(self, query, bind_vars=None):
         bv = bind_vars or {}
+        is_export = "has_recording: phrase.has_recording" in query
 
-        # ── phrase_list endpoint: COLLECT by phrase_ref ──────────────────
-        if "COLLECT ref = p.phrase_ref" in query:
-            seen, result = set(), []
-            for p in phrases:
-                if p["phrase_ref"] not in seen:
-                    seen.add(p["phrase_ref"])
-                    result.append({"phrase_ref": p["phrase_ref"], "english": p["english"]})
-            return iter(result)
+        # sample_refs resolution when not explicitly provided (used by both
+        # the search and export general branches before building bind_vars)
+        if query == "FOR s IN Samples RETURN s.sample_ref":
+            return iter([s["sample_ref"] for s in self.samples])
+        if query == "FOR s IN Samples FILTER s.visible == 'Yes' RETURN s.sample_ref":
+            return iter([s["sample_ref"] for s in self.samples if s.get("visible") == "Yes"])
 
-        # ── sample ref resolution (text search path) ─────────────────────
-        if "RETURN s.sample_ref" in query:
-            if "visible" in query.lower():
-                return iter(VISIBLE_REFS)
-            return iter(ALL_REFS)
+        # get_queryset: GET /phrases/?sample=
+        if "FOR sp IN SamplePhrases" in query and "FILTER sp.sample == @sample" in query and "DOCUMENT" in query:
+            sample = bv["sample"]
+            return iter([self._merged(sp) for sp in self.sample_phrases.values() if sp["sample"] == sample])
 
-        # ── phrase_ref exact-match path ───────────────────────────────────
-        if "phrase.phrase_ref ==" in query:
-            ref = bv.get("phrase_ref")
-            result = [p for p in phrases if p["phrase_ref"] == ref]
-            if bv.get("sample_refs"):
-                result = [p for p in result if p["sample"] in bv["sample_refs"]]
-            if "visible" in query.lower():
-                result = [p for p in result if p["sample"] in VISIBLE_REFS]
-            return iter([{**p, "sample_label": _label(p["sample"])} for p in result])
+        # phrase_list: GET /phrases/list/
+        if "RETURN { phrase_ref: m.phrase_ref, english: m.english }" in query:
+            return iter([{"phrase_ref": m["phrase_ref"], "english": m["english"]} for m in self.master_phrases.values()])
 
-        # ── text search count query ───────────────────────────────────────
-        if "COLLECT WITH COUNT INTO total" in query:
-            q = bv.get("query", "")
-            refs = bv.get("sample_refs", ALL_REFS)
-            count = sum(
-                1 for p in phrases
-                if p["sample"] in refs and (q in p["phrase"].lower() or q in p["english"].lower())
-            )
-            return iter([count])
+        # search/export phrase_ref (exact match) branch
+        if 'LET m = DOCUMENT(CONCAT("MasterPhrases/", @phrase_ref))' in query:
+            phrase_ref = bv.get("phrase_ref")
+            m = self.master_phrases.get(phrase_ref)
+            if not m:
+                return iter([])
+            sample_refs = bv.get("sample_refs")
+            visible_only = "FILTER s.visible == 'Yes'" in query
+            rows = []
+            for sp in self.sample_phrases.values():
+                if sp["phrase_ref"] != phrase_ref:
+                    continue
+                if sample_refs and sp["sample"] not in sample_refs:
+                    continue
+                s = next((x for x in self.samples if x["sample_ref"] == sp["sample"]), None)
+                if s is None:
+                    continue
+                if visible_only and s.get("visible") != "Yes":
+                    continue
+                label = f"Label {sp['sample']}"
+                rows.append(self._export_row(sp, label) if is_export else self._merged(sp, label))
+            return iter(rows)
 
-        # ── text search results query (PhraseSearch) ──────────────────────
-        if "PhraseSearch" in query:
-            q = bv.get("query", "")
-            refs = bv.get("sample_refs", ALL_REFS)
+        # search/export general (free-text) branch
+        if "LET candidate_keys = UNIQUE" in query:
+            query_lower = bv.get("query", "")
+            sample_refs = bv.get("sample_refs", ALL_REFS)
+            search_romani = bv.get("search_romani", True)
+            search_english = bv.get("search_english", True)
+
+            romani_keys = set()
+            if search_romani:
+                romani_keys = {sp["_key"] for sp in self.sample_phrases.values()
+                                if sp["sample"] in sample_refs and query_lower in sp["phrase"].lower()}
+            english_keys = set()
+            if search_english:
+                english_refs = {m["phrase_ref"] for m in self.master_phrases.values()
+                                 if query_lower in (m.get("english") or "").lower()}
+                english_keys = {sp["_key"] for sp in self.sample_phrases.values()
+                                 if sp["phrase_ref"] in english_refs and sp["sample"] in sample_refs}
+            candidate_keys = sorted(romani_keys | english_keys)
+
+            if "RETURN LENGTH(candidate_keys)" in query:
+                return iter([len(candidate_keys)])
+
+            rows = []
+            for key in candidate_keys:
+                sp = self.sample_phrases[key]
+                label = f"Label {sp['sample']}"
+                rows.append(self._export_row(sp, label) if is_export else self._merged(sp, label))
+
+            if is_export:
+                return iter(rows)
             offset = bv.get("offset", 0)
             page_size = bv.get("page_size", 50)
-            result = [
-                p for p in phrases
-                if p["sample"] in refs and (q in p["phrase"].lower() or q in p["english"].lower())
-            ]
-            return iter([{**p, "sample_label": _label(p["sample"])} for p in result[offset:offset + page_size]])
+            return iter(rows[offset:offset + page_size])
 
         return iter([])
 
-    db = MagicMock()
-    db.aql.execute.side_effect = aql_execute
-    # collection().find() used by get_queryset
-    col = MagicMock()
-    col.find.side_effect = lambda q: iter([p for p in phrases if all(p.get(k) == v for k, v in q.items())])
-    db.collection.return_value = col
-    return db
 
-
-def _phrase_request(user, method="get", data=None, query=None):
+def _phrase_request(user, method="get", data=None, query=None, db=None):
     factory = RequestFactory()
     path = "/phrases/"
     if method == "post":
@@ -232,7 +298,11 @@ def _phrase_request(user, method="get", data=None, query=None):
         raw = factory.get(path, query or {})
         req = Request(raw)
     req.user = user
-    req.arangodb = _phrase_db()
+    fake = db or _FakePhraseDB()
+    mock_db = MagicMock()
+    mock_db.aql.execute.side_effect = fake.aql_execute
+    mock_db.collection.side_effect = fake.collection
+    req.arangodb = mock_db
     req.arango_error = None
     return req
 
@@ -274,6 +344,15 @@ class PhraseGetQuerysetTests(SimpleTestCase):
         phrase_refs = [p["phrase_ref"] for p in result]
         self.assertEqual(phrase_refs, sorted(phrase_refs, key=lambda x: (int(''.join(filter(str.isdigit, x)) or 0), x)))
 
+    def test_result_includes_master_fields(self):
+        vs = _phrase_viewset(self.user, query={"sample": "AL-001"})
+        result = vs.get_queryset()
+        for p in result:
+            self.assertIn("english", p)
+            self.assertIn("conjugated", p)
+            self.assertIn("question_ids", p)
+            self.assertIn("category_ids", p)
+
 
 # ---------------------------------------------------------------------------
 # GET /phrases/list/ — phrase_list action
@@ -303,8 +382,9 @@ class PhraseListActionTests(SimpleTestCase):
             self.assertIn("phrase_ref", item)
             self.assertIn("english", item)
 
-    def test_deduplicates_across_samples(self):
-        # "80a" appears in 3 samples, "81" in 2 — should return only 2 unique entries
+    def test_one_record_per_master_phrase(self):
+        # MASTER_PHRASES has 2 entries ("80a", "81") even though "80a" has
+        # 3 sample recordings — one row per MasterPhrase, not per sample.
         response = self._call()
         self.assertEqual(len(response.data), 2)
 
@@ -342,30 +422,35 @@ class PhraseSearchTextTests(SimpleTestCase):
         self.assertIn("page", response.data)
 
     def test_text_search_finds_matching_phrases(self):
-        response = self._search(self.user, {"query": "brother"})
+        response = self._search(self.user, {"query": "brother", "field": "english"})
         self.assertGreater(response.data["count"], 0)
         for phrase in response.data["results"]:
             self.assertIn("brother", phrase.get("english", "").lower())
 
     def test_regular_user_excludes_hidden_samples(self):
-        response = self._search(self.user, {"query": "brother"})
+        response = self._search(self.user, {"query": "brother", "field": "english"})
         samples = [p["sample"] for p in response.data["results"]]
         self.assertNotIn("HIDDEN-01", samples)
 
     def test_admin_with_flag_includes_hidden_samples(self):
-        response = self._search(self.admin, {"query": "brother"})
+        response = self._search(self.admin, {"query": "brother", "field": "english"})
         samples = [p["sample"] for p in response.data["results"]]
         self.assertIn("HIDDEN-01", samples)
 
     def test_sample_refs_filter_restricts_results(self):
-        response = self._search(self.user, {"query": "brother", "sample_refs": ["AL-001"]})
+        response = self._search(self.user, {"query": "brother", "field": "english", "sample_refs": ["AL-001"]})
         samples = [p["sample"] for p in response.data["results"]]
         self.assertTrue(all(s == "AL-001" for s in samples))
 
     def test_results_include_sample_label(self):
-        response = self._search(self.user, {"query": "sister"})
+        response = self._search(self.user, {"query": "sister", "field": "english"})
         for phrase in response.data["results"]:
             self.assertIn("sample_label", phrase)
+
+    def test_romani_field_searches_phrase_text(self):
+        response = self._search(self.user, {"query": "phrako", "field": "romani"})
+        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(response.data["results"][0]["sample"], "AL-001")
 
 
 # ---------------------------------------------------------------------------
@@ -387,7 +472,6 @@ class PhraseSearchByRefTests(SimpleTestCase):
         return vs.search(vs.request)
 
     def test_phrase_ref_does_not_require_query(self):
-        # Should not raise
         response = self._search(self.user, {"phrase_ref": "80a"})
         self.assertIn("results", response.data)
 
@@ -412,7 +496,6 @@ class PhraseSearchByRefTests(SimpleTestCase):
         self.assertIn("HIDDEN-01", samples)
 
     def test_phrase_ref_returns_no_pagination(self):
-        # count == len(results): everything returned in one shot
         response = self._search(self.user, {"phrase_ref": "80a"})
         self.assertEqual(response.data["count"], len(response.data["results"]))
 
@@ -458,16 +541,16 @@ class PhraseExportTests(SimpleTestCase):
             self._export(self.user, {"query": "b"})
 
     def test_text_export_returns_list(self):
-        response = self._export(self.user, {"query": "sister"})
+        response = self._export(self.user, {"query": "sister", "field": "english"})
         self.assertIsInstance(response.data, list)
 
     def test_text_export_excludes_hidden(self):
-        response = self._export(self.user, {"query": "brother"})
+        response = self._export(self.user, {"query": "brother", "field": "english"})
         samples = [r["sample"] for r in response.data]
         self.assertNotIn("HIDDEN-01", samples)
 
     def test_text_export_admin_includes_hidden(self):
-        response = self._export(self.admin, {"query": "brother"})
+        response = self._export(self.admin, {"query": "brother", "field": "english"})
         samples = [r["sample"] for r in response.data]
         self.assertIn("HIDDEN-01", samples)
 
@@ -494,109 +577,109 @@ class PhraseExportTests(SimpleTestCase):
 
 
 # ---------------------------------------------------------------------------
-# _resolve_tag_ids helper
+# _get_question_hierarchy_ids helper
 # ---------------------------------------------------------------------------
 
-def _make_resolve_db(question=None):
-    """Mock db for _resolve_tag_ids: aql.execute returns the question document."""
-    db = MagicMock()
-    db.aql.execute.return_value = iter([question] if question else [])
-    return db
-
-
-class ResolveTagIdsTests(SimpleTestCase):
-    """Unit tests for the _resolve_tag_ids helper in data.views."""
+class QuestionHierarchyIdsTests(SimpleTestCase):
+    """Unit tests for _get_question_hierarchy_ids in data.views."""
 
     def setUp(self):
-        from data.views import _resolve_tag_ids
-        self.resolve = _resolve_tag_ids
+        from data.views import _get_question_hierarchy_ids
+        self.resolve = _get_question_hierarchy_ids
 
-    def test_returns_question_tag_ids_when_present(self):
-        answer = {"question_id": 42, "tags": [{"tag_id": 999}]}
-        question = {"id": 42, "tag_ids": [7, 8]}
-        db = _make_resolve_db(question)
-        tag_ids, tag_words = self.resolve(db, answer)
-        self.assertEqual(tag_ids, [7, 8])
-        self.assertEqual(tag_words, [])
+    def _db(self, hierarchy_ids=None):
+        db = MagicMock()
+        db.aql.execute.return_value = iter([hierarchy_ids] if hierarchy_ids is not None else [])
+        return db
 
-    def test_ignores_answer_tags_when_question_has_tag_ids(self):
-        # Answer has a different tag — should be ignored
-        answer = {"question_id": 42, "tags": [{"tag_id": 999}]}
-        question = {"id": 42, "tag_ids": [7]}
-        db = _make_resolve_db(question)
-        tag_ids, _ = self.resolve(db, answer)
-        self.assertNotIn(999, tag_ids)
+    def test_returns_hierarchy_ids_when_question_found(self):
+        db = self._db([1, 4, 5, 6])
+        self.assertEqual(self.resolve(db, 6), [1, 4, 5, 6])
 
-    def test_falls_back_to_answer_tags_when_question_has_no_tag_ids(self):
-        answer = {"question_id": 42, "tags": [{"tag_id": 5}, {"tag_id": 6}]}
-        question = {"id": 42}  # no tag_ids field
-        db = _make_resolve_db(question)
-        tag_ids, _ = self.resolve(db, answer)
-        self.assertEqual(sorted(tag_ids), [5, 6])
+    def test_returns_none_when_question_not_found(self):
+        db = self._db(hierarchy_ids=None)
+        self.assertIsNone(self.resolve(db, 999))
 
-    def test_falls_back_to_answer_tags_when_question_not_found(self):
-        answer = {"question_id": 99, "tags": [{"tag_id": 3}]}
-        db = _make_resolve_db(question=None)
-        tag_ids, _ = self.resolve(db, answer)
-        self.assertEqual(tag_ids, [3])
-
-    def test_returns_tag_words_from_answer_fallback(self):
-        answer = {"question_id": 42, "tags": [{"tag_word": "walked"}]}
-        question = {"id": 42}  # no tag_ids
-        db = _make_resolve_db(question)
-        _, tag_words = self.resolve(db, answer)
-        self.assertEqual(tag_words, ["walked"])
-
-    def test_returns_empty_when_no_tags_anywhere(self):
-        answer = {"question_id": 42}
-        question = {"id": 42}
-        db = _make_resolve_db(question)
-        tag_ids, tag_words = self.resolve(db, answer)
-        self.assertEqual(tag_ids, [])
-        self.assertEqual(tag_words, [])
-
-    def test_no_question_id_falls_back_to_answer_tags(self):
-        answer = {"tags": [{"tag_id": 11}]}  # no question_id
-        db = _make_resolve_db(question=None)
-        tag_ids, _ = self.resolve(db, answer)
-        self.assertEqual(tag_ids, [11])
+    def test_returns_none_when_question_id_is_none(self):
+        db = self._db()
+        self.assertIsNone(self.resolve(db, None))
+        db.aql.execute.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
 # GET /phrases/by-answer/
 # ---------------------------------------------------------------------------
 
-def _by_answer_db(answer, question=None, phrases=None):
+class _FakeByAnswerPhraseDB:
     """
-    Mock db for by_answer tests.
-    Routes aql.execute calls by inspecting the query string.
+    Fake ArangoDB for PhraseViewSet.by_answer. Mirrors the two AQL shapes
+    the real view issues: the phrase_overrides.include override path, and
+    the normal question_ids/category_ids-matching path — both then joining
+    to SamplePhrases by direct key lookup (DOCUMENT), same as the real
+    implementation.
     """
-    phrases = phrases or []
 
-    def aql_execute(query, bind_vars=None):
-        if "ResearchQuestions" in query:
-            return iter([question] if question else [])
-        if "Phrases" in query:
-            return iter(phrases)
+    def __init__(self, answer, question=None, master_phrases=None, sample_phrases=None):
+        self.answer = answer
+        self.question = question
+        self.master_phrases = {m["phrase_ref"]: m for m in (master_phrases or [])}
+        self.sample_phrases = {sp["_key"]: sp for sp in (sample_phrases or [])}
+
+    def collection(self, name):
+        col = MagicMock()
+        if name == "Answers":
+            col.get.side_effect = lambda key: self.answer if self.answer and self.answer.get("_key") == key else None
+        else:
+            col.get.side_effect = lambda key: None
+        return col
+
+    def _merge(self, sp, m):
+        return {
+            **sp,
+            "english": m.get("english"),
+            "conjugated": m.get("conjugated"),
+            "question_ids": m.get("question_ids"),
+            "category_ids": m.get("category_ids"),
+        }
+
+    def aql_execute(self, query, bind_vars=None):
+        bv = bind_vars or {}
+
+        if "ResearchQuestions" in query and "hierarchy_ids" in query:
+            return iter([self.question["hierarchy_ids"]] if self.question else [])
+
+        if "FOR phrase_ref IN @include" in query:
+            include = bv["include"]
+            exclude = set(bv.get("exclude") or [])
+            sample = bv["sample"]
+            rows = []
+            for ref in include:
+                if ref in exclude:
+                    continue
+                sp = self.sample_phrases.get(f"{sample}_{ref}")
+                if not sp:
+                    continue
+                m = self.master_phrases.get(ref, {})
+                rows.append(self._merge(sp, m))
+            return iter(rows)
+
+        if "FOR m IN MasterPhrases" in query and "@question_id IN" in query:
+            question_id = bv["question_id"]
+            hierarchy_ids = set(bv["hierarchy_ids"])
+            exclude = set(bv.get("exclude") or [])
+            sample = bv["sample"]
+            rows = []
+            for m in self.master_phrases.values():
+                if m["phrase_ref"] in exclude:
+                    continue
+                if question_id in (m.get("question_ids") or []) or (set(m.get("category_ids") or []) & hierarchy_ids):
+                    sp = self.sample_phrases.get(f"{sample}_{m['phrase_ref']}")
+                    if not sp:
+                        continue
+                    rows.append(self._merge(sp, m))
+            return iter(rows)
+
         return iter([])
-
-    col = MagicMock()
-    col.get.return_value = answer
-
-    db = MagicMock()
-    db.aql.execute.side_effect = aql_execute
-    db.collection.return_value = col
-    return db
-
-
-def _by_answer_request(user, answer_key, db):
-    factory = RequestFactory()
-    raw = factory.get("/phrases/by-answer/", {"answer_key": answer_key})
-    req = Request(raw)
-    req.user = user
-    req.arangodb = db
-    req.arango_error = None
-    return req
 
 
 class PhrasesByAnswerTests(SimpleTestCase):
@@ -604,52 +687,87 @@ class PhrasesByAnswerTests(SimpleTestCase):
     def setUp(self):
         self.user = _mock_user()
 
-    def _call(self, answer, question=None, phrases=None):
+    def _call(self, answer, question=None, master_phrases=None, sample_phrases=None):
         from data.views import PhraseViewSet
-        db = _by_answer_db(answer, question=question, phrases=phrases)
+        fake = _FakeByAnswerPhraseDB(answer, question=question, master_phrases=master_phrases, sample_phrases=sample_phrases)
+        mock_db = MagicMock()
+        mock_db.aql.execute.side_effect = fake.aql_execute
+        mock_db.collection.side_effect = fake.collection
+        factory = RequestFactory()
+        raw = factory.get("/phrases/by-answer/", {"answer_key": answer.get("_key", "k1") if answer else "k1"})
+        req = Request(raw)
+        req.user = self.user
+        req.arangodb = mock_db
+        req.arango_error = None
         vs = PhraseViewSet()
-        vs.request = _by_answer_request(self.user, answer.get("_key", "k1"), db)
+        vs.request = req
         vs.kwargs = {}
         vs.format_kwarg = None
         vs.action = "by_answer"
-        return vs.by_answer(vs.request)
+        return vs.by_answer(req)
 
-    def test_uses_question_tag_ids_when_present(self):
-        phrase = {"_key": "p1", "phrase_ref": "1", "phrase": "phrako",
-                  "english": "brother", "sample": "AL-001"}
-        answer = {"_key": "a1", "sample": "AL-001", "question_id": 10,
-                  "tags": [{"tag_id": 999}]}  # different tag on answer
-        question = {"id": 10, "tag_ids": [7]}
-        response = self._call(answer, question=question, phrases=[phrase])
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(len(response.data), 1)
-
-    def test_falls_back_to_answer_tags_when_question_has_no_tag_ids(self):
-        phrase = {"_key": "p1", "phrase_ref": "1", "phrase": "phrako",
-                  "english": "brother", "sample": "AL-001"}
-        answer = {"_key": "a1", "sample": "AL-001", "question_id": 10,
-                  "tags": [{"tag_id": 5}]}
-        question = {"id": 10}  # no tag_ids
-        response = self._call(answer, question=question, phrases=[phrase])
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(len(response.data), 1)
-
-    def test_returns_empty_when_no_tags_anywhere(self):
+    def test_matches_via_question_ids(self):
+        m = {"phrase_ref": "1", "english": "brother", "conjugated": False, "question_ids": [10], "category_ids": []}
+        sp = {"_key": "AL-001_1", "phrase_ref": "1", "phrase": "phrako", "sample": "AL-001", "has_recording": True}
         answer = {"_key": "a1", "sample": "AL-001", "question_id": 10}
-        question = {"id": 10}
-        response = self._call(answer, question=question, phrases=[])
+        question = {"hierarchy_ids": [1, 10]}
+        response = self._call(answer, question=question, master_phrases=[m], sample_phrases=[sp])
         self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+
+    def test_matches_via_category_ids(self):
+        m = {"phrase_ref": "1", "english": "brother", "conjugated": False, "question_ids": [], "category_ids": [4]}
+        sp = {"_key": "AL-001_1", "phrase_ref": "1", "phrase": "phrako", "sample": "AL-001", "has_recording": True}
+        answer = {"_key": "a1", "sample": "AL-001", "question_id": 10}
+        question = {"hierarchy_ids": [1, 4, 10]}  # question 10 falls under category 4
+        response = self._call(answer, question=question, master_phrases=[m], sample_phrases=[sp])
+        self.assertEqual(len(response.data), 1)
+
+    def test_returns_empty_when_no_match(self):
+        answer = {"_key": "a1", "sample": "AL-001", "question_id": 10}
+        question = {"hierarchy_ids": [1, 10]}
+        response = self._call(answer, question=question, master_phrases=[], sample_phrases=[])
         self.assertEqual(list(response.data), [])
+
+    def test_override_include_replaces_normal_match(self):
+        # Normal (question-based) matching would find phrase_ref "2"; the
+        # override should replace that entirely with phrase_ref "1" — this
+        # is what preserves per-answer precision for the heterogeneous
+        # questions (see extract/tag_divergence.md).
+        m1 = {"phrase_ref": "1", "english": "brother", "conjugated": False, "question_ids": [], "category_ids": []}
+        m2 = {"phrase_ref": "2", "english": "sister", "conjugated": False, "question_ids": [10], "category_ids": []}
+        sp1 = {"_key": "AL-001_1", "phrase_ref": "1", "phrase": "phrako", "sample": "AL-001", "has_recording": True}
+        sp2 = {"_key": "AL-001_2", "phrase_ref": "2", "phrase": "phen", "sample": "AL-001", "has_recording": True}
+        answer = {"_key": "a1", "sample": "AL-001", "question_id": 10,
+                  "phrase_overrides": {"include": ["1"], "exclude": []}}
+        question = {"hierarchy_ids": [1, 10]}
+        response = self._call(answer, question=question, master_phrases=[m1, m2], sample_phrases=[sp1, sp2])
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["phrase_ref"], "1")
+
+    def test_override_exclude_removes_from_normal_match(self):
+        m1 = {"phrase_ref": "1", "english": "brother", "conjugated": False, "question_ids": [10], "category_ids": []}
+        m2 = {"phrase_ref": "2", "english": "sister", "conjugated": False, "question_ids": [10], "category_ids": []}
+        sp1 = {"_key": "AL-001_1", "phrase_ref": "1", "phrase": "phrako", "sample": "AL-001", "has_recording": True}
+        sp2 = {"_key": "AL-001_2", "phrase_ref": "2", "phrase": "phen", "sample": "AL-001", "has_recording": True}
+        answer = {"_key": "a1", "sample": "AL-001", "question_id": 10,
+                  "phrase_overrides": {"include": [], "exclude": ["2"]}}
+        question = {"hierarchy_ids": [1, 10]}
+        response = self._call(answer, question=question, master_phrases=[m1, m2], sample_phrases=[sp1, sp2])
+        refs = [p["phrase_ref"] for p in response.data]
+        self.assertEqual(refs, ["1"])
 
     def test_missing_answer_key_raises_400(self):
         from data.views import PhraseViewSet
-        from rest_framework.exceptions import ValidationError
-        db = _by_answer_db(answer=None)
+        fake = _FakeByAnswerPhraseDB(answer=None)
+        mock_db = MagicMock()
+        mock_db.aql.execute.side_effect = fake.aql_execute
+        mock_db.collection.side_effect = fake.collection
         factory = RequestFactory()
         raw = factory.get("/phrases/by-answer/")  # no answer_key param
         req = Request(raw)
         req.user = self.user
-        req.arangodb = db
+        req.arangodb = mock_db
         req.arango_error = None
         vs = PhraseViewSet()
         vs.request = req
@@ -663,23 +781,57 @@ class PhrasesByAnswerTests(SimpleTestCase):
 # GET /transcriptions/by-answer/
 # ---------------------------------------------------------------------------
 
-def _transcription_by_answer_db(answer, question=None, transcriptions=None):
-    transcriptions = transcriptions or []
+class _FakeByAnswerTranscriptionDB:
+    """Mirrors the two AQL shapes TranscriptionViewSet.by_answer issues:
+    the transcription_overrides.include override path (direct key lookups,
+    still sample-scoped), and the normal question_ids/category_ids match."""
 
-    def aql_execute(query, bind_vars=None):
-        if "ResearchQuestions" in query:
-            return iter([question] if question else [])
-        if "Transcriptions" in query:
-            return iter(transcriptions)
+    def __init__(self, answer, question=None, transcriptions=None):
+        self.answer = answer
+        self.question = question
+        self.transcriptions = {t["_key"]: t for t in (transcriptions or [])}
+
+    def collection(self, name):
+        col = MagicMock()
+        if name == "Answers":
+            col.get.side_effect = lambda key: self.answer if self.answer and self.answer.get("_key") == key else None
+        else:
+            col.get.side_effect = lambda key: None
+        return col
+
+    def aql_execute(self, query, bind_vars=None):
+        bv = bind_vars or {}
+
+        if "ResearchQuestions" in query and "hierarchy_ids" in query:
+            return iter([self.question["hierarchy_ids"]] if self.question else [])
+
+        if "FOR key IN @include" in query:
+            include = bv["include"]
+            exclude = set(bv.get("exclude") or [])
+            sample = bv["sample"]
+            rows = []
+            for key in include:
+                if key in exclude:
+                    continue
+                t = self.transcriptions.get(key)
+                if t and t.get("sample") == sample:
+                    rows.append(t)
+            return iter(rows)
+
+        if "FOR transcription IN Transcriptions" in query:
+            sample = bv["sample"]
+            question_id = bv["question_id"]
+            hierarchy_ids = set(bv["hierarchy_ids"])
+            exclude = set(bv.get("exclude") or [])
+            rows = []
+            for t in self.transcriptions.values():
+                if t["sample"] != sample or t["_key"] in exclude:
+                    continue
+                if question_id in (t.get("question_ids") or []) or (set(t.get("category_ids") or []) & hierarchy_ids):
+                    rows.append(t)
+            return iter(rows)
+
         return iter([])
-
-    col = MagicMock()
-    col.get.return_value = answer
-
-    db = MagicMock()
-    db.aql.execute.side_effect = aql_execute
-    db.collection.return_value = col
-    return db
 
 
 class TranscriptionsByAnswerTests(SimpleTestCase):
@@ -689,12 +841,15 @@ class TranscriptionsByAnswerTests(SimpleTestCase):
 
     def _call(self, answer, question=None, transcriptions=None):
         from data.views import TranscriptionViewSet
-        db = _transcription_by_answer_db(answer, question=question, transcriptions=transcriptions)
+        fake = _FakeByAnswerTranscriptionDB(answer, question=question, transcriptions=transcriptions)
+        mock_db = MagicMock()
+        mock_db.aql.execute.side_effect = fake.aql_execute
+        mock_db.collection.side_effect = fake.collection
         factory = RequestFactory()
         raw = factory.get("/transcriptions/by-answer/", {"answer_key": answer.get("_key", "k1")})
         req = Request(raw)
         req.user = self.user
-        req.arangodb = db
+        req.arangodb = mock_db
         req.arango_error = None
         vs = TranscriptionViewSet()
         vs.request = req
@@ -703,27 +858,44 @@ class TranscriptionsByAnswerTests(SimpleTestCase):
         vs.action = "by_answer"
         return vs.by_answer(req)
 
-    def test_uses_question_tag_ids_when_present(self):
-        transcription = {"_key": "t1", "sample": "AL-001", "segment_no": 1}
-        answer = {"_key": "a1", "sample": "AL-001", "question_id": 10,
-                  "tags": [{"tag_id": 999}]}
-        question = {"id": 10, "tag_ids": [7]}
-        response = self._call(answer, question=question, transcriptions=[transcription])
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(len(response.data), 1)
-
-    def test_falls_back_to_answer_tags_when_question_has_no_tag_ids(self):
-        transcription = {"_key": "t1", "sample": "AL-001", "segment_no": 1}
-        answer = {"_key": "a1", "sample": "AL-001", "question_id": 10,
-                  "tags": [{"tag_id": 5}]}
-        question = {"id": 10}  # no tag_ids
-        response = self._call(answer, question=question, transcriptions=[transcription])
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(len(response.data), 1)
-
-    def test_returns_empty_when_no_tags_anywhere(self):
+    def test_matches_via_question_ids(self):
+        t = {"_key": "t1", "sample": "AL-001", "segment_no": 1, "question_ids": [10], "category_ids": []}
         answer = {"_key": "a1", "sample": "AL-001", "question_id": 10}
-        question = {"id": 10}
-        response = self._call(answer, question=question)
+        question = {"hierarchy_ids": [1, 10]}
+        response = self._call(answer, question=question, transcriptions=[t])
         self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+
+    def test_matches_via_category_ids(self):
+        t = {"_key": "t1", "sample": "AL-001", "segment_no": 1, "question_ids": [], "category_ids": [4]}
+        answer = {"_key": "a1", "sample": "AL-001", "question_id": 10}
+        question = {"hierarchy_ids": [1, 4, 10]}
+        response = self._call(answer, question=question, transcriptions=[t])
+        self.assertEqual(len(response.data), 1)
+
+    def test_returns_empty_when_no_match(self):
+        answer = {"_key": "a1", "sample": "AL-001", "question_id": 10}
+        question = {"hierarchy_ids": [1, 10]}
+        response = self._call(answer, question=question, transcriptions=[])
+        self.assertEqual(list(response.data), [])
+
+    def test_override_include_replaces_normal_match(self):
+        t1 = {"_key": "t1", "sample": "AL-001", "segment_no": 1, "question_ids": [], "category_ids": []}
+        t2 = {"_key": "t2", "sample": "AL-001", "segment_no": 2, "question_ids": [10], "category_ids": []}
+        answer = {"_key": "a1", "sample": "AL-001", "question_id": 10,
+                  "transcription_overrides": {"include": ["t1"], "exclude": []}}
+        question = {"hierarchy_ids": [1, 10]}
+        response = self._call(answer, question=question, transcriptions=[t1, t2])
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]["_key"], "t1")
+
+    def test_override_include_respects_sample_scoping(self):
+        # t1 matches by key but belongs to a different sample than the
+        # answer — must still be excluded, same as the real endpoint (an
+        # override computed across all samples shouldn't leak across them).
+        t1 = {"_key": "t1", "sample": "OTHER-001", "segment_no": 1, "question_ids": [], "category_ids": []}
+        answer = {"_key": "a1", "sample": "AL-001", "question_id": 10,
+                  "transcription_overrides": {"include": ["t1"], "exclude": []}}
+        question = {"hierarchy_ids": [1, 10]}
+        response = self._call(answer, question=question, transcriptions=[t1])
         self.assertEqual(list(response.data), [])

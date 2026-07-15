@@ -1,8 +1,8 @@
-from data.models import Category, Phrase, Sample, Source
+from data.models import Category, Sample, Source
 
 
 class DBRouter:
-    data_classes = [Sample, Category, Source, Phrase]
+    data_classes = [Sample, Category, Source]
 
     def db_for_read(self, model, **hints):
         if model in self.data_classes:

@@ -5,8 +5,10 @@ from rest_framework import serializers
 from data.models import (
     Answer,
     Category,
-    Phrase,
+    MasterPhrase,
+    ResearchQuestion,
     Sample,
+    SamplePhrase,
     Source,
     Transcription,
     Translation,
@@ -106,17 +108,47 @@ class TranslationSerializer(serializers.ModelSerializer):
         ]
 
 
+class ResearchQuestionSerializer(ArangoModelSerializer):
+    id = serializers.IntegerField()
+    parent_id = serializers.IntegerField(allow_null=True)
+
+    class Meta:
+        model = ResearchQuestion
+        fields = [
+            "id",
+            "name",
+            "parent_id",
+            "hierarchy",
+            "hierarchy_ids",
+        ]
+
+    def to_representation(self, instance):
+        exclude_fields = ["_rev", "_id", "tag_ids", "is_leaf"]
+        result = {k: v for k, v in instance.items() if k not in exclude_fields}
+        return result
+
+
 class PhraseSerializer(ArangoModelSerializer):
+    """
+    Serializes joined SamplePhrase + MasterPhrase rows (one per sample
+    recording of a phrase). Endpoints build the merged dict themselves
+    (phrase/sample/has_recording from SamplePhrases, english/conjugated/
+    question_ids/category_ids from MasterPhrases) — this serializer just
+    passes it through, same as it did for the old flat Phrases documents.
+    """
+
     has_recording = serializers.SerializerMethodField(required=False)
 
     class Meta:
-        model = Phrase
+        model = SamplePhrase
         fields = [
             "phrase",
             "phrase_ref",
             "conjugated",
             "english",
             "has_recording",
+            "question_ids",
+            "category_ids",
         ]
 
     def get_has_recording(self, obj):
@@ -128,6 +160,23 @@ class PhraseSerializer(ArangoModelSerializer):
     def to_representation(self, instance):
         # Return all attributes from the ArangoDB document, excluding certain fields
         exclude_fields = ["_rev", "_id"]  # Add fields you want to exclude
+        result = {k: v for k, v in instance.items() if k not in exclude_fields}
+        return result
+
+
+class MasterPhraseSerializer(ArangoModelSerializer):
+    class Meta:
+        model = MasterPhrase
+        fields = [
+            "phrase_ref",
+            "english",
+            "conjugated",
+            "question_ids",
+            "category_ids",
+        ]
+
+    def to_representation(self, instance):
+        exclude_fields = ["_rev", "_id"]
         result = {k: v for k, v in instance.items() if k not in exclude_fields}
         return result
 

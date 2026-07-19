@@ -424,21 +424,26 @@ class PhraseViewSet(ArangoModelViewSet):
 
     @staticmethod
     def _merge_with_master(db, sample_phrase):
+        """english/conjugated only — question_ids/category_ids are
+        deliberately excluded here too; fetch those via GET
+        /phrases/{key}/links/ instead (see that action's docstring)."""
         master = db.collection(MasterPhrase.collection_name).get(sample_phrase["phrase_ref"])
         if not master:
             return sample_phrase
-        overrides = sample_phrase.get("question_overrides") or {}
-        resolved_question_ids = sorted(
-            (set(master.get("question_ids") or []) | set(overrides.get("include") or []))
-            - set(overrides.get("exclude") or [])
-        )
         return {
             **sample_phrase,
             "english": master.get("english"),
             "conjugated": master.get("conjugated"),
-            "question_ids": resolved_question_ids,
-            "category_ids": master.get("category_ids", []),
         }
+
+    @staticmethod
+    def _resolve_question_ids_for_sample_phrase(master, sample_phrase):
+        overrides = sample_phrase.get("question_overrides") or {}
+        master_question_ids = (master or {}).get("question_ids") or []
+        return sorted(
+            (set(master_question_ids) | set(overrides.get("include") or []))
+            - set(overrides.get("exclude") or [])
+        )
 
     @staticmethod
     def _validate_question_overrides(value):
@@ -482,6 +487,36 @@ class PhraseViewSet(ArangoModelViewSet):
         serializer = self.serializer_class(updated, context={"request": request})
         return Response(serializer.data)
 
+    @action(detail=True, methods=["get"], url_path="links")
+    def links(self, request, pk=None):
+        """
+        GET /phrases/{key}/links/ — the linking data omitted from list/
+        search/by-answer/by-category/related responses (bulky: averages
+        ~56 question_ids per phrase, unused by any bulk-list consumer).
+        Fetch this for one phrase on demand, e.g. when an edit modal opens
+        and needs to display/edit its linked research questions.
+
+        Returns: { question_ids, category_ids, question_overrides }
+        question_ids is RESOLVED: the MasterPhrase's own links, plus this
+        SamplePhrase's question_overrides.include, minus its exclude —
+        same computation as RESOLVED_QUESTION_IDS_AQL elsewhere in this file.
+        """
+        db = request.arangodb
+        sample_phrase = db.collection(self.model.collection_name).get(pk)
+        if not sample_phrase:
+            raise NotFound(detail="Phrase not found")
+
+        master = db.collection(MasterPhrase.collection_name).get(sample_phrase["phrase_ref"])
+        overrides = sample_phrase.get("question_overrides") or {}
+        return Response({
+            "question_ids": self._resolve_question_ids_for_sample_phrase(master, sample_phrase),
+            "category_ids": (master or {}).get("category_ids") or [],
+            "question_overrides": {
+                "include": overrides.get("include") or [],
+                "exclude": overrides.get("exclude") or [],
+            },
+        })
+
     def get_queryset(self):
         try:
             sample = self.request.query_params.get("sample")
@@ -489,16 +524,18 @@ class PhraseViewSet(ArangoModelViewSet):
                 raise NotFound(detail="Sample parameter is required to fetch phrases")
 
             db = self.request.arangodb
-            aql = f"""
+            # question_ids/category_ids deliberately omitted here — they're
+            # bulky (avg ~56 ints/phrase) and unused by any list/search
+            # consumer; fetch them on demand via GET /phrases/{key}/links/
+            # when an edit modal actually needs them for one phrase.
+            aql = """
                 FOR sp IN SamplePhrases
                     FILTER sp.sample == @sample
                     LET m = DOCUMENT(CONCAT("MasterPhrases/", sp.phrase_ref))
-                    RETURN MERGE(sp, {{
+                    RETURN MERGE(sp, {
                         english: m.english,
-                        conjugated: m.conjugated,
-                        question_ids: {self.RESOLVED_QUESTION_IDS_AQL},
-                        category_ids: m.category_ids
-                    }})
+                        conjugated: m.conjugated
+                    })
             """
             cursor = db.aql.execute(aql, bind_vars={"sample": sample})
             return natsorted(list(cursor), key=lambda x: x["phrase_ref"])
@@ -577,79 +614,156 @@ class PhraseViewSet(ArangoModelViewSet):
             overrides = answer.get('phrase_overrides') or {}
             include = overrides.get('include') or []
             exclude = overrides.get('exclude') or []
+            return self._by_answer_response(db, sample, question_id, include, exclude, request)
 
-            # sp is a direct primary-key lookup (SamplePhrases._key ==
-            # "{sample}_{phrase_ref}"), not a scan — avoids re-scanning all
-            # 128k SamplePhrases once per matching MasterPhrase.
-            if include:
-                aql = f"""
-                    FOR phrase_ref IN @include
-                        FILTER phrase_ref NOT IN @exclude
-                        LET sp = DOCUMENT(CONCAT("SamplePhrases/", @sample, "_", phrase_ref))
-                        FILTER sp != null
-                        FILTER @question_id NOT IN (sp.question_overrides.exclude || [])
-                        LET m = DOCUMENT(CONCAT("MasterPhrases/", phrase_ref))
-                        RETURN MERGE(sp, {{
-                            english: m.english,
-                            conjugated: m.conjugated,
-                            question_ids: {self.RESOLVED_QUESTION_IDS_AQL},
-                            category_ids: m.category_ids
-                        }})
-                """
-                bind_vars = {'include': include, 'exclude': exclude, 'sample': sample, 'question_id': question_id}
-                phrases = list(db.aql.execute(aql, bind_vars=bind_vars))
-            else:
-                hierarchy_ids = _get_question_hierarchy_ids(db, question_id)
-                if hierarchy_ids is None:
-                    return Response([])
-                aql = f"""
-                    FOR m IN MasterPhrases
-                        FILTER (@question_id IN (m.question_ids || [])
-                                OR LENGTH(INTERSECTION(m.category_ids || [], @hierarchy_ids)) > 0)
-                            AND m.phrase_ref NOT IN @exclude
-                        LET sp = DOCUMENT(CONCAT("SamplePhrases/", @sample, "_", m.phrase_ref))
-                        FILTER sp != null
-                        FILTER @question_id NOT IN (sp.question_overrides.exclude || [])
-                        RETURN MERGE(sp, {{
-                            english: m.english,
-                            conjugated: m.conjugated,
-                            question_ids: {self.RESOLVED_QUESTION_IDS_AQL},
-                            category_ids: m.category_ids
-                        }})
-                """
-                bind_vars = {
-                    'question_id': question_id,
-                    'hierarchy_ids': hierarchy_ids,
-                    'sample': sample,
-                    'exclude': exclude,
-                }
-                phrases = list(db.aql.execute(aql, bind_vars=bind_vars))
+        except (NotFound, ValidationError):
+            raise
+        except Exception as e:
+            print(f"Error fetching phrases for answer: {e}")
+            raise NotFound(detail="Error retrieving phrases")
 
-            # Sample-scoped explicit includes: SamplePhrases in this sample
-            # that declare relevance to this exact question_id via their own
-            # question_overrides.include, regardless of which branch above
-            # ran or what it matched.
-            override_include_aql = f"""
-                FOR sp IN SamplePhrases
-                    FILTER sp.sample == @sample
-                    FILTER @question_id IN (sp.question_overrides.include || [])
-                    FILTER sp.phrase_ref NOT IN @exclude
-                    LET m = DOCUMENT(CONCAT("MasterPhrases/", sp.phrase_ref))
-                    RETURN MERGE(sp, {{
-                        english: m.english,
-                        conjugated: m.conjugated,
-                        question_ids: {self.RESOLVED_QUESTION_IDS_AQL},
-                        category_ids: m.category_ids
-                    }})
-            """
-            override_phrases = list(db.aql.execute(
-                override_include_aql, bind_vars={'sample': sample, 'question_id': question_id, 'exclude': exclude}
-            ))
-            seen_keys = {p['_key'] for p in phrases}
-            for p in override_phrases:
-                if p['_key'] not in seen_keys:
-                    phrases.append(p)
-                    seen_keys.add(p['_key'])
+    def _phrase_override_includes(self, db, category_id, sample, exclude):
+        """SamplePhrases in this sample that declare relevance to category_id
+        via their own question_overrides.include, regardless of whether the
+        MasterPhrase itself matches. Shared by _phrases_by_category and
+        by_answer's Answer.phrase_overrides.include branch."""
+        aql = """
+            FOR sp IN SamplePhrases
+                FILTER sp.sample == @sample
+                FILTER @category_id IN (sp.question_overrides.include || [])
+                FILTER sp.phrase_ref NOT IN @exclude
+                LET m = DOCUMENT(CONCAT("MasterPhrases/", sp.phrase_ref))
+                RETURN MERGE(sp, {
+                    english: m.english,
+                    conjugated: m.conjugated
+                })
+        """
+        return list(db.aql.execute(aql, bind_vars={'sample': sample, 'category_id': category_id, 'exclude': exclude}))
+
+    def _phrases_by_category(self, db, category_id, sample, exclude=None):
+        """
+        Phrases linked to a research question/category id, scoped to one
+        sample — the shared core of both by_answer's question/category-match
+        branch and the by_category action (see that action's docstring).
+
+        Matches MasterPhrase.question_ids/category_ids covering category_id,
+        joined to this sample's SamplePhrase, with SamplePhrase.question_overrides
+        layered on top (exclude subtracts a phrase; include adds one even if
+        the MasterPhrase wouldn't otherwise match). `exclude` is an optional
+        list of phrase_refs to additionally drop (used by by_answer for its
+        Answer.phrase_overrides.exclude).
+        """
+        exclude = exclude or []
+        hierarchy_ids = _get_question_hierarchy_ids(db, category_id)
+        if hierarchy_ids is None:
+            return []
+
+        aql = """
+            FOR m IN MasterPhrases
+                FILTER (@category_id IN (m.question_ids || [])
+                        OR LENGTH(INTERSECTION(m.category_ids || [], @hierarchy_ids)) > 0)
+                    AND m.phrase_ref NOT IN @exclude
+                LET sp = DOCUMENT(CONCAT("SamplePhrases/", @sample, "_", m.phrase_ref))
+                FILTER sp != null
+                FILTER @category_id NOT IN (sp.question_overrides.exclude || [])
+                RETURN MERGE(sp, {
+                    english: m.english,
+                    conjugated: m.conjugated
+                })
+        """
+        phrases = list(db.aql.execute(aql, bind_vars={
+            'category_id': category_id, 'hierarchy_ids': hierarchy_ids, 'sample': sample, 'exclude': exclude,
+        }))
+
+        overrides = self._phrase_override_includes(db, category_id, sample, exclude)
+        seen_keys = {p['_key'] for p in phrases}
+        for p in overrides:
+            if p['_key'] not in seen_keys:
+                phrases.append(p)
+                seen_keys.add(p['_key'])
+        return phrases
+
+    def _phrases_by_explicit_refs(self, db, sample, category_id, include, exclude):
+        """Phrases named directly by Answer.phrase_overrides.include (the
+        ~65 divergent-question case), plus the same SamplePhrase-level
+        include union _phrases_by_category applies."""
+        aql = """
+            FOR phrase_ref IN @include
+                FILTER phrase_ref NOT IN @exclude
+                LET sp = DOCUMENT(CONCAT("SamplePhrases/", @sample, "_", phrase_ref))
+                FILTER sp != null
+                FILTER @category_id NOT IN (sp.question_overrides.exclude || [])
+                LET m = DOCUMENT(CONCAT("MasterPhrases/", phrase_ref))
+                RETURN MERGE(sp, {
+                    english: m.english,
+                    conjugated: m.conjugated
+                })
+        """
+        bind_vars = {'include': include, 'exclude': exclude, 'sample': sample, 'category_id': category_id}
+        phrases = list(db.aql.execute(aql, bind_vars=bind_vars))
+        overrides = self._phrase_override_includes(db, category_id, sample, exclude)
+        seen_keys = {p['_key'] for p in phrases}
+        for p in overrides:
+            if p['_key'] not in seen_keys:
+                phrases.append(p)
+                seen_keys.add(p['_key'])
+        return phrases
+
+    def _resolve_phrases(self, db, sample, question_id, include, exclude):
+        """Resolves the phrase list for a question_id: via
+        Answer.phrase_overrides.include if set (exact per-answer precision
+        for divergent questions), otherwise via _phrases_by_category.
+        Shared by by_answer and RelatedContentViewSet."""
+        # sp is a direct primary-key lookup (SamplePhrases._key ==
+        # "{sample}_{phrase_ref}"), not a scan — avoids re-scanning all
+        # 128k SamplePhrases once per matching MasterPhrase.
+        if include:
+            return self._phrases_by_explicit_refs(db, sample, question_id, include, exclude)
+        return self._phrases_by_category(db, question_id, sample, exclude=exclude)
+
+    def _by_answer_response(self, db, sample, question_id, include, exclude, request):
+        """Shared response-building tail for by_answer: resolves, sorts,
+        and serializes."""
+        phrases = self._resolve_phrases(db, sample, question_id, include, exclude)
+        if not phrases:
+            return Response([])
+
+        phrases = natsorted(phrases, key=lambda x: x.get("phrase_ref", ""))
+        serializer = self.serializer_class(phrases, many=True, context={"request": request})
+        return Response(serializer.data)
+
+    @action(detail=False, methods=["get"], url_path="by-category")
+    def by_category(self, request):
+        """
+        GET /phrases/by-category/?category_id=<id>&sample=<sample_ref>
+
+        Same matching as by-answer's question/category branch, but keyed
+        directly by a stable ResearchQuestion/Category id + sample instead
+        of an Answer _key. Prefer this over by-answer when the caller
+        already has the category_id in hand (e.g. Tables cell metadata) —
+        category/question ids are stable across re-imports/migrations,
+        whereas Answer._key is an ArangoDB-generated key that isn't.
+
+        Does not apply Answer.phrase_overrides (there's no specific Answer
+        in play here) — only the MasterPhrase/SamplePhrase-level matching
+        and SamplePhrase.question_overrides.
+        """
+        from rest_framework.exceptions import ValidationError
+
+        try:
+            category_id = request.query_params.get("category_id")
+            sample = request.query_params.get("sample")
+            if not category_id:
+                raise ValidationError("category_id parameter is required")
+            if not sample:
+                raise ValidationError("sample parameter is required")
+            try:
+                category_id = int(category_id)
+            except (TypeError, ValueError):
+                raise ValidationError("category_id must be an integer")
+
+            db = request.arangodb
+            phrases = self._phrases_by_category(db, category_id, sample)
 
             if not phrases:
                 return Response([])
@@ -661,7 +775,7 @@ class PhraseViewSet(ArangoModelViewSet):
         except (NotFound, ValidationError):
             raise
         except Exception as e:
-            print(f"Error fetching phrases for answer: {e}")
+            print(f"Error fetching phrases for category: {e}")
             raise NotFound(detail="Error retrieving phrases")
 
     @action(detail=False, methods=["post"], url_path="search")
@@ -723,9 +837,7 @@ class PhraseViewSet(ArangoModelViewSet):
                         {visibility_filter}
                         LET phrase = MERGE(sp, {{
                             english: m.english,
-                            conjugated: m.conjugated,
-                            question_ids: {self.RESOLVED_QUESTION_IDS_AQL},
-                            category_ids: m.category_ids
+                            conjugated: m.conjugated
                         }})
                         {sort_aql}
                         RETURN MERGE(phrase, {{
@@ -791,9 +903,7 @@ class PhraseViewSet(ArangoModelViewSet):
                     LET m = DOCUMENT(CONCAT("MasterPhrases/", sp.phrase_ref))
                     LET phrase = MERGE(sp, {{
                         english: m.english,
-                        conjugated: m.conjugated,
-                        question_ids: {self.RESOLVED_QUESTION_IDS_AQL},
-                        category_ids: m.category_ids
+                        conjugated: m.conjugated
                     }})
                     {sort_aql}
                     LIMIT @offset, @page_size
@@ -967,6 +1077,10 @@ class MasterPhraseViewSet(ArangoModelViewSet):
     singular target rather than being smuggled into a per-sample PATCH.
 
     Available endpoints:
+    - GET /master-phrases/{phrase_ref}/ - read english/conjugated/question_ids/category_ids
+      for one phrase concept (public read — used by the admin "Edit Phrase
+      Concept" modal, and cheaper than the old approach of denormalizing
+      question_ids onto every bulk phrase list/search response)
     - PATCH /master-phrases/{phrase_ref}/ - update english/conjugated/question_ids/category_ids
 
     Editing a MasterPhrase affects every sample of that phrase at once, and
@@ -980,10 +1094,14 @@ class MasterPhraseViewSet(ArangoModelViewSet):
 
     model = MasterPhrase
     serializer_class = MasterPhraseSerializer
-    http_method_names = ["patch", "head", "options"]
-    permission_classes = [IsGlobalAdmin]
+    http_method_names = ["get", "patch", "head", "options"]
 
     EDITABLE_FIELDS = {"english", "conjugated", "question_ids", "category_ids"}
+
+    def get_permissions(self):
+        if self.request.method == "PATCH":
+            return [IsGlobalAdmin()]
+        return [AllowAny()]
 
     def partial_update(self, request, pk=None):
         """
@@ -2169,39 +2287,8 @@ class TranscriptionViewSet(ArangoModelViewSet):
 
             overrides = answer.get('transcription_overrides') or {}
             include = overrides.get('include') or []
-            exclude = set(overrides.get('exclude') or [])
-            transcriptions = []
-
-            if include:
-                aql = """
-                    FOR key IN @include
-                        FILTER key NOT IN @exclude
-                        LET t = DOCUMENT(CONCAT("Transcriptions/", key))
-                        FILTER t != null AND t.sample == @sample
-                        RETURN t
-                """
-                transcriptions = list(db.aql.execute(aql, bind_vars={
-                    'include': include,
-                    'exclude': list(exclude),
-                    'sample': sample,
-                }))
-            else:
-                hierarchy_ids = _get_question_hierarchy_ids(db, answer.get('question_id'))
-                if hierarchy_ids:
-                    aql = """
-                        FOR transcription IN Transcriptions
-                            FILTER transcription.sample == @sample
-                            FILTER (@question_id IN (transcription.question_ids || [])
-                                    OR LENGTH(INTERSECTION(transcription.category_ids || [], @hierarchy_ids)) > 0)
-                                AND transcription._key NOT IN @exclude
-                            RETURN transcription
-                    """
-                    transcriptions = list(db.aql.execute(aql, bind_vars={
-                        'sample': sample,
-                        'question_id': answer.get('question_id'),
-                        'hierarchy_ids': hierarchy_ids,
-                        'exclude': list(exclude),
-                    }))
+            exclude = list(overrides.get('exclude') or [])
+            transcriptions = self._resolve_transcriptions(db, sample, answer.get('question_id'), include, exclude)
 
             if not transcriptions:
                 return Response([])
@@ -2215,6 +2302,94 @@ class TranscriptionViewSet(ArangoModelViewSet):
             raise
         except Exception as e:
             print(f"Error fetching transcriptions for answer: {e}")
+            raise NotFound(detail="Error retrieving transcriptions")
+
+    def _resolve_transcriptions(self, db, sample, question_id, include, exclude):
+        """Resolves the transcription list for a question_id: via
+        Answer.transcription_overrides.include (exact Transcription _keys)
+        if set, otherwise via _transcriptions_by_category. Shared by
+        by_answer and RelatedContentViewSet."""
+        if include:
+            aql = """
+                FOR key IN @include
+                    FILTER key NOT IN @exclude
+                    LET t = DOCUMENT(CONCAT("Transcriptions/", key))
+                    FILTER t != null AND t.sample == @sample
+                    RETURN t
+            """
+            return list(db.aql.execute(aql, bind_vars={
+                'include': include,
+                'exclude': exclude,
+                'sample': sample,
+            }))
+        return self._transcriptions_by_category(db, question_id, sample, exclude=exclude)
+
+    def _transcriptions_by_category(self, db, category_id, sample, exclude=None):
+        """Transcriptions linked to a research question/category id, scoped
+        to one sample. Transcriptions have no MasterPhrase-style split (each
+        one already stands alone), so unlike phrases there's no
+        question_overrides layer here — just the direct question_ids/
+        category_ids match. Shared by by_answer's question/category branch
+        and by_category."""
+        exclude = exclude or []
+        hierarchy_ids = _get_question_hierarchy_ids(db, category_id)
+        if hierarchy_ids is None:
+            return []
+
+        aql = """
+            FOR transcription IN Transcriptions
+                FILTER transcription.sample == @sample
+                FILTER (@category_id IN (transcription.question_ids || [])
+                        OR LENGTH(INTERSECTION(transcription.category_ids || [], @hierarchy_ids)) > 0)
+                    AND transcription._key NOT IN @exclude
+                RETURN transcription
+        """
+        return list(db.aql.execute(aql, bind_vars={
+            'sample': sample, 'category_id': category_id, 'hierarchy_ids': hierarchy_ids, 'exclude': exclude,
+        }))
+
+    @action(detail=False, methods=["get"], url_path="by-category")
+    def by_category(self, request):
+        """
+        GET /transcriptions/by-category/?category_id=<id>&sample=<sample_ref>
+
+        Same matching as by-answer's question/category branch, but keyed
+        directly by a stable ResearchQuestion/Category id + sample instead
+        of an Answer _key — see PhraseViewSet.by_category's docstring for
+        the full rationale (category/question ids are stable across
+        re-imports; Answer._key is not).
+
+        Does not apply Answer.transcription_overrides (there's no specific
+        Answer in play here) — only the direct question_ids/category_ids match.
+        """
+        from rest_framework.exceptions import ValidationError
+
+        try:
+            category_id = request.query_params.get("category_id")
+            sample = request.query_params.get("sample")
+            if not category_id:
+                raise ValidationError("category_id parameter is required")
+            if not sample:
+                raise ValidationError("sample parameter is required")
+            try:
+                category_id = int(category_id)
+            except (TypeError, ValueError):
+                raise ValidationError("category_id must be an integer")
+
+            db = request.arangodb
+            transcriptions = self._transcriptions_by_category(db, category_id, sample)
+
+            if not transcriptions:
+                return Response([])
+
+            transcriptions.sort(key=lambda x: x.get("segment_no", 0))
+            serializer = self.serializer_class(transcriptions, many=True, context={"request": request})
+            return Response(serializer.data)
+
+        except (NotFound, ValidationError):
+            raise
+        except Exception as e:
+            print(f"Error fetching transcriptions for category: {e}")
             raise NotFound(detail="Error retrieving transcriptions")
 
     def _get_visible_sample_refs(self, request):
@@ -2378,6 +2553,67 @@ class TranscriptionViewSet(ArangoModelViewSet):
         except Exception as e:
             print(f"Error exporting transcriptions: {e}")
             raise ValidationError(f"Export failed: {str(e)}")
+
+
+class RelatedContentViewSet(ViewSet):
+    """
+    API endpoint for the "click a table cell" hot path: fetches both
+    phrases and transcriptions related to a research question/category id
+    in one request, instead of the client firing separate calls to
+    PhraseViewSet.by_category and TranscriptionViewSet.by_category.
+
+    GET /related/?category_id=<id>&sample=<sample_ref>&answer_key=<optional>
+
+    If answer_key is given, that Answer is fetched once and reused to
+    decide — independently for phrases and transcriptions — whether to
+    honor its phrase_overrides/transcription_overrides (the ~65 "divergent
+    questions" case, see PhraseViewSet.by_answer's docstring) instead of
+    the plain category/sample match. This also avoids the double Answer
+    lookup that calling by-answer for both phrases and transcriptions
+    would otherwise cost.
+
+    Response: { "phrases": [...], "transcriptions": [...] }
+    """
+
+    permission_classes = [AllowAny]
+
+    def list(self, request):
+        category_id = request.query_params.get("category_id")
+        sample = request.query_params.get("sample")
+        answer_key = request.query_params.get("answer_key")
+        if not category_id:
+            raise ValidationError("category_id parameter is required")
+        if not sample:
+            raise ValidationError("sample parameter is required")
+        try:
+            category_id = int(category_id)
+        except (TypeError, ValueError):
+            raise ValidationError("category_id must be an integer")
+
+        db = request.arangodb
+        answer = db.collection("Answers").get(answer_key) if answer_key else None
+
+        phrase_overrides = (answer or {}).get("phrase_overrides") or {}
+        phrase_view = PhraseViewSet()
+        phrases = phrase_view._resolve_phrases(
+            db, sample, category_id,
+            phrase_overrides.get("include") or [],
+            phrase_overrides.get("exclude") or [],
+        )
+        phrases = natsorted(phrases, key=lambda x: x.get("phrase_ref", ""))
+        phrase_data = PhraseSerializer(phrases, many=True, context={"request": request}).data
+
+        transcription_overrides = (answer or {}).get("transcription_overrides") or {}
+        transcription_view = TranscriptionViewSet()
+        transcriptions = transcription_view._resolve_transcriptions(
+            db, sample, category_id,
+            transcription_overrides.get("include") or [],
+            transcription_overrides.get("exclude") or [],
+        )
+        transcriptions.sort(key=lambda x: x.get("segment_no", 0))
+        transcription_data = TranscriptionSerializer(transcriptions, many=True, context={"request": request}).data
+
+        return Response({"phrases": phrase_data, "transcriptions": transcription_data})
 
 
 class BackupViewSet(ViewSet):

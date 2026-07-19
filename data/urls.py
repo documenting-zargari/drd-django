@@ -14,6 +14,7 @@ router.register(r"views", views.ViewViewSet, basename="views")
 router.register(
     r"transcriptions", views.TranscriptionViewSet, basename="transcriptions"
 )
+router.register(r"related", views.RelatedContentViewSet, basename="related")
 router.register(r"backups", views.BackupViewSet, basename="backups")
 
 urlpatterns = [

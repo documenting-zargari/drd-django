@@ -177,13 +177,14 @@ class _FakePhraseDB:
         self.samples = samples if samples is not None else ALL_SAMPLES
 
     def _merged(self, sp, sample_label=None):
+        # question_ids/category_ids deliberately omitted — list/search/
+        # export no longer return them (bulky, unused by any bulk-list
+        # consumer; see PhraseViewSet.links for the on-demand replacement).
         m = self.master_phrases.get(sp["phrase_ref"], {})
         out = {
             **sp,
             "english": m.get("english"),
             "conjugated": m.get("conjugated"),
-            "question_ids": m.get("question_ids"),
-            "category_ids": m.get("category_ids"),
         }
         if sample_label is not None:
             out["sample_label"] = sample_label
@@ -350,8 +351,15 @@ class PhraseGetQuerysetTests(SimpleTestCase):
         for p in result:
             self.assertIn("english", p)
             self.assertIn("conjugated", p)
-            self.assertIn("question_ids", p)
-            self.assertIn("category_ids", p)
+
+    def test_result_omits_question_and_category_ids(self):
+        # Bulky (avg ~56 ints/phrase) and unused by any list/search
+        # consumer — fetch via GET /phrases/{key}/links/ instead.
+        vs = _phrase_viewset(self.user, query={"sample": "AL-001"})
+        result = vs.get_queryset()
+        for p in result:
+            self.assertNotIn("question_ids", p)
+            self.assertNotIn("category_ids", p)
 
 
 # ---------------------------------------------------------------------------
@@ -634,12 +642,12 @@ class _FakeByAnswerPhraseDB:
         return col
 
     def _merge(self, sp, m):
+        # question_ids/category_ids deliberately omitted from the response —
+        # see PhraseGetQuerysetTests.test_result_omits_question_and_category_ids.
         return {
             **sp,
             "english": m.get("english"),
             "conjugated": m.get("conjugated"),
-            "question_ids": m.get("question_ids"),
-            "category_ids": m.get("category_ids"),
         }
 
     def aql_execute(self, query, bind_vars=None):
@@ -647,6 +655,11 @@ class _FakeByAnswerPhraseDB:
 
         if "ResearchQuestions" in query and "hierarchy_ids" in query:
             return iter([self.question["hierarchy_ids"]] if self.question else [])
+
+        # question_overrides.include/exclude live on SamplePhrases now; the
+        # fixtures here don't set them, so this always no-ops (empty override).
+        if "FOR sp IN SamplePhrases" in query and "question_overrides.include" in query:
+            return iter([])
 
         if "FOR phrase_ref IN @include" in query:
             include = bv["include"]
@@ -663,8 +676,8 @@ class _FakeByAnswerPhraseDB:
                 rows.append(self._merge(sp, m))
             return iter(rows)
 
-        if "FOR m IN MasterPhrases" in query and "@question_id IN" in query:
-            question_id = bv["question_id"]
+        if "FOR m IN MasterPhrases" in query and "@category_id IN" in query:
+            category_id = bv["category_id"]
             hierarchy_ids = set(bv["hierarchy_ids"])
             exclude = set(bv.get("exclude") or [])
             sample = bv["sample"]
@@ -672,7 +685,7 @@ class _FakeByAnswerPhraseDB:
             for m in self.master_phrases.values():
                 if m["phrase_ref"] in exclude:
                     continue
-                if question_id in (m.get("question_ids") or []) or (set(m.get("category_ids") or []) & hierarchy_ids):
+                if category_id in (m.get("question_ids") or []) or (set(m.get("category_ids") or []) & hierarchy_ids):
                     sp = self.sample_phrases.get(f"{sample}_{m['phrase_ref']}")
                     if not sp:
                         continue
@@ -820,14 +833,14 @@ class _FakeByAnswerTranscriptionDB:
 
         if "FOR transcription IN Transcriptions" in query:
             sample = bv["sample"]
-            question_id = bv["question_id"]
+            category_id = bv["category_id"]
             hierarchy_ids = set(bv["hierarchy_ids"])
             exclude = set(bv.get("exclude") or [])
             rows = []
             for t in self.transcriptions.values():
                 if t["sample"] != sample or t["_key"] in exclude:
                     continue
-                if question_id in (t.get("question_ids") or []) or (set(t.get("category_ids") or []) & hierarchy_ids):
+                if category_id in (t.get("question_ids") or []) or (set(t.get("category_ids") or []) & hierarchy_ids):
                     rows.append(t)
             return iter(rows)
 

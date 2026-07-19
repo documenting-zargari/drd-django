@@ -50,7 +50,7 @@ from data.serializers import (
     ViewSerializer,
 )
 from roma.views import ArangoModelViewSet
-from user.permissions import CanEditSample, IsGlobalOrProjectAdmin, IsProjectEditor
+from user.permissions import CanEditSample, IsGlobalAdmin, IsGlobalOrProjectAdmin, IsProjectEditor
 
 
 def _get_question_hierarchy_ids(db, question_id):
@@ -397,7 +397,16 @@ class PhraseViewSet(ArangoModelViewSet):
     http_method_names = ["get", "post", "patch", "head", "options"]
     permission_classes = [AllowAny]  # GET and search POST are public; PATCH uses per-action override
 
-    EDITABLE_FIELDS = {"phrase"}
+    EDITABLE_FIELDS = {"phrase", "question_overrides"}
+
+    # Resolved question_ids for display/matching: the MasterPhrase's own
+    # links, plus this SamplePhrase's question_overrides.include, minus its
+    # question_overrides.exclude. Requires `m` (MasterPhrase doc) and `sp`
+    # (SamplePhrase doc) bound in the enclosing AQL FOR loop.
+    RESOLVED_QUESTION_IDS_AQL = (
+        "MINUS(UNION_DISTINCT((m.question_ids || []), (sp.question_overrides.include || [])), "
+        "(sp.question_overrides.exclude || []))"
+    )
 
     def get_permissions(self):
         if self.request.method == "PATCH":
@@ -418,21 +427,41 @@ class PhraseViewSet(ArangoModelViewSet):
         master = db.collection(MasterPhrase.collection_name).get(sample_phrase["phrase_ref"])
         if not master:
             return sample_phrase
+        overrides = sample_phrase.get("question_overrides") or {}
+        resolved_question_ids = sorted(
+            (set(master.get("question_ids") or []) | set(overrides.get("include") or []))
+            - set(overrides.get("exclude") or [])
+        )
         return {
             **sample_phrase,
             "english": master.get("english"),
             "conjugated": master.get("conjugated"),
-            "question_ids": master.get("question_ids", []),
+            "question_ids": resolved_question_ids,
             "category_ids": master.get("category_ids", []),
         }
 
+    @staticmethod
+    def _validate_question_overrides(value):
+        if value is None:
+            return {"include": [], "exclude": []}
+        if not isinstance(value, dict):
+            raise ValidationError("question_overrides must be an object with include/exclude arrays")
+        include = value.get("include") or []
+        exclude = value.get("exclude") or []
+        if not all(isinstance(v, int) for v in include) or not all(isinstance(v, int) for v in exclude):
+            raise ValidationError("question_overrides.include/exclude must be arrays of research question ids")
+        return {"include": sorted(set(include)), "exclude": sorted(set(exclude))}
+
     def partial_update(self, request, pk=None):
         """
-        PATCH /phrases/{sample}_{phrase_ref}/ — update the per-sample phrase text.
+        PATCH /phrases/{sample}_{phrase_ref}/ — update the per-sample phrase
+        text and/or its question_overrides (rare, sample-scoped exceptions
+        to the MasterPhrase's linked research questions — see
+        question_overrides docstring on RESOLVED_QUESTION_IDS_AQL / by_answer).
         Requires editor+ role. Editors with sample restrictions may only
         edit phrases belonging to their allowed samples.
 
-        Allowed fields: phrase
+        Allowed fields: phrase, question_overrides
         """
         db = request.arangodb
         doc = db.collection(self.model.collection_name).get(pk)
@@ -445,6 +474,8 @@ class PhraseViewSet(ArangoModelViewSet):
                 {"error": f"No editable fields provided. Allowed: {sorted(self.EDITABLE_FIELDS)}"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        if "question_overrides" in updates:
+            updates["question_overrides"] = self._validate_question_overrides(updates["question_overrides"])
 
         db.collection(self.model.collection_name).update({"_key": pk, **updates})
         updated = self._merge_with_master(db, db.collection(self.model.collection_name).get(pk))
@@ -458,16 +489,16 @@ class PhraseViewSet(ArangoModelViewSet):
                 raise NotFound(detail="Sample parameter is required to fetch phrases")
 
             db = self.request.arangodb
-            aql = """
+            aql = f"""
                 FOR sp IN SamplePhrases
                     FILTER sp.sample == @sample
                     LET m = DOCUMENT(CONCAT("MasterPhrases/", sp.phrase_ref))
-                    RETURN MERGE(sp, {
+                    RETURN MERGE(sp, {{
                         english: m.english,
                         conjugated: m.conjugated,
-                        question_ids: m.question_ids,
+                        question_ids: {self.RESOLVED_QUESTION_IDS_AQL},
                         category_ids: m.category_ids
-                    })
+                    }})
             """
             cursor = db.aql.execute(aql, bind_vars={"sample": sample})
             return natsorted(list(cursor), key=lambda x: x["phrase_ref"])
@@ -516,6 +547,15 @@ class PhraseViewSet(ArangoModelViewSet):
         matching happens per-question rather than per-answer.
         `phrase_overrides.exclude` is always subtracted, whichever path was
         used. See extract/master_phrases_migration/PLAN.md.
+
+        On top of that, each matching SamplePhrase's own `question_overrides`
+        is applied: a phrase whose `question_overrides.exclude` contains this
+        answer's question_id is dropped even if the branch above matched it;
+        a phrase (in this sample) whose `question_overrides.include` contains
+        this answer's question_id is added even if the branch above didn't
+        match it. This is the rare, sample-scoped exception a sample editor
+        can make from the phrase editor — distinct from Answer.phrase_overrides
+        above, which is question-scoped and admin/meta-editor territory.
         """
         from rest_framework.exceptions import ValidationError
 
@@ -533,6 +573,7 @@ class PhraseViewSet(ArangoModelViewSet):
             if not sample:
                 return Response([])
 
+            question_id = answer.get('question_id')
             overrides = answer.get('phrase_overrides') or {}
             include = overrides.get('include') or []
             exclude = overrides.get('exclude') or []
@@ -541,46 +582,74 @@ class PhraseViewSet(ArangoModelViewSet):
             # "{sample}_{phrase_ref}"), not a scan — avoids re-scanning all
             # 128k SamplePhrases once per matching MasterPhrase.
             if include:
-                aql = """
+                aql = f"""
                     FOR phrase_ref IN @include
                         FILTER phrase_ref NOT IN @exclude
                         LET sp = DOCUMENT(CONCAT("SamplePhrases/", @sample, "_", phrase_ref))
                         FILTER sp != null
+                        FILTER @question_id NOT IN (sp.question_overrides.exclude || [])
                         LET m = DOCUMENT(CONCAT("MasterPhrases/", phrase_ref))
-                        RETURN MERGE(sp, {
+                        RETURN MERGE(sp, {{
                             english: m.english,
                             conjugated: m.conjugated,
-                            question_ids: m.question_ids,
+                            question_ids: {self.RESOLVED_QUESTION_IDS_AQL},
                             category_ids: m.category_ids
-                        })
+                        }})
                 """
-                bind_vars = {'include': include, 'exclude': exclude, 'sample': sample}
+                bind_vars = {'include': include, 'exclude': exclude, 'sample': sample, 'question_id': question_id}
+                phrases = list(db.aql.execute(aql, bind_vars=bind_vars))
             else:
-                hierarchy_ids = _get_question_hierarchy_ids(db, answer.get('question_id'))
-                if not hierarchy_ids:
+                hierarchy_ids = _get_question_hierarchy_ids(db, question_id)
+                if hierarchy_ids is None:
                     return Response([])
-                aql = """
+                aql = f"""
                     FOR m IN MasterPhrases
                         FILTER (@question_id IN (m.question_ids || [])
                                 OR LENGTH(INTERSECTION(m.category_ids || [], @hierarchy_ids)) > 0)
                             AND m.phrase_ref NOT IN @exclude
                         LET sp = DOCUMENT(CONCAT("SamplePhrases/", @sample, "_", m.phrase_ref))
                         FILTER sp != null
-                        RETURN MERGE(sp, {
+                        FILTER @question_id NOT IN (sp.question_overrides.exclude || [])
+                        RETURN MERGE(sp, {{
                             english: m.english,
                             conjugated: m.conjugated,
-                            question_ids: m.question_ids,
+                            question_ids: {self.RESOLVED_QUESTION_IDS_AQL},
                             category_ids: m.category_ids
-                        })
+                        }})
                 """
                 bind_vars = {
-                    'question_id': answer.get('question_id'),
+                    'question_id': question_id,
                     'hierarchy_ids': hierarchy_ids,
                     'sample': sample,
                     'exclude': exclude,
                 }
+                phrases = list(db.aql.execute(aql, bind_vars=bind_vars))
 
-            phrases = list(db.aql.execute(aql, bind_vars=bind_vars))
+            # Sample-scoped explicit includes: SamplePhrases in this sample
+            # that declare relevance to this exact question_id via their own
+            # question_overrides.include, regardless of which branch above
+            # ran or what it matched.
+            override_include_aql = f"""
+                FOR sp IN SamplePhrases
+                    FILTER sp.sample == @sample
+                    FILTER @question_id IN (sp.question_overrides.include || [])
+                    FILTER sp.phrase_ref NOT IN @exclude
+                    LET m = DOCUMENT(CONCAT("MasterPhrases/", sp.phrase_ref))
+                    RETURN MERGE(sp, {{
+                        english: m.english,
+                        conjugated: m.conjugated,
+                        question_ids: {self.RESOLVED_QUESTION_IDS_AQL},
+                        category_ids: m.category_ids
+                    }})
+            """
+            override_phrases = list(db.aql.execute(
+                override_include_aql, bind_vars={'sample': sample, 'question_id': question_id, 'exclude': exclude}
+            ))
+            seen_keys = {p['_key'] for p in phrases}
+            for p in override_phrases:
+                if p['_key'] not in seen_keys:
+                    phrases.append(p)
+                    seen_keys.add(p['_key'])
 
             if not phrases:
                 return Response([])
@@ -655,7 +724,7 @@ class PhraseViewSet(ArangoModelViewSet):
                         LET phrase = MERGE(sp, {{
                             english: m.english,
                             conjugated: m.conjugated,
-                            question_ids: m.question_ids,
+                            question_ids: {self.RESOLVED_QUESTION_IDS_AQL},
                             category_ids: m.category_ids
                         }})
                         {sort_aql}
@@ -723,7 +792,7 @@ class PhraseViewSet(ArangoModelViewSet):
                     LET phrase = MERGE(sp, {{
                         english: m.english,
                         conjugated: m.conjugated,
-                        question_ids: m.question_ids,
+                        question_ids: {self.RESOLVED_QUESTION_IDS_AQL},
                         category_ids: m.category_ids
                     }})
                     {sort_aql}
@@ -900,16 +969,19 @@ class MasterPhraseViewSet(ArangoModelViewSet):
     Available endpoints:
     - PATCH /master-phrases/{phrase_ref}/ - update english/conjugated/question_ids/category_ids
 
-    Editing a MasterPhrase affects every sample of that phrase at once, so
-    this requires project editor/admin role rather than the per-sample
-    CanEditSample check used elsewhere — there's no single sample to scope
-    a per-sample permission check to.
+    Editing a MasterPhrase affects every sample of that phrase at once, and
+    defines the phrase concept itself (english gloss, which research
+    questions/categories it answers) rather than one sample's transcription
+    of it — this is meta-editor/superadmin territory (global admin), not the
+    regular per-sample CanEditSample privilege used elsewhere. Sample
+    editors make rare per-sample exceptions via SamplePhrase.question_overrides
+    (see PhraseViewSet.partial_update) instead of editing this directly.
     """
 
     model = MasterPhrase
     serializer_class = MasterPhraseSerializer
     http_method_names = ["patch", "head", "options"]
-    permission_classes = [IsProjectEditor]
+    permission_classes = [IsGlobalAdmin]
 
     EDITABLE_FIELDS = {"english", "conjugated", "question_ids", "category_ids"}
 

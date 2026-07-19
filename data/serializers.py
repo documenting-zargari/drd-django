@@ -21,6 +21,7 @@ class CategorySerializer(ArangoModelSerializer):
     id = serializers.IntegerField()
     parent_id = serializers.IntegerField()
     has_children = serializers.SerializerMethodField()
+    is_leaf = serializers.BooleanField(required=False, default=False)
     drill = serializers.SerializerMethodField()
     hierarchy = serializers.SerializerMethodField()
 
@@ -33,6 +34,7 @@ class CategorySerializer(ArangoModelSerializer):
             "hierarchy",
             "hierarchy_ids",
             "has_children",
+            "is_leaf",
             "drill",
             "path",
         )
@@ -149,6 +151,7 @@ class PhraseSerializer(ArangoModelSerializer):
             "has_recording",
             "question_ids",
             "category_ids",
+            "question_overrides",
         ]
 
     def get_has_recording(self, obj):

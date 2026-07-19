@@ -27,48 +27,53 @@ from rest_framework.response import Response
 from rest_framework.viewsets import ViewSet
 from natsort import natsorted
 
-from data.models import Answer, Category, Phrase, Sample, Source, Transcription, View
+from data.models import (
+    Answer,
+    Category,
+    MasterPhrase,
+    ResearchQuestion,
+    Sample,
+    SamplePhrase,
+    Source,
+    Transcription,
+    View,
+)
 from data.serializers import (
     AnswerSerializer,
     CategorySerializer,
+    MasterPhraseSerializer,
     PhraseSerializer,
+    ResearchQuestionSerializer,
     SampleSerializer,
     SourceSerializer,
     TranscriptionSerializer,
     ViewSerializer,
 )
 from roma.views import ArangoModelViewSet
-from user.permissions import CanEditSample, IsGlobalOrProjectAdmin, IsProjectEditor
+from user.permissions import CanEditSample, IsGlobalAdmin, IsGlobalOrProjectAdmin, IsProjectEditor
 
 
-def _resolve_tag_ids(db, answer):
+def _get_question_hierarchy_ids(db, question_id):
     """
-    Return (tag_ids, tag_words) for an answer.
+    Return a ResearchQuestion's hierarchy_ids (itself plus every ancestor
+    Category id), or None if not found.
 
-    Prefers tag_ids stored on the parent ResearchQuestion (set by the
-    copy_tags_to_questions migration). Falls back to reading answer.tags
-    directly for the 65 questions where answers carry per-answer tags.
+    Used to match a MasterPhrase/Transcription's question_ids/category_ids
+    against the specific question an answer belongs to: a direct hit on
+    question_ids, or an overlap between category_ids and hierarchy_ids
+    (the phrase/transcription was linked at a category level that covers
+    this question). See extract/master_phrases_migration/PLAN.md — this
+    replaces the old tag_ids-intersection approach entirely; tag_word
+    text-search fallback is not carried over (tag_word was never meant to
+    link phrases, per extract/Tags.md).
     """
-    question_id = answer.get('question_id')
-    if question_id is not None:
-        cursor = db.aql.execute(
-            "FOR q IN ResearchQuestions FILTER q.id == @id RETURN q",
-            bind_vars={"id": question_id},
-        )
-        questions = list(cursor)
-        if questions and questions[0].get('tag_ids'):
-            return list(questions[0]['tag_ids']), []
-
-    # Fallback: read from answer.tags (always an array after normalisation)
-    tag_ids, tag_words = [], []
-    for tag in answer.get('tags') or []:
-        if tag.get('tag_id'):
-            tag_ids.append(tag['tag_id'])
-        elif tag.get('tag_word'):
-            tag_words.append(tag['tag_word'])
-        elif tag.get('name'):
-            tag_words.append(tag['name'])
-    return tag_ids, tag_words
+    if question_id is None:
+        return None
+    cursor = db.aql.execute(
+        "FOR q IN ResearchQuestions FILTER q.id == @id RETURN q.hierarchy_ids",
+        bind_vars={"id": question_id},
+    )
+    return next(cursor, None)
 
 
 class CategoryViewSet(ArangoModelViewSet):
@@ -278,19 +283,103 @@ class CategoryViewSet(ArangoModelViewSet):
         except Exception as e:
             return Response({"error": f"Search failed: {str(e)}"}, status=500)
 
+
+class ResearchQuestionViewSet(ArangoModelViewSet):
+    """
+    Read-only API endpoint for browsing/searching ResearchQuestions.
+
+    Added for the MasterPhrases migration — editors need to look up and
+    link specific research questions on MasterPhrases.question_ids (see
+    extract/master_phrases_migration/PLAN.md). Deliberately minimal: no
+    tree navigation like CategoryViewSet, just search-by-name and
+    batch-by-id (for resolving a phrase's linked question_ids to
+    human-readable labels).
+
+    Available endpoints:
+    - GET /research-questions/batch/?ids=<id1,id2,...> - Retrieve multiple questions by ID
+    - GET /research-questions/search/?q=<term> - Search questions by name (min 2 chars)
+    """
+
+    model = ResearchQuestion
+    serializer_class = ResearchQuestionSerializer
+    http_method_names = ["get", "head", "options"]
+
+    @action(detail=False, methods=["get"])
+    def batch(self, request):
+        """
+        GET /research-questions/batch/?ids=<id1,id2,...> - retrieve multiple
+        ResearchQuestions by id in a single request.
+        """
+        ids_param = request.query_params.get("ids", "").strip()
+        if not ids_param:
+            return Response([])
+
+        try:
+            ids = [int(x) for x in ids_param.split(",") if x.strip()]
+        except ValueError:
+            return Response({"error": "ids must be comma-separated integers"}, status=400)
+
+        if not ids:
+            return Response([])
+
+        db = request.arangodb
+        cursor = db.aql.execute(
+            "FOR q IN ResearchQuestions FILTER q.id IN @ids RETURN q",
+            bind_vars={"ids": ids},
+        )
+        results = list(cursor)
+        serializer = self.serializer_class(results, many=True, context={"request": request, "view": self})
+        return Response(serializer.data)
+
+    @action(detail=False, methods=["get"])
+    def search(self, request):
+        """
+        GET /research-questions/search/?q=<term> - search ResearchQuestions
+        by name (case-insensitive substring, minimum 2 characters), sorted
+        by id, capped at 50 results.
+        """
+        query = request.query_params.get("q", "").strip()
+        if not query or len(query) < 2:
+            return Response([])
+
+        db = request.arangodb
+        cursor = db.aql.execute(
+            """
+            FOR q IN ResearchQuestions
+                FILTER REGEX_TEST(q.name, @pattern, true)
+                SORT q.id
+                LIMIT 50
+                RETURN q
+            """,
+            bind_vars={"pattern": f".*{query}.*"},
+        )
+        results = list(cursor)
+        serializer = self.serializer_class(results, many=True, context={"request": request, "view": self})
+        return Response(serializer.data)
+
+
 class PhraseViewSet(ArangoModelViewSet):
     """
-    API endpoint for retrieving phrases associated with samples.
+    API endpoint for retrieving sample-level phrase recordings.
 
-    Phrases are linguistic data linked to specific samples.
+    Each phrase recording is a join of SamplePhrases (per-sample text,
+    recording flag) and MasterPhrases (english, conjugated, question_ids,
+    category_ids — shared across every sample of that phrase_ref). Replaces
+    the old flat Phrases collection; see
+    extract/master_phrases_migration/PLAN.md.
 
     Available endpoints:
     - GET /phrases/?sample=<sample_ref> - List phrases for a specific sample
     - GET /phrases/list/ - Unique phrase list for the phrase picker (phrase_ref + english only)
     - GET /phrases/<id>/ - Retrieve specific phrase by ID
-    - GET /phrases/by-answer/?answer_key=<key> - Get phrases linked to an answer via phrase tags
+    - GET /phrases/by-answer/?answer_key=<key> - Get phrases linked to an answer's research question
     - POST /phrases/search/ - Search phrases (see that endpoint for parameters)
     - POST /phrases/export/ - Export matching phrases without pagination (see that endpoint for parameters)
+
+    Editing: PATCH here only changes the per-sample `phrase` text. To edit
+    english/conjugated/question_ids/category_ids (shared across every
+    sample of this phrase_ref), use MasterPhraseViewSet
+    (/master-phrases/{phrase_ref}/) instead.
 
     Query Parameters:
     - sample (required for list): Sample reference (e.g., sample=AL-001)
@@ -300,15 +389,24 @@ class PhraseViewSet(ArangoModelViewSet):
     - /phrases/?sample=AL-001 - Phrases for sample AL-001
     - /phrases/list/ - Unique phrase list for picker (phrase_ref + english only)
     - /phrases/123/ - Specific phrase with ID 123
-    - /phrases/by-answer/?answer_key=ABC123 - Phrases linked to answer ABC123 via phrase tags
+    - /phrases/by-answer/?answer_key=ABC123 - Phrases linked to answer ABC123 via its research question
     """
 
-    model = Phrase
+    model = SamplePhrase
     serializer_class = PhraseSerializer
     http_method_names = ["get", "post", "patch", "head", "options"]
     permission_classes = [AllowAny]  # GET and search POST are public; PATCH uses per-action override
 
-    EDITABLE_FIELDS = {"phrase", "english", "conjugated", "tag_ids"}
+    EDITABLE_FIELDS = {"phrase", "question_overrides"}
+
+    # Resolved question_ids for display/matching: the MasterPhrase's own
+    # links, plus this SamplePhrase's question_overrides.include, minus its
+    # question_overrides.exclude. Requires `m` (MasterPhrase doc) and `sp`
+    # (SamplePhrase doc) bound in the enclosing AQL FOR loop.
+    RESOLVED_QUESTION_IDS_AQL = (
+        "MINUS(UNION_DISTINCT((m.question_ids || []), (sp.question_overrides.include || [])), "
+        "(sp.question_overrides.exclude || []))"
+    )
 
     def get_permissions(self):
         if self.request.method == "PATCH":
@@ -324,13 +422,46 @@ class PhraseViewSet(ArangoModelViewSet):
         doc = db.collection(self.model.collection_name).get(pk)
         return doc.get("sample") if doc else None
 
+    @staticmethod
+    def _merge_with_master(db, sample_phrase):
+        master = db.collection(MasterPhrase.collection_name).get(sample_phrase["phrase_ref"])
+        if not master:
+            return sample_phrase
+        overrides = sample_phrase.get("question_overrides") or {}
+        resolved_question_ids = sorted(
+            (set(master.get("question_ids") or []) | set(overrides.get("include") or []))
+            - set(overrides.get("exclude") or [])
+        )
+        return {
+            **sample_phrase,
+            "english": master.get("english"),
+            "conjugated": master.get("conjugated"),
+            "question_ids": resolved_question_ids,
+            "category_ids": master.get("category_ids", []),
+        }
+
+    @staticmethod
+    def _validate_question_overrides(value):
+        if value is None:
+            return {"include": [], "exclude": []}
+        if not isinstance(value, dict):
+            raise ValidationError("question_overrides must be an object with include/exclude arrays")
+        include = value.get("include") or []
+        exclude = value.get("exclude") or []
+        if not all(isinstance(v, int) for v in include) or not all(isinstance(v, int) for v in exclude):
+            raise ValidationError("question_overrides.include/exclude must be arrays of research question ids")
+        return {"include": sorted(set(include)), "exclude": sorted(set(exclude))}
+
     def partial_update(self, request, pk=None):
         """
-        PATCH /phrases/{key}/ — update editable fields on a phrase.
+        PATCH /phrases/{sample}_{phrase_ref}/ — update the per-sample phrase
+        text and/or its question_overrides (rare, sample-scoped exceptions
+        to the MasterPhrase's linked research questions — see
+        question_overrides docstring on RESOLVED_QUESTION_IDS_AQL / by_answer).
         Requires editor+ role. Editors with sample restrictions may only
         edit phrases belonging to their allowed samples.
 
-        Allowed fields: phrase, english, conjugated
+        Allowed fields: phrase, question_overrides
         """
         db = request.arangodb
         doc = db.collection(self.model.collection_name).get(pk)
@@ -343,9 +474,11 @@ class PhraseViewSet(ArangoModelViewSet):
                 {"error": f"No editable fields provided. Allowed: {sorted(self.EDITABLE_FIELDS)}"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        if "question_overrides" in updates:
+            updates["question_overrides"] = self._validate_question_overrides(updates["question_overrides"])
 
         db.collection(self.model.collection_name).update({"_key": pk, **updates})
-        updated = db.collection(self.model.collection_name).get(pk)
+        updated = self._merge_with_master(db, db.collection(self.model.collection_name).get(pk))
         serializer = self.serializer_class(updated, context={"request": request})
         return Response(serializer.data)
 
@@ -356,9 +489,19 @@ class PhraseViewSet(ArangoModelViewSet):
                 raise NotFound(detail="Sample parameter is required to fetch phrases")
 
             db = self.request.arangodb
-            collection = db.collection(self.model.collection_name)
-            cursor = collection.find({"sample": sample})
-            return [phrase for phrase in natsorted(cursor, key=lambda x: x["phrase_ref"])]
+            aql = f"""
+                FOR sp IN SamplePhrases
+                    FILTER sp.sample == @sample
+                    LET m = DOCUMENT(CONCAT("MasterPhrases/", sp.phrase_ref))
+                    RETURN MERGE(sp, {{
+                        english: m.english,
+                        conjugated: m.conjugated,
+                        question_ids: {self.RESOLVED_QUESTION_IDS_AQL},
+                        category_ids: m.category_ids
+                    }})
+            """
+            cursor = db.aql.execute(aql, bind_vars={"sample": sample})
+            return natsorted(list(cursor), key=lambda x: x["phrase_ref"])
 
         except NotFound:
             raise
@@ -370,47 +513,49 @@ class PhraseViewSet(ArangoModelViewSet):
     def phrase_list(self, request):
         """
         GET /phrases/list/ — unique phrases for the phrase picker.
-        Returns one record per phrase_ref (deduplicated across samples),
-        with only phrase_ref and english fields, sorted naturally by phrase_ref.
+        One record per MasterPhrase (phrase_ref + english), sorted naturally by phrase_ref.
         """
         db = request.arangodb
         aql = """
-            FOR p IN Phrases
-                COLLECT ref = p.phrase_ref INTO g
-                LET doc = FIRST(g[*].p)
-                SORT ref
-                RETURN { phrase_ref: doc.phrase_ref, english: doc.english }
+            FOR m IN MasterPhrases
+                RETURN { phrase_ref: m.phrase_ref, english: m.english }
         """
         cursor = db.aql.execute(aql)
         results = natsorted(list(cursor), key=lambda x: x["phrase_ref"])
         return Response(results)
 
 
-    @action(detail=False, methods=["get"], url_path="tags")
-    def tags(self, request):
-        """
-        GET /phrases/tags/ — all phrase tags for client-side hierarchy display.
-        Returns: [{ "id": 1, "tag": "go", "parent_id": 5 }, ...]
-        """
-        db = request.arangodb
-        aql = """
-            FOR tag IN PhraseTags
-                RETURN { id: tag.id, tag: tag.tag, parent_id: tag.parent_id }
-        """
-        cursor = db.aql.execute(aql)
-        return Response(list(cursor))
-
     @action(detail=False, methods=["get"], url_path="by-answer")
     def by_answer(self, request):
         """
-        Get phrases associated with an answer via sample + tag matching.
+        Get phrases associated with an answer via its research question.
 
         Query Parameters:
         - answer_key (required): Answer _key
 
-        Returns phrases where:
-        - phrase.sample == answer.sample AND answer.tag_id IN phrase.tag_ids
-        - OR if tag_id is NULL but tag_word exists, searches phrase text and english
+        Returns phrases where phrase.sample == answer.sample AND the
+        MasterPhrase links to the answer's question (directly via
+        question_ids, or via a covering category whose subtree includes
+        this question — category_ids intersects the question's
+        hierarchy_ids).
+
+        If the answer has `phrase_overrides.include` set (non-empty), that
+        list of phrase_refs is used instead of the question/category match
+        entirely — this preserves exact per-answer precision for the ~65
+        "heterogeneous" questions where different answers intentionally
+        carry different tags (see extract/tag_divergence.md), now that
+        matching happens per-question rather than per-answer.
+        `phrase_overrides.exclude` is always subtracted, whichever path was
+        used. See extract/master_phrases_migration/PLAN.md.
+
+        On top of that, each matching SamplePhrase's own `question_overrides`
+        is applied: a phrase whose `question_overrides.exclude` contains this
+        answer's question_id is dropped even if the branch above matched it;
+        a phrase (in this sample) whose `question_overrides.include` contains
+        this answer's question_id is added even if the branch above didn't
+        match it. This is the rare, sample-scoped exception a sample editor
+        can make from the phrase editor — distinct from Answer.phrase_overrides
+        above, which is question-scoped and admin/meta-editor territory.
         """
         from rest_framework.exceptions import ValidationError
 
@@ -428,72 +573,88 @@ class PhraseViewSet(ArangoModelViewSet):
             if not sample:
                 return Response([])
 
-            tag_ids, tag_words = _resolve_tag_ids(db, answer)
-            phrases = []
+            question_id = answer.get('question_id')
+            overrides = answer.get('phrase_overrides') or {}
+            include = overrides.get('include') or []
+            exclude = overrides.get('exclude') or []
 
-            # Query by tag_ids if available
-            if tag_ids:
-                aql = """
-                    FOR phrase IN Phrases
-                        FILTER phrase.sample == @sample
-                        FILTER LENGTH(INTERSECTION(phrase.tag_ids || [], @tag_ids)) > 0
-                        RETURN phrase
+            # sp is a direct primary-key lookup (SamplePhrases._key ==
+            # "{sample}_{phrase_ref}"), not a scan — avoids re-scanning all
+            # 128k SamplePhrases once per matching MasterPhrase.
+            if include:
+                aql = f"""
+                    FOR phrase_ref IN @include
+                        FILTER phrase_ref NOT IN @exclude
+                        LET sp = DOCUMENT(CONCAT("SamplePhrases/", @sample, "_", phrase_ref))
+                        FILTER sp != null
+                        FILTER @question_id NOT IN (sp.question_overrides.exclude || [])
+                        LET m = DOCUMENT(CONCAT("MasterPhrases/", phrase_ref))
+                        RETURN MERGE(sp, {{
+                            english: m.english,
+                            conjugated: m.conjugated,
+                            question_ids: {self.RESOLVED_QUESTION_IDS_AQL},
+                            category_ids: m.category_ids
+                        }})
                 """
-                phrases.extend(db.aql.execute(aql, bind_vars={
+                bind_vars = {'include': include, 'exclude': exclude, 'sample': sample, 'question_id': question_id}
+                phrases = list(db.aql.execute(aql, bind_vars=bind_vars))
+            else:
+                hierarchy_ids = _get_question_hierarchy_ids(db, question_id)
+                if hierarchy_ids is None:
+                    return Response([])
+                aql = f"""
+                    FOR m IN MasterPhrases
+                        FILTER (@question_id IN (m.question_ids || [])
+                                OR LENGTH(INTERSECTION(m.category_ids || [], @hierarchy_ids)) > 0)
+                            AND m.phrase_ref NOT IN @exclude
+                        LET sp = DOCUMENT(CONCAT("SamplePhrases/", @sample, "_", m.phrase_ref))
+                        FILTER sp != null
+                        FILTER @question_id NOT IN (sp.question_overrides.exclude || [])
+                        RETURN MERGE(sp, {{
+                            english: m.english,
+                            conjugated: m.conjugated,
+                            question_ids: {self.RESOLVED_QUESTION_IDS_AQL},
+                            category_ids: m.category_ids
+                        }})
+                """
+                bind_vars = {
+                    'question_id': question_id,
+                    'hierarchy_ids': hierarchy_ids,
                     'sample': sample,
-                    'tag_ids': tag_ids
-                }))
+                    'exclude': exclude,
+                }
+                phrases = list(db.aql.execute(aql, bind_vars=bind_vars))
 
-            # Fallback: text search by tag_words
-            # First try exact match on english field (for tags like "be (PRES)")
-            # Then fall back to regex word matching on english field
-            # Strip bracketed annotations like [<CONJ>], [PAST] before searching
-            if tag_words and not phrases:
-                import re
-                for tag_word in tag_words:
-                    # Strip bracketed annotations (e.g., "did[<CONJ>]" -> "did", "put [PAST]" -> "put")
-                    clean_tag = re.sub(r'\s*\[.*?\]', '', tag_word).strip()
-                    if not clean_tag:
-                        clean_tag = tag_word
-
-                    # Try exact case-insensitive match on english field first
-                    aql_exact = """
-                        FOR phrase IN Phrases
-                            FILTER phrase.sample == @sample
-                            FILTER LOWER(phrase.english || '') == LOWER(@tag_word)
-                            RETURN phrase
-                    """
-                    phrases.extend(db.aql.execute(aql_exact, bind_vars={
-                        'sample': sample,
-                        'tag_word': clean_tag
-                    }))
-
-                    # If no exact match, try regex word match on english field
-                    if not phrases:
-                        escaped_tag = re.escape(clean_tag)
-                        aql_regex = """
-                            FOR phrase IN Phrases
-                                FILTER phrase.sample == @sample
-                                FILTER REGEX_TEST(phrase.english || '', CONCAT('(?i)(^|[^a-zA-Z])', @escaped_tag, '([^a-zA-Z]|$)'))
-                                RETURN phrase
-                        """
-                        phrases.extend(db.aql.execute(aql_regex, bind_vars={
-                            'sample': sample,
-                            'escaped_tag': escaped_tag
-                        }))
+            # Sample-scoped explicit includes: SamplePhrases in this sample
+            # that declare relevance to this exact question_id via their own
+            # question_overrides.include, regardless of which branch above
+            # ran or what it matched.
+            override_include_aql = f"""
+                FOR sp IN SamplePhrases
+                    FILTER sp.sample == @sample
+                    FILTER @question_id IN (sp.question_overrides.include || [])
+                    FILTER sp.phrase_ref NOT IN @exclude
+                    LET m = DOCUMENT(CONCAT("MasterPhrases/", sp.phrase_ref))
+                    RETURN MERGE(sp, {{
+                        english: m.english,
+                        conjugated: m.conjugated,
+                        question_ids: {self.RESOLVED_QUESTION_IDS_AQL},
+                        category_ids: m.category_ids
+                    }})
+            """
+            override_phrases = list(db.aql.execute(
+                override_include_aql, bind_vars={'sample': sample, 'question_id': question_id, 'exclude': exclude}
+            ))
+            seen_keys = {p['_key'] for p in phrases}
+            for p in override_phrases:
+                if p['_key'] not in seen_keys:
+                    phrases.append(p)
+                    seen_keys.add(p['_key'])
 
             if not phrases:
                 return Response([])
 
-            # Deduplicate and sort
-            seen = set()
-            unique_phrases = []
-            for p in phrases:
-                if p['_key'] not in seen:
-                    seen.add(p['_key'])
-                    unique_phrases.append(p)
-
-            phrases = natsorted(unique_phrases, key=lambda x: x.get("phrase_ref", ""))
+            phrases = natsorted(phrases, key=lambda x: x.get("phrase_ref", ""))
             serializer = self.serializer_class(phrases, many=True, context={"request": request})
             return Response(serializer.data)
 
@@ -547,17 +708,25 @@ class PhraseViewSet(ArangoModelViewSet):
             # Visibility and sample label resolved per-row via inline Samples lookup.
             see_hidden = user_sees_hidden_samples(request.user)
             visibility_filter = "" if see_hidden else "FILTER s.visible == 'Yes'"
-            sample_filter = "FILTER phrase.sample IN @sample_refs" if sample_refs else ""
+            sample_filter = "FILTER sp.sample IN @sample_refs" if sample_refs else ""
             bind: dict = {"phrase_ref": phrase_ref}
             if sample_refs:
                 bind["sample_refs"] = sample_refs
             results_aql = f"""
-                FOR phrase IN Phrases
-                    FILTER phrase.phrase_ref == @phrase_ref
+                LET m = DOCUMENT(CONCAT("MasterPhrases/", @phrase_ref))
+                FILTER m != null
+                FOR sp IN SamplePhrases
+                    FILTER sp.phrase_ref == m.phrase_ref
                     {sample_filter}
                     FOR s IN Samples
-                        FILTER s.sample_ref == phrase.sample
+                        FILTER s.sample_ref == sp.sample
                         {visibility_filter}
+                        LET phrase = MERGE(sp, {{
+                            english: m.english,
+                            conjugated: m.conjugated,
+                            question_ids: {self.RESOLVED_QUESTION_IDS_AQL},
+                            category_ids: m.category_ids
+                        }})
                         {sort_aql}
                         RETURN MERGE(phrase, {{
                             sample_label: CONCAT_SEPARATOR(', ', s.dialect_name, s.location)
@@ -578,41 +747,68 @@ class PhraseViewSet(ArangoModelViewSet):
                 else:
                     sample_refs = list(db.aql.execute("FOR s IN Samples FILTER s.visible == 'Yes' RETURN s.sample_ref"))
 
-            # Uses PhraseSearch ArangoSearch view with norm_lower analyzer for fast
-            # case-insensitive substring matching via LIKE with wildcards
+            # Romani text ('phrase') lives per-sample on SamplePhrases, indexed by the
+            # SamplePhraseSearch ArangoSearch view (norm_lower analyzer). English lives
+            # once per phrase_ref on the small MasterPhrases collection (~1,100 docs) —
+            # a plain LIKE scan there is cheap and avoids re-denormalizing english onto
+            # every sample row just for search convenience.
             query_lower = query.lower()
-            if field == "romani":
-                like_expr = 'LIKE(phrase.phrase, CONCAT("%", @query, "%"))'
-            elif field == "english":
-                like_expr = 'LIKE(phrase.english, CONCAT("%", @query, "%"))'
-            else:
-                like_expr = 'LIKE(phrase.phrase, CONCAT("%", @query, "%")) OR LIKE(phrase.english, CONCAT("%", @query, "%"))'
-            search_filter = f'SEARCH ANALYZER({like_expr}, "norm_lower")'
+            search_romani = field in ("romani", "both")
+            search_english = field in ("english", "both")
 
+            candidates_aql = """
+                LET romani_keys = @search_romani ? (
+                    FOR sp IN SamplePhraseSearch
+                        SEARCH ANALYZER(LIKE(sp.phrase, CONCAT("%", @query, "%")), "norm_lower")
+                        FILTER sp.sample IN @sample_refs
+                        RETURN sp._key
+                ) : []
+                LET english_refs = @search_english ? (
+                    FOR m IN MasterPhrases
+                        FILTER LIKE(m.english, CONCAT("%", @query, "%"), true)
+                        RETURN m.phrase_ref
+                ) : []
+                LET english_keys = @search_english ? (
+                    FOR sp IN SamplePhrases
+                        FILTER sp.phrase_ref IN english_refs AND sp.sample IN @sample_refs
+                        RETURN sp._key
+                ) : []
+                LET candidate_keys = UNIQUE(APPEND(romani_keys, english_keys))
+            """
             count_aql = f"""
-                FOR phrase IN PhraseSearch
-                    {search_filter}
-                    FILTER phrase.sample IN @sample_refs
-                    COLLECT WITH COUNT INTO total
-                    RETURN total
+                {candidates_aql}
+                RETURN LENGTH(candidate_keys)
             """
             results_aql = f"""
+                {candidates_aql}
                 LET sample_lookup = (
                     FOR s IN Samples
                         RETURN {{ref: s.sample_ref, label: CONCAT_SEPARATOR(', ', s.dialect_name, s.location)}}
                 )
                 LET sample_map = ZIP(sample_lookup[*].ref, sample_lookup[*].label)
-                FOR phrase IN PhraseSearch
-                    {search_filter}
-                    FILTER phrase.sample IN @sample_refs
+                FOR key IN candidate_keys
+                    LET sp = DOCUMENT(CONCAT("SamplePhrases/", key))
+                    LET m = DOCUMENT(CONCAT("MasterPhrases/", sp.phrase_ref))
+                    LET phrase = MERGE(sp, {{
+                        english: m.english,
+                        conjugated: m.conjugated,
+                        question_ids: {self.RESOLVED_QUESTION_IDS_AQL},
+                        category_ids: m.category_ids
+                    }})
                     {sort_aql}
                     LIMIT @offset, @page_size
                     RETURN MERGE(phrase, {{
                         sample_label: sample_map[phrase.sample]
                     }})
             """
-            count_bind = {"query": query_lower, "sample_refs": sample_refs}
-            results_bind = {"query": query_lower, "sample_refs": sample_refs, "offset": offset, "page_size": page_size}
+            bind = {
+                "query": query_lower,
+                "sample_refs": sample_refs,
+                "search_romani": search_romani,
+                "search_english": search_english,
+            }
+            count_bind = bind
+            results_bind = {**bind, "offset": offset, "page_size": page_size}
 
         try:
             count_cursor = db.aql.execute(count_aql, bind_vars=count_bind)
@@ -681,18 +877,24 @@ class PhraseViewSet(ArangoModelViewSet):
         if phrase_ref:
             see_hidden = user_sees_hidden_samples(request.user)
             visibility_filter = "" if see_hidden else "FILTER s.visible == 'Yes'"
-            sample_filter = "FILTER phrase.sample IN @sample_refs" if sample_refs else ""
+            sample_filter = "FILTER sp.sample IN @sample_refs" if sample_refs else ""
             bind: dict = {"phrase_ref": phrase_ref}
             if sample_refs:
                 bind["sample_refs"] = sample_refs
             export_aql = f"""
-                FOR phrase IN Phrases
-                    FILTER phrase.phrase_ref == @phrase_ref
+                LET m = DOCUMENT(CONCAT("MasterPhrases/", @phrase_ref))
+                FILTER m != null
+                FOR sp IN SamplePhrases
+                    FILTER sp.phrase_ref == m.phrase_ref
                     {sample_filter}
                     FOR s IN Samples
-                        FILTER s.sample_ref == phrase.sample
+                        FILTER s.sample_ref == sp.sample
                         {visibility_filter}
                         LET sample_label = CONCAT_SEPARATOR(', ', s.dialect_name, s.location)
+                        LET phrase = MERGE(sp, {{
+                            english: m.english,
+                            conjugated: m.conjugated
+                        }})
                         {sort_aql}
                         {export_fields}
             """
@@ -704,25 +906,46 @@ class PhraseViewSet(ArangoModelViewSet):
                     sample_refs = list(db.aql.execute("FOR s IN Samples FILTER s.visible == 'Yes' RETURN s.sample_ref"))
 
             query_lower = query.lower()
-            if field == "romani":
-                like_expr = 'LIKE(phrase.phrase, CONCAT("%", @query, "%"))'
-            elif field == "english":
-                like_expr = 'LIKE(phrase.english, CONCAT("%", @query, "%"))'
-            else:
-                like_expr = 'LIKE(phrase.phrase, CONCAT("%", @query, "%")) OR LIKE(phrase.english, CONCAT("%", @query, "%"))'
-            search_filter = f'SEARCH ANALYZER({like_expr}, "norm_lower")'
-            bind = {"query": query_lower, "sample_refs": sample_refs}
+            search_romani = field in ("romani", "both")
+            search_english = field in ("english", "both")
+            bind = {
+                "query": query_lower,
+                "sample_refs": sample_refs,
+                "search_romani": search_romani,
+                "search_english": search_english,
+            }
             export_aql = f"""
+                LET romani_keys = @search_romani ? (
+                    FOR sp IN SamplePhraseSearch
+                        SEARCH ANALYZER(LIKE(sp.phrase, CONCAT("%", @query, "%")), "norm_lower")
+                        FILTER sp.sample IN @sample_refs
+                        RETURN sp._key
+                ) : []
+                LET english_refs = @search_english ? (
+                    FOR m IN MasterPhrases
+                        FILTER LIKE(m.english, CONCAT("%", @query, "%"), true)
+                        RETURN m.phrase_ref
+                ) : []
+                LET english_keys = @search_english ? (
+                    FOR sp IN SamplePhrases
+                        FILTER sp.phrase_ref IN english_refs AND sp.sample IN @sample_refs
+                        RETURN sp._key
+                ) : []
+                LET candidate_keys = UNIQUE(APPEND(romani_keys, english_keys))
                 LET sample_lookup = (
                     FOR s IN Samples
                         RETURN {{ref: s.sample_ref, label: CONCAT_SEPARATOR(', ', s.dialect_name, s.location)}}
                 )
                 LET sample_map = ZIP(sample_lookup[*].ref, sample_lookup[*].label)
-                FOR phrase IN PhraseSearch
-                    {search_filter}
-                    FILTER phrase.sample IN @sample_refs
+                FOR key IN candidate_keys
+                    LET sp = DOCUMENT(CONCAT("SamplePhrases/", key))
+                    LET m = DOCUMENT(CONCAT("MasterPhrases/", sp.phrase_ref))
+                    LET sample_label = sample_map[sp.sample]
+                    LET phrase = MERGE(sp, {{
+                        english: m.english,
+                        conjugated: m.conjugated
+                    }})
                     {sort_aql}
-                    LET sample_label = sample_map[phrase.sample]
                     {export_fields}
             """
 
@@ -732,6 +955,59 @@ class PhraseViewSet(ArangoModelViewSet):
         except Exception as e:
             print(f"Error exporting phrases: {e}")
             raise ValidationError(f"Export failed: {str(e)}")
+
+
+class MasterPhraseViewSet(ArangoModelViewSet):
+    """
+    API endpoint for editing MasterPhrases — the fields shared across every
+    sample recording of a given phrase_ref (english, conjugated,
+    question_ids, category_ids). Read access to phrase data goes through
+    PhraseViewSet (which joins SamplePhrases + MasterPhrases); this
+    viewset exists only so edits to the shared fields have a clear,
+    singular target rather than being smuggled into a per-sample PATCH.
+
+    Available endpoints:
+    - PATCH /master-phrases/{phrase_ref}/ - update english/conjugated/question_ids/category_ids
+
+    Editing a MasterPhrase affects every sample of that phrase at once, and
+    defines the phrase concept itself (english gloss, which research
+    questions/categories it answers) rather than one sample's transcription
+    of it — this is meta-editor/superadmin territory (global admin), not the
+    regular per-sample CanEditSample privilege used elsewhere. Sample
+    editors make rare per-sample exceptions via SamplePhrase.question_overrides
+    (see PhraseViewSet.partial_update) instead of editing this directly.
+    """
+
+    model = MasterPhrase
+    serializer_class = MasterPhraseSerializer
+    http_method_names = ["patch", "head", "options"]
+    permission_classes = [IsGlobalAdmin]
+
+    EDITABLE_FIELDS = {"english", "conjugated", "question_ids", "category_ids"}
+
+    def partial_update(self, request, pk=None):
+        """
+        PATCH /master-phrases/{phrase_ref}/ — update fields shared across
+        every sample's recording of this phrase.
+
+        Allowed fields: english, conjugated, question_ids, category_ids
+        """
+        db = request.arangodb
+        doc = db.collection(self.model.collection_name).get(pk)
+        if not doc:
+            raise NotFound(detail="MasterPhrase not found")
+
+        updates = {k: v for k, v in request.data.items() if k in self.EDITABLE_FIELDS}
+        if not updates:
+            return Response(
+                {"error": f"No editable fields provided. Allowed: {sorted(self.EDITABLE_FIELDS)}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        db.collection(self.model.collection_name).update({"_key": pk, **updates})
+        updated = db.collection(self.model.collection_name).get(pk)
+        serializer = self.serializer_class(updated, context={"request": request})
+        return Response(serializer.data)
 
 
 class SampleViewSet(ArangoModelViewSet):
@@ -1856,13 +2132,24 @@ class TranscriptionViewSet(ArangoModelViewSet):
     @action(detail=False, methods=["get"], url_path="by-answer")
     def by_answer(self, request):
         """
-        Get transcriptions associated with an answer via sample + tag matching.
+        Get transcriptions associated with an answer via its research question.
 
         Query Parameters:
         - answer_key (required): Answer _key
 
-        Returns transcriptions where:
-        - transcription.sample == answer.sample AND transcription has HasTag edge to matching tag_id
+        Returns transcriptions where transcription.sample == answer.sample
+        AND the transcription links to the answer's question (directly via
+        question_ids, or via a covering category whose subtree includes
+        this question — category_ids intersects the question's
+        hierarchy_ids). See extract/master_phrases_migration/PLAN.md —
+        this replaces the old HasTag edge traversal.
+
+        If the answer has `transcription_overrides.include` set
+        (non-empty), that list of Transcription _keys is used instead of
+        the question/category match entirely — preserves per-answer
+        precision for the ~65 heterogeneous questions (see PhraseViewSet.
+        by_answer's docstring for the full rationale).
+        `transcription_overrides.exclude` is always subtracted.
         """
         from rest_framework.exceptions import ValidationError
 
@@ -1880,26 +2167,41 @@ class TranscriptionViewSet(ArangoModelViewSet):
             if not sample:
                 return Response([])
 
-            tag_ids, _ = _resolve_tag_ids(db, answer)
+            overrides = answer.get('transcription_overrides') or {}
+            include = overrides.get('include') or []
+            exclude = set(overrides.get('exclude') or [])
             transcriptions = []
 
-            if tag_ids:
-                # Find transcriptions via HasTag edges to PhraseTags
+            if include:
                 aql = """
-                    FOR transcription IN Transcriptions
-                        FILTER transcription.sample == @sample
-                        LET tags = (
-                            FOR tag IN 1..1 OUTBOUND transcription HasTag
-                                FILTER tag.id IN @tag_ids
-                                RETURN tag
-                        )
-                        FILTER LENGTH(tags) > 0
-                        RETURN transcription
+                    FOR key IN @include
+                        FILTER key NOT IN @exclude
+                        LET t = DOCUMENT(CONCAT("Transcriptions/", key))
+                        FILTER t != null AND t.sample == @sample
+                        RETURN t
                 """
                 transcriptions = list(db.aql.execute(aql, bind_vars={
+                    'include': include,
+                    'exclude': list(exclude),
                     'sample': sample,
-                    'tag_ids': tag_ids
                 }))
+            else:
+                hierarchy_ids = _get_question_hierarchy_ids(db, answer.get('question_id'))
+                if hierarchy_ids:
+                    aql = """
+                        FOR transcription IN Transcriptions
+                            FILTER transcription.sample == @sample
+                            FILTER (@question_id IN (transcription.question_ids || [])
+                                    OR LENGTH(INTERSECTION(transcription.category_ids || [], @hierarchy_ids)) > 0)
+                                AND transcription._key NOT IN @exclude
+                            RETURN transcription
+                    """
+                    transcriptions = list(db.aql.execute(aql, bind_vars={
+                        'sample': sample,
+                        'question_id': answer.get('question_id'),
+                        'hierarchy_ids': hierarchy_ids,
+                        'exclude': list(exclude),
+                    }))
 
             if not transcriptions:
                 return Response([])

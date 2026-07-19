@@ -18,6 +18,13 @@ class Category(ArangoModel):
         return self.name
 
 
+class ResearchQuestion(ArangoModel):
+    collection_name = "ResearchQuestions"
+
+    def _str_(self):
+        return self.name
+
+
 class Translation(models.Model):
     class Meta:
         db_table = "phrase_anchors"
@@ -27,8 +34,22 @@ class Translation(models.Model):
     phrase_ref = models.IntegerField()
 
 
-class Phrase(ArangoModel):
-    collection_name = "Phrases"
+class MasterPhrase(ArangoModel):
+    """One doc per distinct elicited phrase, keyed by phrase_ref. Replaces
+    the old PhraseAnchors + per-phrase tag_ids. See
+    extract/master_phrases_migration/PLAN.md."""
+
+    collection_name = "MasterPhrases"
+
+    def _str_(self):
+        return self.english
+
+
+class SamplePhrase(ArangoModel):
+    """One doc per (sample, phrase_ref) recording, keyed by
+    '{sample}_{phrase_ref}'. Replaces the old Phrases collection."""
+
+    collection_name = "SamplePhrases"
 
     def _str_(self):
         return self.phrase

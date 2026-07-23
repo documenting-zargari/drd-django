@@ -14,8 +14,8 @@ service:
   name: "web"
   url: "$public_url"
   type: ClusterIP
-  externalPort: # the port your app runs on
-  internalPort: # the port your app runs on
+  externalPort: 8020 # the port your app runs on
+  internalPort: 8020 # the port your app runs on
 ingress:
   enabled: true
   path: "/"

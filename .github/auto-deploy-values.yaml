@@ -1,0 +1,37 @@
+replicaCount: 1
+image:
+  repository: $repository
+  tag: "$tag"
+  pullPolicy: Always
+  secrets: []
+extraLabels:
+  "ID": "$service_id"
+gitlab:
+  app: "$app_name"
+  envURL: "$repo_url"
+service:
+  enabled: true
+  name: "web"
+  url: "$public_url"
+  type: ClusterIP
+  externalPort: 8020 # the port your app runs on
+  internalPort: 8020 # the port your app runs on
+ingress:
+  enabled: true
+  path: "/"
+  className: "nginx"
+  annotations: {}
+livenessProbe:
+  path: # path to your health check route, can be /
+  initialDelaySeconds: 15
+  timeoutSeconds: 15
+  scheme: "HTTP"
+  probeType: "httpGet"
+readinessProbe:
+  path: # path to your health check route, can be /
+  initialDelaySeconds: 5
+  timeoutSeconds: 3
+  scheme: "HTTP"
+  probeType: "httpGet"
+serviceAccount:
+  name: drd-release-manager

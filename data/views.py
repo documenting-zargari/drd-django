@@ -371,6 +371,7 @@ class PhraseViewSet(ArangoModelViewSet):
     Available endpoints:
     - GET /phrases/?sample=<sample_ref> - List phrases for a specific sample
     - GET /phrases/list/ - Unique phrase list for the phrase picker (phrase_ref + english only)
+    - GET /phrases/all-for-sample/?sample=<sample_ref> - Every MasterPhrase, with Romani text where a SamplePhrase exists for this sample
     - GET /phrases/<id>/ - Retrieve specific phrase by ID
     - GET /phrases/by-answer/?answer_key=<key> - Get phrases linked to an answer's research question
     - POST /phrases/search/ - Search phrases (see that endpoint for parameters)
@@ -561,6 +562,37 @@ class PhraseViewSet(ArangoModelViewSet):
         results = natsorted(list(cursor), key=lambda x: x["phrase_ref"])
         return Response(results)
 
+    @action(detail=False, methods=["get"], url_path="all-for-sample")
+    def all_for_sample(self, request):
+        """
+        GET /phrases/all-for-sample/?sample=<sample_ref> — every MasterPhrase,
+        left-joined with this sample's SamplePhrase where one exists. Used by
+        the Answer.phrase_overrides picker, which needs to show each phrase's
+        actual Romani text for the sample being edited (not just its English
+        gloss) — `phrase`/`has_recording` are null/false for MasterPhrases
+        that have no SamplePhrase row for this sample yet.
+        """
+        from rest_framework.exceptions import ValidationError
+
+        sample = request.query_params.get("sample")
+        if not sample:
+            raise ValidationError("sample parameter is required")
+
+        db = request.arangodb
+        aql = """
+            FOR m IN MasterPhrases
+                LET sp = DOCUMENT(CONCAT("SamplePhrases/", @sample, "_", m.phrase_ref))
+                RETURN {
+                    phrase_ref: m.phrase_ref,
+                    english: m.english,
+                    phrase: sp ? sp.phrase : null,
+                    has_recording: sp ? sp.has_recording : false
+                }
+        """
+        cursor = db.aql.execute(aql, bind_vars={"sample": sample})
+        results = natsorted(list(cursor), key=lambda x: x["phrase_ref"])
+        return Response(results)
+
 
     @action(detail=False, methods=["get"], url_path="by-answer")
     def by_answer(self, request):
@@ -640,7 +672,7 @@ class PhraseViewSet(ArangoModelViewSet):
         """
         return list(db.aql.execute(aql, bind_vars={'sample': sample, 'category_id': category_id, 'exclude': exclude}))
 
-    def _phrases_by_category(self, db, category_id, sample, exclude=None):
+    def _phrases_by_category(self, db, category_id, sample, exclude=None, ignore_sample_overrides=False):
         """
         Phrases linked to a research question/category id, scoped to one
         sample — the shared core of both by_answer's question/category-match
@@ -652,28 +684,40 @@ class PhraseViewSet(ArangoModelViewSet):
         the MasterPhrase wouldn't otherwise match). `exclude` is an optional
         list of phrase_refs to additionally drop (used by by_answer for its
         Answer.phrase_overrides.exclude).
+
+        `ignore_sample_overrides=True` skips both the exclude filter and the
+        include union, returning the master-link-only baseline regardless of
+        any SamplePhrase.question_overrides — used by the Tables cell edit
+        dialog to tell a phrase that's naturally linked apart from one that's
+        only present due to a question_overrides.include exception, which
+        otherwise look identical (the exception applies unconditionally, not
+        just when reading through a specific Answer).
         """
         exclude = exclude or []
         hierarchy_ids = _get_question_hierarchy_ids(db, category_id)
         if hierarchy_ids is None:
             return []
 
-        aql = """
+        exclude_filter = "" if ignore_sample_overrides else "FILTER @category_id NOT IN (sp.question_overrides.exclude || [])"
+        aql = f"""
             FOR m IN MasterPhrases
                 FILTER (@category_id IN (m.question_ids || [])
                         OR LENGTH(INTERSECTION(m.category_ids || [], @hierarchy_ids)) > 0)
                     AND m.phrase_ref NOT IN @exclude
                 LET sp = DOCUMENT(CONCAT("SamplePhrases/", @sample, "_", m.phrase_ref))
                 FILTER sp != null
-                FILTER @category_id NOT IN (sp.question_overrides.exclude || [])
-                RETURN MERGE(sp, {
+                {exclude_filter}
+                RETURN MERGE(sp, {{
                     english: m.english,
                     conjugated: m.conjugated
-                })
+                }})
         """
         phrases = list(db.aql.execute(aql, bind_vars={
             'category_id': category_id, 'hierarchy_ids': hierarchy_ids, 'sample': sample, 'exclude': exclude,
         }))
+
+        if ignore_sample_overrides:
+            return phrases
 
         overrides = self._phrase_override_includes(db, category_id, sample, exclude)
         seen_keys = {p['_key'] for p in phrases}
@@ -735,7 +779,7 @@ class PhraseViewSet(ArangoModelViewSet):
     @action(detail=False, methods=["get"], url_path="by-category")
     def by_category(self, request):
         """
-        GET /phrases/by-category/?category_id=<id>&sample=<sample_ref>
+        GET /phrases/by-category/?category_id=<id>&sample=<sample_ref>&ignore_overrides=<optional>
 
         Same matching as by-answer's question/category branch, but keyed
         directly by a stable ResearchQuestion/Category id + sample instead
@@ -747,12 +791,19 @@ class PhraseViewSet(ArangoModelViewSet):
         Does not apply Answer.phrase_overrides (there's no specific Answer
         in play here) — only the MasterPhrase/SamplePhrase-level matching
         and SamplePhrase.question_overrides.
+
+        `ignore_overrides=true` skips SamplePhrase.question_overrides
+        entirely, returning the master-link-only baseline — used by the
+        Tables cell edit dialog to distinguish a naturally-linked phrase
+        from one only present via a question_overrides.include exception
+        (see _phrases_by_category's docstring).
         """
         from rest_framework.exceptions import ValidationError
 
         try:
             category_id = request.query_params.get("category_id")
             sample = request.query_params.get("sample")
+            ignore_overrides = request.query_params.get("ignore_overrides", "").lower() in ("1", "true")
             if not category_id:
                 raise ValidationError("category_id parameter is required")
             if not sample:
@@ -763,7 +814,7 @@ class PhraseViewSet(ArangoModelViewSet):
                 raise ValidationError("category_id must be an integer")
 
             db = request.arangodb
-            phrases = self._phrases_by_category(db, category_id, sample)
+            phrases = self._phrases_by_category(db, category_id, sample, ignore_sample_overrides=ignore_overrides)
 
             if not phrases:
                 return Response([])

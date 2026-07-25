@@ -2613,6 +2613,15 @@ class RelatedContentViewSet(ViewSet):
         transcriptions.sort(key=lambda x: x.get("segment_no", 0))
         transcription_data = TranscriptionSerializer(transcriptions, many=True, context={"request": request}).data
 
+        # PhraseSerializer/TranscriptionSerializer pass through the raw
+        # ArangoDB document (minus _rev/_id) since PhraseViewSet's own
+        # endpoints need the document _key to address a phrase for editing.
+        # This read-only "click a table cell" hot path has no such need, so
+        # strip the internal _key here rather than narrowing the shared
+        # serializers used elsewhere.
+        phrase_data = [{k: v for k, v in item.items() if k != "_key"} for item in phrase_data]
+        transcription_data = [{k: v for k, v in item.items() if k != "_key"} for item in transcription_data]
+
         return Response({"phrases": phrase_data, "transcriptions": transcription_data})
 
 

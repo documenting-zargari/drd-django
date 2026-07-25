@@ -24,6 +24,7 @@ class CategorySerializer(ArangoModelSerializer):
     is_leaf = serializers.BooleanField(required=False, default=False)
     drill = serializers.SerializerMethodField()
     hierarchy = serializers.SerializerMethodField()
+    hierarchy_ids = serializers.SerializerMethodField()
 
     class Meta:
         model = Category
@@ -54,6 +55,21 @@ class CategorySerializer(ArangoModelSerializer):
                 print(f"Error parsing hierarchy: {e}")
                 hierarchy = []
         return hierarchy
+
+    def get_hierarchy_ids(self, obj):
+        # Same string-encoded-list quirk as hierarchy above.
+        if isinstance(obj, dict):
+            hierarchy_ids = obj.get("hierarchy_ids", [])
+        else:
+            hierarchy_ids = getattr(obj, "hierarchy_ids", [])
+
+        if isinstance(hierarchy_ids, str):
+            try:
+                hierarchy_ids = eval(hierarchy_ids)
+            except Exception as e:
+                print(f"Error parsing hierarchy_ids: {e}")
+                hierarchy_ids = []
+        return hierarchy_ids
 
     def get_has_children(self, obj):
         request = self.context.get("request")

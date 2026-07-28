@@ -1712,6 +1712,9 @@ class AnswerViewSet(ArangoModelViewSet):
     - /answers/?search=1,form,verbal - Answers where form=verbal
     - /answers/?search=1,form,verbal&search=2,marker,past - Multiple field filters
     - /answers/?q=1&include_hidden=true - Include answers from hidden samples
+
+    Also see the `suggestions` action (GET /answers/suggestions/) for
+    distinct previously-entered values for a given question_id+field.
     """
 
     serializer_class = AnswerSerializer
@@ -1831,6 +1834,50 @@ class AnswerViewSet(ArangoModelViewSet):
         })
 
         return Response(answer_doc, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=["get"])
+    def suggestions(self, request):
+        """
+        GET /answers/suggestions/?question_id=<id>&field=<name>&q=<partial>&include_hidden=<bool>
+
+        Distinct previously-entered values for a given question+field across
+        all samples, most-frequent first — powers value autocomplete in the
+        table cell editor and the search-criteria builder.
+        """
+        question_id = request.GET.get("question_id")
+        field = request.GET.get("field", "").strip()
+        query = request.GET.get("q", "").strip().lower()
+
+        if not question_id or not field:
+            return Response(
+                {"error": "question_id and field are required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            question_id = int(question_id)
+        except (TypeError, ValueError):
+            return Response({"error": "question_id must be an integer"}, status=status.HTTP_400_BAD_REQUEST)
+        if field in self.PROTECTED_FIELDS:
+            return Response({"error": f"Field '{field}' is not suggestible."}, status=status.HTTP_400_BAD_REQUEST)
+
+        sample_refs = None if self.include_hidden() else self.get_visible_sample_refs()
+
+        db = request.arangodb
+        cursor = db.aql.execute(
+            """
+            FOR a IN Answers
+              FILTER a.question_id == @qid
+              FILTER a[@field] != null AND a[@field] != ""
+              FILTER @sample_refs == null OR a.sample IN @sample_refs
+              FILTER @q == "" OR CONTAINS(LOWER(a[@field]), @q)
+              COLLECT value = a[@field] WITH COUNT INTO freq
+              SORT freq DESC, value ASC
+              LIMIT 20
+              RETURN { value, count: freq }
+            """,
+            bind_vars={"qid": question_id, "field": field, "q": query, "sample_refs": sample_refs},
+        )
+        return Response(list(cursor))
 
     def destroy(self, request, pk=None):
         """

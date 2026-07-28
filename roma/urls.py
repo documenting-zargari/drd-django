@@ -103,6 +103,7 @@ def api_root(request, format=None):
                 "description": "Research question answers and analysis data. PATCH a detail url to edit; "
                                "PUT create/ to create a new answer.",
                 "create": reverse("answers-create-answer", request=request, format=format),
+                "suggestions": reverse("answers-suggestions", request=request, format=format),
             },
             "views": {
                 "url": reverse("views-list", request=request, format=format),

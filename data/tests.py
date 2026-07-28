@@ -135,6 +135,68 @@ class AnswerIncludeHiddenTests(SimpleTestCase):
         self.assertFalse(vs.include_hidden())
 
 
+class AnswerSuggestionsTests(SimpleTestCase):
+    """Unit test AnswerViewSet.suggestions() — request validation and AQL wiring."""
+
+    def setUp(self):
+        self.user = _mock_user()
+
+    def _request(self, query):
+        factory = RequestFactory()
+        raw = factory.get("/answers/suggestions/", query)
+        req = Request(raw)
+        req.user = self.user
+
+        def aql_execute(q, bind_vars=None):
+            if "COLLECT" in q:
+                return iter([{"value": "Yes", "count": 3}, {"value": "No", "count": 1}])
+            return iter(["AL-001", "AL-002"])  # visible sample refs lookup
+
+        db = MagicMock()
+        db.aql.execute.side_effect = aql_execute
+        req.arangodb = db
+        req.arango_error = None
+        return req, db
+
+    def _make_viewset(self, request):
+        from data.views import AnswerViewSet
+        vs = AnswerViewSet()
+        vs.request = request
+        return vs
+
+    def test_missing_question_id_400(self):
+        req, _ = self._request({"field": "form"})
+        resp = self._make_viewset(req).suggestions(req)
+        self.assertEqual(resp.status_code, 400)
+
+    def test_missing_field_400(self):
+        req, _ = self._request({"question_id": "1"})
+        resp = self._make_viewset(req).suggestions(req)
+        self.assertEqual(resp.status_code, 400)
+
+    def test_non_integer_question_id_400(self):
+        req, _ = self._request({"question_id": "abc", "field": "form"})
+        resp = self._make_viewset(req).suggestions(req)
+        self.assertEqual(resp.status_code, 400)
+
+    def test_protected_field_rejected(self):
+        req, _ = self._request({"question_id": "1", "field": "sample"})
+        resp = self._make_viewset(req).suggestions(req)
+        self.assertEqual(resp.status_code, 400)
+
+    def test_valid_request_returns_suggestions(self):
+        req, db = self._request({"question_id": "1", "field": "form", "q": "y"})
+        resp = self._make_viewset(req).suggestions(req)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data, [{"value": "Yes", "count": 3}, {"value": "No", "count": 1}])
+
+        collect_call = next(c for c in db.aql.execute.call_args_list if "COLLECT" in c.args[0])
+        bind_vars = collect_call.kwargs["bind_vars"]
+        self.assertEqual(bind_vars["qid"], 1)
+        self.assertEqual(bind_vars["field"], "form")
+        self.assertEqual(bind_vars["q"], "y")
+
+
 # ---------------------------------------------------------------------------
 # Phrase test fixtures
 #

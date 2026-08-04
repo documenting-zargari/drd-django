@@ -196,7 +196,11 @@ class MasterPhraseSerializer(ArangoModelSerializer):
 
     def to_representation(self, instance):
         exclude_fields = ["_rev", "_id"]
-        result = {k: v for k, v in instance.items() if k not in exclude_fields}
+        # retrieve() passes a raw Arango document (dict); list() passes
+        # MasterPhrase model instances (via MasterPhrase.all()) — normalize
+        # both to a dict before filtering.
+        data = instance if isinstance(instance, dict) else instance.to_dict()
+        result = {k: v for k, v in data.items() if k not in exclude_fields}
         return result
 
 

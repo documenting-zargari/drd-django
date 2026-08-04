@@ -347,6 +347,7 @@ class ResearchQuestionViewSet(ArangoModelViewSet):
             """
             FOR q IN ResearchQuestions
                 FILTER REGEX_TEST(q.name, @pattern, true)
+                FILTER q.is_leaf == true
                 SORT q.id
                 LIMIT 50
                 RETURN q
@@ -1132,6 +1133,8 @@ class MasterPhraseViewSet(ArangoModelViewSet):
       for one phrase concept (public read — used by the admin "Edit Phrase
       Concept" modal, and cheaper than the old approach of denormalizing
       question_ids onto every bulk phrase list/search response)
+    - GET /master-phrases/ - list all MasterPhrase docs (phrase_ref/english/conjugated/
+      question_ids/category_ids), unpaginated — used by the admin "Edit Master Phrases" list.
     - PATCH /master-phrases/{phrase_ref}/ - update english/conjugated/question_ids/category_ids
 
     Editing a MasterPhrase affects every sample of that phrase at once, and
@@ -1172,6 +1175,30 @@ class MasterPhraseViewSet(ArangoModelViewSet):
                 {"error": f"No editable fields provided. Allowed: {sorted(self.EDITABLE_FIELDS)}"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        if updates.get("question_ids"):
+            valid = set(db.aql.execute(
+                "FOR q IN ResearchQuestions FILTER q.id IN @ids AND q.is_leaf == true RETURN q.id",
+                bind_vars={"ids": updates["question_ids"]},
+            ))
+            bad = set(updates["question_ids"]) - valid
+            if bad:
+                return Response(
+                    {"error": f"Not valid research question ids: {sorted(bad)}"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        if updates.get("category_ids"):
+            valid = set(db.aql.execute(
+                "FOR c IN Categories FILTER c.id IN @ids AND c.has_children == true AND c.is_leaf != true RETURN c.id",
+                bind_vars={"ids": updates["category_ids"]},
+            ))
+            bad = set(updates["category_ids"]) - valid
+            if bad:
+                return Response(
+                    {"error": f"Not valid category ids: {sorted(bad)}"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
         db.collection(self.model.collection_name).update({"_key": pk, **updates})
         updated = db.collection(self.model.collection_name).get(pk)
@@ -2166,25 +2193,19 @@ class AnswerViewSet(ArangoModelViewSet):
             if sample_refs:
                 self.validate_samples(sample_refs)
             
-            # Build dynamic AQL query with OR conditions for different questions
+            # Build one match condition per criterion (each targets a single
+            # question_id, so no single Answer doc can ever satisfy two
+            # criteria that name different questions).
             conditions = []
             bind_vars = {}
-            
+
             for i, filter_obj in enumerate(search_filters):
-                qid = filter_obj["question_id"]
-                field = filter_obj["field"]
-                value = filter_obj["value"]
-                
                 # Match value allowing partial matches
-                condition = f"(answer.question_id == @qid_{i} AND answer.{field} LIKE @value_{i})"
-                bind_vars[f"qid_{i}"] = qid
-                bind_vars[f"value_{i}"] = f"%{value}%"
+                condition = f"(answer.question_id == @qid_{i} AND answer.{filter_obj['field']} LIKE @value_{i})"
+                bind_vars[f"qid_{i}"] = filter_obj["question_id"]
+                bind_vars[f"value_{i}"] = f"%{filter_obj['value']}%"
                 conditions.append(condition)
-            
-            # Combine all conditions with AND or OR
-            joiner = f" {operator} "
-            filter_clause = joiner.join(conditions)
-            
+
             # Add sample filtering if provided
             extra_filters = ""
             if sample_refs:
@@ -2196,13 +2217,37 @@ class AnswerViewSet(ArangoModelViewSet):
                 extra_filters += " AND answer.sample IN @visible_samples"
                 bind_vars["visible_samples"] = visible_refs
 
-            # Build final AQL query
-            aql = f"""
-            FOR answer IN Answers
-              FILTER ({filter_clause}){extra_filters}
-              RETURN answer
-            """
-            
+            match_clause = " OR ".join(conditions)
+
+            if operator == "AND" and len(conditions) > 1:
+                # "AND" means every criterion must be satisfied *within the
+                # same sample* (criteria commonly target different
+                # questions, so no single Answer doc can match all of them
+                # at once). Find the samples that satisfy every criterion,
+                # then return the matching answers for those samples.
+                sample_lookups = "\n".join(
+                    f"LET sample_match_{i} = (FOR answer IN Answers "
+                    f"FILTER {conditions[i]}{extra_filters} "
+                    f"RETURN DISTINCT answer.sample)"
+                    for i in range(len(conditions))
+                )
+                intersection = "INTERSECTION(" + ", ".join(
+                    f"sample_match_{i}" for i in range(len(conditions))
+                ) + ")"
+                aql = f"""
+                {sample_lookups}
+                LET qualifying_samples = {intersection}
+                FOR answer IN Answers
+                  FILTER ({match_clause}){extra_filters} AND answer.sample IN qualifying_samples
+                  RETURN answer
+                """
+            else:
+                aql = f"""
+                FOR answer IN Answers
+                  FILTER ({match_clause}){extra_filters}
+                  RETURN answer
+                """
+
             cursor = db.aql.execute(aql, bind_vars=bind_vars)
             answers = [doc for doc in cursor]
             # sort by sample reference

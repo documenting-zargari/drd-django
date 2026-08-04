@@ -1157,6 +1157,14 @@ class MasterPhraseViewSet(ArangoModelViewSet):
             return [IsGlobalAdmin()]
         return [AllowAny()]
 
+    def list(self, request):
+        # Base ArangoModelViewSet.list() has no SORT, so ordering is
+        # whatever Arango happens to return — natsort by phrase_ref to match
+        # every other phrase-listing endpoint (e.g. by_category below).
+        phrases = natsorted(self.get_queryset(), key=lambda m: m.phrase_ref)
+        serializer = self.serializer_class(phrases, many=True, context={"request": request, "view": self})
+        return Response(serializer.data)
+
     def partial_update(self, request, pk=None):
         """
         PATCH /master-phrases/{phrase_ref}/ — update fields shared across

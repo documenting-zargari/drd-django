@@ -1301,8 +1301,12 @@ class MasterPhraseViewSet(ArangoModelViewSet):
                 )
 
         if category_ids:
+            # is_leaf is the only reliable branch/leaf signal — the stored
+            # has_children field is unset on every Categories doc (unlike
+            # CategorySerializer.get_has_children, which computes it live
+            # from actual child docs), so checking it here always rejects.
             valid = set(db.aql.execute(
-                "FOR c IN Categories FILTER c.id IN @ids AND c.has_children == true AND c.is_leaf != true RETURN c.id",
+                "FOR c IN Categories FILTER c.id IN @ids AND c.is_leaf != true RETURN c.id",
                 bind_vars={"ids": category_ids},
             ))
             bad = set(category_ids) - valid
@@ -1364,8 +1368,10 @@ class MasterPhraseViewSet(ArangoModelViewSet):
                 )
 
         if updates.get("category_ids"):
+            # See the matching comment in create() — has_children is unset
+            # on every Categories doc, so is_leaf is the only valid check.
             valid = set(db.aql.execute(
-                "FOR c IN Categories FILTER c.id IN @ids AND c.has_children == true AND c.is_leaf != true RETURN c.id",
+                "FOR c IN Categories FILTER c.id IN @ids AND c.is_leaf != true RETURN c.id",
                 bind_vars={"ids": updates["category_ids"]},
             ))
             bad = set(updates["category_ids"]) - valid

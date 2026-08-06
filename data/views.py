@@ -2,6 +2,7 @@ import csv
 import io
 import json
 import os
+import re
 import shutil
 import uuid
 from datetime import datetime
@@ -26,6 +27,7 @@ from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.viewsets import ViewSet
 from natsort import natsorted
+from arango.exceptions import DocumentInsertError
 
 from data.models import (
     Answer,
@@ -375,6 +377,8 @@ class PhraseViewSet(ArangoModelViewSet):
     - GET /phrases/all-for-sample/?sample=<sample_ref> - Every MasterPhrase, with Romani text where a SamplePhrase exists for this sample
     - GET /phrases/<id>/ - Retrieve specific phrase by ID
     - GET /phrases/by-answer/?answer_key=<key> - Get phrases linked to an answer's research question
+    - POST /phrases/ - Add a per-sample recording of an existing phrase concept (sample/phrase_ref required)
+    - DELETE /phrases/{sample}_{phrase_ref}/ - Delete this one sample's recording only
     - POST /phrases/search/ - Search phrases (see that endpoint for parameters)
     - POST /phrases/export/ - Export matching phrases without pagination (see that endpoint for parameters)
 
@@ -396,8 +400,8 @@ class PhraseViewSet(ArangoModelViewSet):
 
     model = SamplePhrase
     serializer_class = PhraseSerializer
-    http_method_names = ["get", "post", "patch", "head", "options"]
-    permission_classes = [AllowAny]  # GET and search POST are public; PATCH uses per-action override
+    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
+    permission_classes = [AllowAny]  # GET and search POST are public; write actions use per-action override
 
     EDITABLE_FIELDS = {"phrase", "question_overrides"}
 
@@ -411,18 +415,94 @@ class PhraseViewSet(ArangoModelViewSet):
     )
 
     def get_permissions(self):
-        if self.request.method == "PATCH":
+        if self.request.method in ("PATCH", "POST", "DELETE"):
             return [CanEditSample()]
         return [AllowAny()]
 
     def get_sample_ref(self, request):
         """Required by CanEditSample to resolve the target sample."""
         pk = self.kwargs.get("pk")
-        if not pk:
-            return None
+        if pk:
+            db = request.arangodb
+            doc = db.collection(self.model.collection_name).get(pk)
+            return doc.get("sample") if doc else None
+        # POST (create): no pk yet, take the target sample straight from the body.
+        return request.data.get("sample")
+
+    def create(self, request):
+        """
+        POST /phrases/ — add a per-sample recording of an existing phrase
+        concept. Requires editor+ role for the target sample (editors with
+        sample restrictions may only add phrases for their allowed samples).
+
+        Required: sample, phrase_ref (must already name an existing
+        MasterPhrase — create the phrase concept first via
+        POST /master-phrases/ if it doesn't exist yet).
+        Optional: phrase (Romani text; may be left blank and filled in later
+        via PATCH).
+        """
         db = request.arangodb
-        doc = db.collection(self.model.collection_name).get(pk)
-        return doc.get("sample") if doc else None
+        sample_ref = str(request.data.get("sample", "")).strip()
+        phrase_ref = str(request.data.get("phrase_ref", "")).strip()
+        phrase_text = request.data.get("phrase")
+
+        if not sample_ref:
+            return Response({"error": "sample is required"}, status=status.HTTP_400_BAD_REQUEST)
+        if not phrase_ref:
+            return Response({"error": "phrase_ref is required"}, status=status.HTTP_400_BAD_REQUEST)
+        if phrase_text is not None and not isinstance(phrase_text, str):
+            return Response({"error": "phrase must be a string"}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not list(db.collection(Sample.collection_name).find({"sample_ref": sample_ref}, limit=1)):
+            return Response({"error": f"No such sample '{sample_ref}'"}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not db.collection(MasterPhrase.collection_name).get(phrase_ref):
+            return Response(
+                {"error": f"No such phrase concept '{phrase_ref}'. Create it first via POST /master-phrases/."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        key = f"{sample_ref}_{phrase_ref}"
+        collection = db.collection(self.model.collection_name)
+        if collection.get(key):
+            return Response(
+                {"error": f"Phrase '{phrase_ref}' already exists for sample '{sample_ref}'."},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        doc = {
+            "_key": key,
+            "sample": sample_ref,
+            "phrase_ref": phrase_ref,
+            "phrase": phrase_text or None,
+            "question_overrides": {"include": [], "exclude": []},
+        }
+        try:
+            collection.insert(doc)
+        except DocumentInsertError:
+            return Response(
+                {"error": f"Phrase '{phrase_ref}' already exists for sample '{sample_ref}'."},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        created = self._merge_with_master(db, collection.get(key))
+        serializer = self.serializer_class(created, context={"request": request})
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+    def destroy(self, request, pk=None):
+        """
+        DELETE /phrases/{sample}_{phrase_ref}/ — deletes this one sample's
+        recording only. The phrase concept (MasterPhrase: english gloss,
+        linked questions/categories) and every other sample's recording of
+        it are untouched — for that, see MasterPhraseViewSet.destroy()
+        instead. Requires editor+ role for this phrase's sample.
+        """
+        db = request.arangodb
+        collection = db.collection(self.model.collection_name)
+        if not collection.get(pk):
+            raise NotFound(detail="Phrase not found")
+        collection.delete(pk)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     @staticmethod
     def _merge_with_master(db, sample_phrase):
@@ -1135,7 +1215,12 @@ class MasterPhraseViewSet(ArangoModelViewSet):
       question_ids onto every bulk phrase list/search response)
     - GET /master-phrases/ - list all MasterPhrase docs (phrase_ref/english/conjugated/
       question_ids/category_ids), unpaginated — used by the admin "Edit Master Phrases" list.
+    - POST /master-phrases/ - create a new phrase concept (phrase_ref/english required)
     - PATCH /master-phrases/{phrase_ref}/ - update english/conjugated/question_ids/category_ids
+    - GET /master-phrases/{phrase_ref}/impact/ - count + sample_refs of every SamplePhrase
+      recording this phrase concept, for the delete confirmation below
+    - DELETE /master-phrases/{phrase_ref}/ - delete this phrase concept AND every sample's
+      recording of it (cascade) — see destroy() docstring
 
     Editing a MasterPhrase affects every sample of that phrase at once, and
     defines the phrase concept itself (english gloss, which research
@@ -1148,12 +1233,13 @@ class MasterPhraseViewSet(ArangoModelViewSet):
 
     model = MasterPhrase
     serializer_class = MasterPhraseSerializer
-    http_method_names = ["get", "patch", "head", "options"]
+    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
 
     EDITABLE_FIELDS = {"english", "conjugated", "question_ids", "category_ids"}
+    PHRASE_REF_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
     def get_permissions(self):
-        if self.request.method == "PATCH":
+        if self.request.method in ("POST", "PATCH", "DELETE"):
             return [IsGlobalAdmin()]
         return [AllowAny()]
 
@@ -1164,6 +1250,87 @@ class MasterPhraseViewSet(ArangoModelViewSet):
         phrases = natsorted(self.get_queryset(), key=lambda m: m.phrase_ref)
         serializer = self.serializer_class(phrases, many=True, context={"request": request, "view": self})
         return Response(serializer.data)
+
+    def create(self, request):
+        """
+        POST /master-phrases/ — create a new phrase concept.
+
+        Required: phrase_ref, english. Optional: conjugated, question_ids,
+        category_ids (validated the same way as PATCH, below).
+
+        phrase_ref becomes the doc's _key (see MasterPhrase docstring), so
+        it must be unique and safe as an Arango key — checked explicitly
+        first for a clean 409, with the insert itself as a second line of
+        defense against a concurrent create of the same ref.
+        """
+        db = request.arangodb
+        data = request.data
+
+        phrase_ref = str(data.get("phrase_ref", "")).strip()
+        english = str(data.get("english", "")).strip()
+        if not phrase_ref:
+            return Response({"error": "phrase_ref is required"}, status=status.HTTP_400_BAD_REQUEST)
+        if not self.PHRASE_REF_RE.match(phrase_ref):
+            return Response(
+                {"error": "phrase_ref may only contain letters, digits, underscores and hyphens"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not english:
+            return Response({"error": "english is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        collection = db.collection(self.model.collection_name)
+        if collection.get(phrase_ref):
+            return Response(
+                {"error": f"Phrase number '{phrase_ref}' already exists."},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        question_ids = data.get("question_ids") or []
+        category_ids = data.get("category_ids") or []
+
+        if question_ids:
+            valid = set(db.aql.execute(
+                "FOR q IN ResearchQuestions FILTER q.id IN @ids AND q.is_leaf == true RETURN q.id",
+                bind_vars={"ids": question_ids},
+            ))
+            bad = set(question_ids) - valid
+            if bad:
+                return Response(
+                    {"error": f"Not valid research question ids: {sorted(bad)}"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        if category_ids:
+            valid = set(db.aql.execute(
+                "FOR c IN Categories FILTER c.id IN @ids AND c.has_children == true AND c.is_leaf != true RETURN c.id",
+                bind_vars={"ids": category_ids},
+            ))
+            bad = set(category_ids) - valid
+            if bad:
+                return Response(
+                    {"error": f"Not valid category ids: {sorted(bad)}"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        doc = {
+            "_key": phrase_ref,
+            "phrase_ref": phrase_ref,
+            "english": english,
+            "conjugated": bool(data.get("conjugated", False)),
+            "question_ids": question_ids,
+            "category_ids": category_ids,
+        }
+        try:
+            collection.insert(doc)
+        except DocumentInsertError:
+            return Response(
+                {"error": f"Phrase number '{phrase_ref}' already exists."},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        created = collection.get(phrase_ref)
+        serializer = self.serializer_class(created, context={"request": request})
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
 
     def partial_update(self, request, pk=None):
         """
@@ -1212,6 +1379,44 @@ class MasterPhraseViewSet(ArangoModelViewSet):
         updated = db.collection(self.model.collection_name).get(pk)
         serializer = self.serializer_class(updated, context={"request": request})
         return Response(serializer.data)
+
+    @action(detail=True, methods=["get"], url_path="impact")
+    def impact(self, request, pk=None):
+        """
+        GET /master-phrases/{phrase_ref}/impact/ — how many samples have a
+        recording of this phrase concept, and which ones. Backs the "Delete
+        Phrase Concept" confirmation dialog (destroy() below), so the admin
+        sees what's about to be cascade-deleted before confirming. Public
+        read, same as the rest of this viewset's GETs.
+        """
+        db = request.arangodb
+        if not db.collection(self.model.collection_name).get(pk):
+            raise NotFound(detail="MasterPhrase not found")
+
+        samples = natsorted(db.aql.execute(
+            "FOR sp IN SamplePhrases FILTER sp.phrase_ref == @phrase_ref RETURN sp.sample",
+            bind_vars={"phrase_ref": pk},
+        ))
+        return Response({"phrase_ref": pk, "count": len(samples), "samples": samples})
+
+    def destroy(self, request, pk=None):
+        """
+        DELETE /master-phrases/{phrase_ref}/ — permanently deletes this
+        phrase concept AND every sample's recording of it (cascade delete
+        of the matching SamplePhrases). Rare and destructive by design —
+        the client is expected to call impact() first and have the admin
+        confirm against its counts/sample list. Global-admin only.
+        """
+        db = request.arangodb
+        if not db.collection(self.model.collection_name).get(pk):
+            raise NotFound(detail="MasterPhrase not found")
+
+        db.aql.execute(
+            "FOR sp IN SamplePhrases FILTER sp.phrase_ref == @phrase_ref REMOVE sp IN SamplePhrases",
+            bind_vars={"phrase_ref": pk},
+        )
+        db.collection(self.model.collection_name).delete(pk)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class SampleViewSet(ArangoModelViewSet):

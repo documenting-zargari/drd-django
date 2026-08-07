@@ -403,7 +403,7 @@ class PhraseViewSet(ArangoModelViewSet):
     http_method_names = ["get", "post", "patch", "delete", "head", "options"]
     permission_classes = [AllowAny]  # GET and search POST are public; write actions use per-action override
 
-    EDITABLE_FIELDS = {"phrase", "question_overrides"}
+    EDITABLE_FIELDS = {"phrase", "question_overrides", "category_overrides"}
 
     # Resolved question_ids for display/matching: the MasterPhrase's own
     # links, plus this SamplePhrase's question_overrides.include, minus its
@@ -412,6 +412,14 @@ class PhraseViewSet(ArangoModelViewSet):
     RESOLVED_QUESTION_IDS_AQL = (
         "MINUS(UNION_DISTINCT((m.question_ids || []), (sp.question_overrides.include || [])), "
         "(sp.question_overrides.exclude || []))"
+    )
+
+    # Same idea as RESOLVED_QUESTION_IDS_AQL but for category-level
+    # exceptions (category_overrides) layered on the MasterPhrase's own
+    # category_ids.
+    RESOLVED_CATEGORY_IDS_AQL = (
+        "MINUS(UNION_DISTINCT((m.category_ids || []), (sp.category_overrides.include || [])), "
+        "(sp.category_overrides.exclude || []))"
     )
 
     def get_permissions(self):
@@ -476,6 +484,7 @@ class PhraseViewSet(ArangoModelViewSet):
             "phrase_ref": phrase_ref,
             "phrase": phrase_text or None,
             "question_overrides": {"include": [], "exclude": []},
+            "category_overrides": {"include": [], "exclude": []},
         }
         try:
             collection.insert(doc)
@@ -528,27 +537,66 @@ class PhraseViewSet(ArangoModelViewSet):
         )
 
     @staticmethod
-    def _validate_question_overrides(value):
+    def _resolve_category_ids_for_sample_phrase(master, sample_phrase):
+        """Same computation as _resolve_question_ids_for_sample_phrase, for
+        the category-level counterpart (category_overrides)."""
+        overrides = sample_phrase.get("category_overrides") or {}
+        master_category_ids = (master or {}).get("category_ids") or []
+        return sorted(
+            (set(master_category_ids) | set(overrides.get("include") or []))
+            - set(overrides.get("exclude") or [])
+        )
+
+    @staticmethod
+    def _validate_id_overrides(db, value, field_name, want_leaf):
+        """Shared validator for question_overrides (want_leaf=True, ids must
+        be ResearchQuestions) and category_overrides (want_leaf=False, ids
+        must be branch Categories) — same is_leaf split MasterPhraseViewSet
+        uses for question_ids/category_ids (see its create()/partial_update()
+        for why has_children can't be used: it's unset on every Categories
+        doc)."""
         if value is None:
             return {"include": [], "exclude": []}
         if not isinstance(value, dict):
-            raise ValidationError("question_overrides must be an object with include/exclude arrays")
+            raise ValidationError(f"{field_name} must be an object with include/exclude arrays")
         include = value.get("include") or []
         exclude = value.get("exclude") or []
         if not all(isinstance(v, int) for v in include) or not all(isinstance(v, int) for v in exclude):
-            raise ValidationError("question_overrides.include/exclude must be arrays of research question ids")
+            raise ValidationError(f"{field_name}.include/exclude must be arrays of ids")
+
+        ids = set(include) | set(exclude)
+        if ids:
+            if want_leaf:
+                valid = set(db.aql.execute(
+                    "FOR q IN ResearchQuestions FILTER q.id IN @ids AND q.is_leaf == true RETURN q.id",
+                    bind_vars={"ids": list(ids)},
+                ))
+            else:
+                valid = set(db.aql.execute(
+                    "FOR c IN Categories FILTER c.id IN @ids AND c.is_leaf != true RETURN c.id",
+                    bind_vars={"ids": list(ids)},
+                ))
+            bad = ids - valid
+            if bad:
+                kind = "research question" if want_leaf else "category"
+                raise ValidationError(f"Not valid {kind} ids for {field_name}: {sorted(bad)}")
+
         return {"include": sorted(set(include)), "exclude": sorted(set(exclude))}
 
     def partial_update(self, request, pk=None):
         """
         PATCH /phrases/{sample}_{phrase_ref}/ — update the per-sample phrase
-        text and/or its question_overrides (rare, sample-scoped exceptions
-        to the MasterPhrase's linked research questions — see
-        question_overrides docstring on RESOLVED_QUESTION_IDS_AQL / by_answer).
+        text and/or its question_overrides/category_overrides (rare,
+        sample-scoped exceptions to the MasterPhrase's linked research
+        questions/categories — see question_overrides docstring on
+        RESOLVED_QUESTION_IDS_AQL / by_answer; category_overrides works the
+        same way one level up, via RESOLVED_CATEGORY_IDS_AQL and the
+        matching hierarchy_ids-intersection logic in _phrase_override_includes
+        / _phrases_by_category / _phrases_by_explicit_refs).
         Requires editor+ role. Editors with sample restrictions may only
         edit phrases belonging to their allowed samples.
 
-        Allowed fields: phrase, question_overrides
+        Allowed fields: phrase, question_overrides, category_overrides
         """
         db = request.arangodb
         doc = db.collection(self.model.collection_name).get(pk)
@@ -562,7 +610,11 @@ class PhraseViewSet(ArangoModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         if "question_overrides" in updates:
-            updates["question_overrides"] = self._validate_question_overrides(updates["question_overrides"])
+            updates["question_overrides"] = self._validate_id_overrides(
+                db, updates["question_overrides"], "question_overrides", want_leaf=True)
+        if "category_overrides" in updates:
+            updates["category_overrides"] = self._validate_id_overrides(
+                db, updates["category_overrides"], "category_overrides", want_leaf=False)
 
         db.collection(self.model.collection_name).update({"_key": pk, **updates})
         updated = self._merge_with_master(db, db.collection(self.model.collection_name).get(pk))
@@ -576,12 +628,13 @@ class PhraseViewSet(ArangoModelViewSet):
         search/by-answer/by-category/related responses (bulky: averages
         ~56 question_ids per phrase, unused by any bulk-list consumer).
         Fetch this for one phrase on demand, e.g. when an edit modal opens
-        and needs to display/edit its linked research questions.
+        and needs to display/edit its linked research questions/categories.
 
-        Returns: { question_ids, category_ids, question_overrides }
-        question_ids is RESOLVED: the MasterPhrase's own links, plus this
-        SamplePhrase's question_overrides.include, minus its exclude —
-        same computation as RESOLVED_QUESTION_IDS_AQL elsewhere in this file.
+        Returns: { question_ids, category_ids, question_overrides, category_overrides }
+        question_ids/category_ids are RESOLVED: the MasterPhrase's own
+        links, plus this SamplePhrase's own overrides.include, minus its
+        overrides.exclude — same computation as RESOLVED_QUESTION_IDS_AQL/
+        RESOLVED_CATEGORY_IDS_AQL elsewhere in this file.
         """
         db = request.arangodb
         sample_phrase = db.collection(self.model.collection_name).get(pk)
@@ -589,13 +642,18 @@ class PhraseViewSet(ArangoModelViewSet):
             raise NotFound(detail="Phrase not found")
 
         master = db.collection(MasterPhrase.collection_name).get(sample_phrase["phrase_ref"])
-        overrides = sample_phrase.get("question_overrides") or {}
+        q_overrides = sample_phrase.get("question_overrides") or {}
+        c_overrides = sample_phrase.get("category_overrides") or {}
         return Response({
             "question_ids": self._resolve_question_ids_for_sample_phrase(master, sample_phrase),
-            "category_ids": (master or {}).get("category_ids") or [],
+            "category_ids": self._resolve_category_ids_for_sample_phrase(master, sample_phrase),
             "question_overrides": {
-                "include": overrides.get("include") or [],
-                "exclude": overrides.get("exclude") or [],
+                "include": q_overrides.get("include") or [],
+                "exclude": q_overrides.get("exclude") or [],
+            },
+            "category_overrides": {
+                "include": c_overrides.get("include") or [],
+                "exclude": c_overrides.get("exclude") or [],
             },
         })
 
@@ -737,13 +795,22 @@ class PhraseViewSet(ArangoModelViewSet):
 
     def _phrase_override_includes(self, db, category_id, sample, exclude):
         """SamplePhrases in this sample that declare relevance to category_id
-        via their own question_overrides.include, regardless of whether the
-        MasterPhrase itself matches. Shared by _phrases_by_category and
-        by_answer's Answer.phrase_overrides.include branch."""
+        via their own question_overrides.include (direct) or
+        category_overrides.include (covers category_id's whole subtree, via
+        the same hierarchy_ids-intersection trick MasterPhrase.category_ids
+        matching uses), regardless of whether the MasterPhrase itself
+        matches. Shared by _phrases_by_category, _phrases_by_explicit_refs,
+        and by_answer's Answer.phrase_overrides.include branch."""
+        hierarchy_ids = _get_question_hierarchy_ids(db, category_id)
+        if hierarchy_ids is None:
+            return []
         aql = """
             FOR sp IN SamplePhrases
                 FILTER sp.sample == @sample
-                FILTER @category_id IN (sp.question_overrides.include || [])
+                FILTER LENGTH(INTERSECTION(
+                    UNION_DISTINCT((sp.question_overrides.include || []), (sp.category_overrides.include || [])),
+                    @hierarchy_ids
+                )) > 0
                 FILTER sp.phrase_ref NOT IN @exclude
                 LET m = DOCUMENT(CONCAT("MasterPhrases/", sp.phrase_ref))
                 RETURN MERGE(sp, {
@@ -751,7 +818,7 @@ class PhraseViewSet(ArangoModelViewSet):
                     conjugated: m.conjugated
                 })
         """
-        return list(db.aql.execute(aql, bind_vars={'sample': sample, 'category_id': category_id, 'exclude': exclude}))
+        return list(db.aql.execute(aql, bind_vars={'sample': sample, 'hierarchy_ids': hierarchy_ids, 'exclude': exclude}))
 
     def _phrases_by_category(self, db, category_id, sample, exclude=None, ignore_sample_overrides=False):
         """
@@ -761,16 +828,17 @@ class PhraseViewSet(ArangoModelViewSet):
 
         Matches MasterPhrase.question_ids/category_ids covering category_id,
         joined to this sample's SamplePhrase, with SamplePhrase.question_overrides
-        layered on top (exclude subtracts a phrase; include adds one even if
-        the MasterPhrase wouldn't otherwise match). `exclude` is an optional
-        list of phrase_refs to additionally drop (used by by_answer for its
+        and category_overrides layered on top (exclude subtracts a phrase;
+        include adds one even if the MasterPhrase wouldn't otherwise match —
+        see _phrase_override_includes). `exclude` is an optional list of
+        phrase_refs to additionally drop (used by by_answer for its
         Answer.phrase_overrides.exclude).
 
         `ignore_sample_overrides=True` skips both the exclude filter and the
         include union, returning the master-link-only baseline regardless of
-        any SamplePhrase.question_overrides — used by the Tables cell edit
-        dialog to tell a phrase that's naturally linked apart from one that's
-        only present due to a question_overrides.include exception, which
+        any SamplePhrase.question_overrides/category_overrides — used by the
+        Tables cell edit dialog to tell a phrase that's naturally linked
+        apart from one that's only present via an include exception, which
         otherwise look identical (the exception applies unconditionally, not
         just when reading through a specific Answer).
         """
@@ -779,7 +847,14 @@ class PhraseViewSet(ArangoModelViewSet):
         if hierarchy_ids is None:
             return []
 
-        exclude_filter = "" if ignore_sample_overrides else "FILTER @category_id NOT IN (sp.question_overrides.exclude || [])"
+        # A category-level exclude covers category_id's whole subtree (same
+        # hierarchy_ids-intersection trick as MasterPhrase.category_ids
+        # matching above), not just an exact id match — a category exception
+        # a level or more above the queried question still applies.
+        exclude_filter = "" if ignore_sample_overrides else """FILTER LENGTH(INTERSECTION(
+                    UNION_DISTINCT((sp.question_overrides.exclude || []), (sp.category_overrides.exclude || [])),
+                    @hierarchy_ids
+                )) == 0"""
         aql = f"""
             FOR m IN MasterPhrases
                 FILTER (@category_id IN (m.question_ids || [])
@@ -812,19 +887,23 @@ class PhraseViewSet(ArangoModelViewSet):
         """Phrases named directly by Answer.phrase_overrides.include (the
         ~65 divergent-question case), plus the same SamplePhrase-level
         include union _phrases_by_category applies."""
+        hierarchy_ids = _get_question_hierarchy_ids(db, category_id) or []
         aql = """
             FOR phrase_ref IN @include
                 FILTER phrase_ref NOT IN @exclude
                 LET sp = DOCUMENT(CONCAT("SamplePhrases/", @sample, "_", phrase_ref))
                 FILTER sp != null
-                FILTER @category_id NOT IN (sp.question_overrides.exclude || [])
+                FILTER LENGTH(INTERSECTION(
+                    UNION_DISTINCT((sp.question_overrides.exclude || []), (sp.category_overrides.exclude || [])),
+                    @hierarchy_ids
+                )) == 0
                 LET m = DOCUMENT(CONCAT("MasterPhrases/", phrase_ref))
                 RETURN MERGE(sp, {
                     english: m.english,
                     conjugated: m.conjugated
                 })
         """
-        bind_vars = {'include': include, 'exclude': exclude, 'sample': sample, 'category_id': category_id}
+        bind_vars = {'include': include, 'exclude': exclude, 'sample': sample, 'hierarchy_ids': hierarchy_ids}
         phrases = list(db.aql.execute(aql, bind_vars=bind_vars))
         overrides = self._phrase_override_includes(db, category_id, sample, exclude)
         seen_keys = {p['_key'] for p in phrases}

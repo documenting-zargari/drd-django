@@ -2148,6 +2148,15 @@ class AnswerViewSet(ArangoModelViewSet):
         PUT /answers/create/ — create a new answer for a question+sample.
         Requires editor+ role.
 
+        Some research questions intentionally accept more than one answer
+        per sample (surfaced client-side by a [foreach]-templated table
+        column — see Tables' "Add another answer" in Edit Mode), so this
+        does not reject when one already exists; duplicate creation for a
+        genuinely single-answer question is prevented by the client only
+        ever calling this once per cell (no existing answer to begin with)
+        or via the explicit multi-answer affordance, not by a server-side
+        uniqueness rule.
+
         Body: { question_id, sample, field, value }
         """
         db = request.arangodb
@@ -2181,22 +2190,6 @@ class AnswerViewSet(ArangoModelViewSet):
         if not questions:
             raise NotFound(detail=f"Question {question_id} not found")
         question = questions[0]
-
-        # Reject if an answer already exists for this question+sample
-        existing_cursor = db.aql.execute(
-            """
-            FOR q IN ResearchQuestions FILTER q.id == @qid
-              FOR a IN 1..1 OUTBOUND q GivesAnswer
-                FILTER a.sample == @sample
-                RETURN a._key
-            """,
-            bind_vars={"qid": question_id, "sample": sample},
-        )
-        if list(existing_cursor):
-            return Response(
-                {"error": "An answer already exists for this question and sample"},
-                status=status.HTTP_409_CONFLICT,
-            )
 
         # Insert the new answer document
         new_doc = {"sample": sample, "question_id": question_id, field: value}

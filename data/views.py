@@ -1301,6 +1301,8 @@ class MasterPhraseViewSet(ArangoModelViewSet):
       recording this phrase concept, for the delete confirmation below
     - GET /master-phrases/{phrase_ref}/translations/ - per-language translations of
       this phrase's English gloss (english field above is the English one)
+    - PATCH /master-phrases/{phrase_ref}/translations/ - replace the per-language
+      translations list (upserts the Translations doc); global-admin only
     - DELETE /master-phrases/{phrase_ref}/ - delete this phrase concept AND every sample's
       recording of it (cascade) — see destroy() docstring
 
@@ -1487,28 +1489,73 @@ class MasterPhraseViewSet(ArangoModelViewSet):
         ))
         return Response({"phrase_ref": pk, "count": len(samples), "samples": samples})
 
-    @action(detail=True, methods=["get"], url_path="translations")
+    @action(detail=True, methods=["get", "patch"], url_path="translations")
     def translations(self, request, pk=None):
         """
-        GET /master-phrases/{phrase_ref}/translations/ — per-language
+        GET/PATCH /master-phrases/{phrase_ref}/translations/ — per-language
         translations of this phrase's English gloss (MasterPhrase.english
-        is the English one; this is the rest). Translations is keyed
+        is the English one; this holds the rest). Translations is keyed
         directly by phrase_ref (see PhraseTranslation model docstring), so
-        this is a single DOCUMENT lookup — no PhraseAnchors/TranslatesTo
-        hop. Public read, same as the rest of this viewset's GETs.
+        this is a single DOCUMENT lookup/upsert — no PhraseAnchors/TranslatesTo
+        hop. GET is public read, same as the rest of this viewset's GETs;
+        PATCH is global-admin only (see get_permissions above, which already
+        gates every PATCH on this viewset).
 
         Not every MasterPhrase necessarily has a Translations doc (e.g. one
-        created after the migration via POST /master-phrases/), so this
-        returns an empty list rather than 404 in that case.
+        created after the migration via POST /master-phrases/), so GET
+        returns an empty list rather than 404 in that case, and PATCH
+        upserts (insert if missing, replace if present) rather than
+        requiring the doc to pre-exist.
+
+        PATCH body: {"translations": [{"language": str, "translation": str}, ...]}
+        — replaces the whole list (matches the shape written at import time,
+        see extract/manual_extraction/phrases.py).
         """
         db = request.arangodb
         if not db.collection(self.model.collection_name).get(pk):
             raise NotFound(detail="MasterPhrase not found")
 
-        doc = db.collection("Translations").get(pk)
-        serializer = PhraseTranslationSerializer(
-            doc or {"phrase_ref": pk, "translations": []}, context={"request": request}
-        )
+        collection = db.collection("Translations")
+
+        if request.method == "GET":
+            doc = collection.get(pk)
+            serializer = PhraseTranslationSerializer(
+                doc or {"phrase_ref": pk, "translations": []}, context={"request": request}
+            )
+            return Response(serializer.data)
+
+        # PATCH
+        translations = request.data.get("translations")
+        if not isinstance(translations, list):
+            return Response(
+                {"error": "translations must be a list"}, status=status.HTTP_400_BAD_REQUEST
+            )
+        for item in translations:
+            if (
+                not isinstance(item, dict)
+                or not str(item.get("language", "")).strip()
+                or not str(item.get("translation", "")).strip()
+            ):
+                return Response(
+                    {"error": "each translation needs a non-empty language and translation"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        doc = {
+            "_key": pk,
+            "phrase_ref": pk,
+            "translations": [
+                {"language": str(t["language"]).strip(), "translation": str(t["translation"]).strip()}
+                for t in translations
+            ],
+        }
+        if collection.get(pk):
+            collection.update(doc)
+        else:
+            collection.insert(doc)
+
+        updated = collection.get(pk)
+        serializer = PhraseTranslationSerializer(updated, context={"request": request})
         return Response(serializer.data)
 
     def destroy(self, request, pk=None):

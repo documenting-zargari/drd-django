@@ -6,6 +6,7 @@ from data.models import (
     Answer,
     Category,
     MasterPhrase,
+    PhraseTranslation,
     ResearchQuestion,
     Sample,
     SamplePhrase,
@@ -199,6 +200,23 @@ class MasterPhraseSerializer(ArangoModelSerializer):
         # retrieve() passes a raw Arango document (dict); list() passes
         # MasterPhrase model instances (via MasterPhrase.all()) — normalize
         # both to a dict before filtering.
+        data = instance if isinstance(instance, dict) else instance.to_dict()
+        result = {k: v for k, v in data.items() if k not in exclude_fields}
+        return result
+
+
+class PhraseTranslationSerializer(ArangoModelSerializer):
+    class Meta:
+        model = PhraseTranslation
+        fields = [
+            "phrase_ref",
+            "translations",
+        ]
+
+    def to_representation(self, instance):
+        exclude_fields = ["_rev", "_id"]
+        # Same normalization as MasterPhraseSerializer — retrieve() passes a
+        # raw Arango document (dict).
         data = instance if isinstance(instance, dict) else instance.to_dict()
         result = {k: v for k, v in data.items() if k not in exclude_fields}
         return result

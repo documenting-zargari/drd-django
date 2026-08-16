@@ -45,6 +45,19 @@ class MasterPhrase(ArangoModel):
         return self.english
 
 
+class PhraseTranslation(ArangoModel):
+    """One doc per MasterPhrase, keyed by phrase_ref (same DOCUMENT(CONCAT(...))
+    lookup pattern as MasterPhrases/SamplePhrases) — the per-language
+    translations of that phrase's English gloss. Bypasses the old
+    PhraseAnchors + TranslatesTo edge hop; see
+    extract/master_phrases_migration/link_translations_to_master_phrases.py."""
+
+    collection_name = "Translations"
+
+    def _str_(self):
+        return f"Translations for phrase {self.phrase_ref}"
+
+
 class SamplePhrase(ArangoModel):
     """One doc per (sample, phrase_ref) recording, keyed by
     '{sample}_{phrase_ref}'. Replaces the old Phrases collection."""

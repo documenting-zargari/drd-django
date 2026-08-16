@@ -45,6 +45,7 @@ from data.serializers import (
     CategorySerializer,
     MasterPhraseSerializer,
     PhraseSerializer,
+    PhraseTranslationSerializer,
     ResearchQuestionSerializer,
     SampleSerializer,
     SourceSerializer,
@@ -1298,6 +1299,8 @@ class MasterPhraseViewSet(ArangoModelViewSet):
     - PATCH /master-phrases/{phrase_ref}/ - update english/conjugated/question_ids/category_ids
     - GET /master-phrases/{phrase_ref}/impact/ - count + sample_refs of every SamplePhrase
       recording this phrase concept, for the delete confirmation below
+    - GET /master-phrases/{phrase_ref}/translations/ - per-language translations of
+      this phrase's English gloss (english field above is the English one)
     - DELETE /master-phrases/{phrase_ref}/ - delete this phrase concept AND every sample's
       recording of it (cascade) — see destroy() docstring
 
@@ -1483,6 +1486,30 @@ class MasterPhraseViewSet(ArangoModelViewSet):
             bind_vars={"phrase_ref": pk},
         ))
         return Response({"phrase_ref": pk, "count": len(samples), "samples": samples})
+
+    @action(detail=True, methods=["get"], url_path="translations")
+    def translations(self, request, pk=None):
+        """
+        GET /master-phrases/{phrase_ref}/translations/ — per-language
+        translations of this phrase's English gloss (MasterPhrase.english
+        is the English one; this is the rest). Translations is keyed
+        directly by phrase_ref (see PhraseTranslation model docstring), so
+        this is a single DOCUMENT lookup — no PhraseAnchors/TranslatesTo
+        hop. Public read, same as the rest of this viewset's GETs.
+
+        Not every MasterPhrase necessarily has a Translations doc (e.g. one
+        created after the migration via POST /master-phrases/), so this
+        returns an empty list rather than 404 in that case.
+        """
+        db = request.arangodb
+        if not db.collection(self.model.collection_name).get(pk):
+            raise NotFound(detail="MasterPhrase not found")
+
+        doc = db.collection("Translations").get(pk)
+        serializer = PhraseTranslationSerializer(
+            doc or {"phrase_ref": pk, "translations": []}, context={"request": request}
+        )
+        return Response(serializer.data)
 
     def destroy(self, request, pk=None):
         """

@@ -13,6 +13,7 @@ https://docs.djangoproject.com/en/5.1/ref/settings/
 import os
 from pathlib import Path
 
+import dj_database_url
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / '.env')
 
@@ -154,26 +155,10 @@ WSGI_APPLICATION = "roma.wsgi.application"
 # https://docs.djangoproject.com/en/5.1/ref/settings/#databases
 
 DATABASES = {
-    "data": {
-        "ENGINE": "django.db.backends.mysql",
-        "NAME": os.getenv("MYSQL_DATA_NAME", "romani"),
-        "USER": os.getenv("MYSQL_DATA_USER", "root"),
-        "PASSWORD": os.getenv("MYSQL_DATA_PASSWORD", ""),
-        "HOST": os.getenv("MYSQL_DATA_HOST", "localhost"),
-        "PORT": os.getenv("MYSQL_DATA_PORT", "3306"),
-    },
-    "default": {
-        "ENGINE": "django.db.backends.mysql",
-        "NAME": os.getenv("MYSQL_DEFAULT_NAME", "rms"),
-        "USER": os.getenv("MYSQL_DEFAULT_USER", "root"),
-        "PASSWORD": os.getenv("MYSQL_DEFAULT_PASSWORD", ""),
-        "HOST": os.getenv("MYSQL_DEFAULT_HOST", "localhost"),
-        "PORT": os.getenv("MYSQL_DEFAULT_PORT", "3306"),
-    },
+    "default": dj_database_url.parse(
+        os.getenv("DATABASE_URL", "postgresql://postgres:@localhost:5432/rms")
+    ),
 }
-DATABASE_ROUTERS = [
-    "roma.dbrouters.DBRouter",
-]
 
 # Password validation
 # https://docs.djangoproject.com/en/5.1/ref/settings/#auth-password-validators

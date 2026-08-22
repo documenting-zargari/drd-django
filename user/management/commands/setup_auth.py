@@ -9,6 +9,7 @@ Usage:
     python manage.py setup_auth --default-password changeme123
 """
 
+import os
 import subprocess
 import sys
 
@@ -70,15 +71,20 @@ class Command(BaseCommand):
         db_user = db_conf.get("USER", "root")
         db_password = db_conf.get("PASSWORD", "")
         db_host = db_conf.get("HOST", "localhost")
-        db_port = db_conf.get("PORT", "3306")
+        db_port = db_conf.get("PORT", "5432")
 
         self.stdout.write(f"\n1. Dropping and recreating database '{db_name}'...")
-        mysql_args = ["mysql", f"-u{db_user}", f"-h{db_host}", f"-P{db_port}"]
+        env = os.environ.copy()
         if db_password:
-            mysql_args.append(f"-p{db_password}")
+            env["PGPASSWORD"] = db_password
+        psql_args = ["psql", "-U", db_user, "-h", db_host, "-p", str(db_port), "-d", "postgres"]
         subprocess.run(
-            mysql_args + ["-e", f"DROP DATABASE IF EXISTS `{db_name}`; CREATE DATABASE `{db_name}`;"],
-            check=True,
+            psql_args + ["-c", f'DROP DATABASE IF EXISTS "{db_name}";'],
+            check=True, env=env,
+        )
+        subprocess.run(
+            psql_args + ["-c", f'CREATE DATABASE "{db_name}";'],
+            check=True, env=env,
         )
         self.stdout.write(self.style.SUCCESS(f"   Database '{db_name}' recreated."))
 

@@ -58,7 +58,7 @@ class ArangoDBMiddleware:
 
     def _ensure_indexes(self, db):
         try:
-            db.collection("Phrases").add_persistent_index(fields=["phrase_ref"])
+            db.collection("SamplePhrases").add_persistent_index(fields=["phrase_ref"])
             db.collection("Samples").add_persistent_index(fields=["sample_ref"])
         except Exception as e:
             logger.warning(f"Could not ensure ArangoDB indexes: {e}")

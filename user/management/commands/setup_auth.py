@@ -1,19 +1,20 @@
 """
 Automated setup for the custom user model.
 
-Drops and recreates the rms database, runs migrations, and re-seeds
+Runs migrations, flushes all data (keeping the schema), and re-seeds
 the 4 known users with their project roles.
+
+Note: this does NOT drop/recreate the database itself. Managed Postgres
+instances typically grant the app role ownership of its one database but
+not CREATEDB, so DROP DATABASE/CREATE DATABASE would fail there (and if
+the DROP succeeds before the CREATE fails, you're left with no database
+at all). `flush` clears all rows without touching the database object.
 
 Usage:
     python manage.py setup_auth
     python manage.py setup_auth --default-password changeme123
 """
 
-import os
-import subprocess
-import sys
-
-from django.conf import settings
 from django.core.management import call_command
 from django.core.management.base import BaseCommand
 
@@ -55,7 +56,7 @@ USERS = [
 
 
 class Command(BaseCommand):
-    help = "Reset rms database, run migrations, and seed users with project roles."
+    help = "Run migrations, flush all data, and seed users with project roles."
 
     def add_arguments(self, parser):
         parser.add_argument(
@@ -66,31 +67,14 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
         default_password = options["default_password"]
-        db_conf = settings.DATABASES["default"]
-        db_name = db_conf["NAME"]
-        db_user = db_conf.get("USER", "root")
-        db_password = db_conf.get("PASSWORD", "")
-        db_host = db_conf.get("HOST", "localhost")
-        db_port = db_conf.get("PORT", "5432")
 
-        self.stdout.write(f"\n1. Dropping and recreating database '{db_name}'...")
-        env = os.environ.copy()
-        if db_password:
-            env["PGPASSWORD"] = db_password
-        psql_args = ["psql", "-U", db_user, "-h", db_host, "-p", str(db_port), "-d", "postgres"]
-        subprocess.run(
-            psql_args + ["-c", f'DROP DATABASE IF EXISTS "{db_name}";'],
-            check=True, env=env,
-        )
-        subprocess.run(
-            psql_args + ["-c", f'CREATE DATABASE "{db_name}";'],
-            check=True, env=env,
-        )
-        self.stdout.write(self.style.SUCCESS(f"   Database '{db_name}' recreated."))
-
-        self.stdout.write("\n2. Running migrations...")
+        self.stdout.write("\n1. Running migrations...")
         call_command("migrate", verbosity=0)
         self.stdout.write(self.style.SUCCESS("   Migrations complete."))
+
+        self.stdout.write("\n2. Flushing all data...")
+        call_command("flush", interactive=False, verbosity=0)
+        self.stdout.write(self.style.SUCCESS("   Database flushed."))
 
         self.stdout.write(f"\n3. Seeding {len(USERS)} users (password: {default_password})...")
         from user.models import CustomUser, UserProjectRole

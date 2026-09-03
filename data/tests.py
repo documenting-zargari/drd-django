@@ -1142,3 +1142,103 @@ class ConcordanceFrequencyTests(SimpleTestCase):
         self.assertEqual(resp.data["fold"], False)
         self.assertEqual(resp.data["total_occurrences"], 3)
         self.assertEqual(resp.data["by_country"], [{"country_code": "AL", "count": 3}])
+
+
+# ---------------------------------------------------------------------------
+# POST /{transcriptions,phrases}/wordlist/  — alphabetical de-duped word list
+# ---------------------------------------------------------------------------
+
+class ConcordanceWordlistTests(SimpleTestCase):
+    def setUp(self):
+        self.user = _mock_user()
+
+    def _run(self, viewset_name, data):
+        from data import views
+        vs = getattr(views, viewset_name)()
+        req = MagicMock(spec=Request)
+        req.data = data
+        req.user = self.user
+        self.calls = []
+
+        def aql(q, bind_vars=None):
+            self.calls.append((q, bind_vars or {}))
+            if "RETURN s.sample_ref" in q and "country_code" not in q:
+                return iter(["AL-001", "AL-002"])
+            if "country_code IN @codes" in q:
+                codes = set((bind_vars or {}).get("codes") or [])
+                return iter([r for r in ["AL-001", "AL-002"] if "AL" in codes])
+            # the wordlist AQL itself
+            return iter([{
+                "count": 2, "total": 5,
+                "results": [{"word": "aro", "count": 3}, {"word": "phral", "count": 2}],
+            }])
+
+        db = MagicMock()
+        db.aql.execute.side_effect = aql
+        req.arangodb = db
+        req.arango_error = None
+        vs.request = req
+        vs.kwargs = {}
+        vs.format_kwarg = None
+        vs.action = "wordlist"
+        return vs.wordlist(req)
+
+    def _wordlist_aql(self):
+        return next(q for q, _ in self.calls if "COLLECT word = w" in q)
+
+    def _wordlist_bind(self):
+        return next(b for q, b in self.calls if "COLLECT word = w" in q)
+
+    def test_transcriptions_wordlist_shape(self):
+        resp = self._run("TranscriptionViewSet", {"sample_refs": ["AL-001"]})
+        self.assertEqual(resp.data["count"], 2)
+        self.assertEqual(resp.data["total"], 5)
+        self.assertEqual(resp.data["page"], 1)
+        self.assertEqual(resp.data["page_size"], 200)
+        self.assertEqual(resp.data["results"][0], {"word": "aro", "count": 3})
+
+    def test_phrases_wordlist_uses_sample_phrases_collection(self):
+        self._run("PhraseViewSet", {})
+        self.assertIn("FOR d IN SamplePhrases", self._wordlist_aql())
+        self.assertIn("TOKENS(d.phrase,", self._wordlist_aql())
+
+    def test_transcriptions_wordlist_uses_transcriptions_collection(self):
+        self._run("TranscriptionViewSet", {})
+        self.assertIn("FOR d IN Transcriptions", self._wordlist_aql())
+        self.assertIn("TOKENS(d.transcription,", self._wordlist_aql())
+
+    def test_fold_selects_analyzer(self):
+        self._run("TranscriptionViewSet", {"fold": True})
+        self.assertIn('"concord_fold"', self._wordlist_aql())
+        self._run("TranscriptionViewSet", {"fold": False})
+        self.assertIn('"concord"', self._wordlist_aql())
+        self.assertNotIn("concord_fold", self._wordlist_aql())
+
+    def test_prefix_and_paging_forwarded(self):
+        self._run("PhraseViewSet", {"prefix": "PhR", "page": 3, "page_size": 50})
+        aql, bind = self._wordlist_aql(), self._wordlist_bind()
+        self.assertIn("STARTS_WITH(w, @prefix)", aql)
+        self.assertEqual(bind["prefix"], "phr")      # lower-cased
+        self.assertEqual(bind["offset"], 100)         # (3 - 1) * 50
+        self.assertEqual(bind["page_size"], 50)
+
+    def test_no_prefix_omits_filter(self):
+        self._run("PhraseViewSet", {})
+        self.assertNotIn("STARTS_WITH", self._wordlist_aql())
+        self.assertNotIn("prefix", self._wordlist_bind())
+
+    def test_sort_count_orders_by_frequency(self):
+        self._run("PhraseViewSet", {"sort": "count"})
+        self.assertIn("SORT r.n DESC", self._wordlist_aql())
+        self._run("PhraseViewSet", {"sort": "alpha"})
+        self.assertIn("SORT r.word", self._wordlist_aql())
+        self.assertNotIn("r.n DESC", self._wordlist_aql())
+
+    def test_country_codes_scope_forwarded_to_sample_refs(self):
+        self._run("PhraseViewSet", {"country_codes": ["AL"]})
+        bind = self._wordlist_bind()
+        self.assertEqual(sorted(bind["sample_refs"]), ["AL-001", "AL-002"])
+
+    def test_page_size_capped_at_1000(self):
+        self._run("TranscriptionViewSet", {"page_size": 99999})
+        self.assertEqual(self._wordlist_bind()["page_size"], 1000)

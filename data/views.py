@@ -93,6 +93,16 @@ def _parse_concord_options(request):
     return match, bool(fold)
 
 
+def _visible_sample_refs(db, user):
+    """All sample refs the user may see (every sample if they opted into hidden
+    ones, otherwise visible == 'Yes' only)."""
+    if user_sees_hidden_samples(user):
+        cursor = db.aql.execute("FOR s IN Samples RETURN s.sample_ref")
+    else:
+        cursor = db.aql.execute("FOR s IN Samples FILTER s.visible == 'Yes' RETURN s.sample_ref")
+    return list(cursor)
+
+
 def _resolve_country_scope(db, request, sample_refs, country_codes, visible_refs):
     """
     Final list of sample refs: the caller's explicit `sample_refs` (or, when
@@ -138,6 +148,65 @@ def _concord_fields(field, romani_field, english_field="english"):
     if field == "english":
         return [english_field]
     return [romani_field, english_field]
+
+
+def _parse_wordlist_options(request):
+    """Body params for the /wordlist/ actions (no query term)."""
+    _, fold = _parse_concord_options(request)
+    prefix = (request.data.get("prefix") or "").strip().lower()
+    sort = request.data.get("sort", "alpha")
+    if sort not in ("alpha", "count"):
+        sort = "alpha"
+    page = max(1, int(request.data.get("page", 1)))
+    page_size = min(max(1, int(request.data.get("page_size", 200))), 1000)
+    return {
+        "fold": fold,
+        "prefix": prefix,
+        "sort": sort,
+        "page": page,
+        "page_size": page_size,
+        "offset": (page - 1) * page_size,
+    }
+
+
+def _wordlist_response(db, collection, text_field, sample_refs, opts):
+    """
+    Alphabetical (or frequency-sorted), de-duplicated list of every token in
+    `collection`.`text_field` over `sample_refs`, tokenised by the concord
+    analyzer. Shared by TranscriptionViewSet/PhraseViewSet.wordlist.
+
+    Returns {count, total, page, page_size, results:[{word, count}]}.
+    `collection` / `text_field` are code-controlled (never user input).
+    """
+    analyzer = _concord_analyzer(opts["fold"])
+    prefix_filter = "FILTER STARTS_WITH(w, @prefix)" if opts["prefix"] else ""
+    sort_clause = "SORT r.n DESC, r.word" if opts["sort"] == "count" else "SORT r.word"
+
+    aql = f"""
+        LET rows = (
+            FOR d IN {collection}
+                FILTER d.sample IN @sample_refs
+                FOR w IN TOKENS(d.{text_field}, "{analyzer}")
+                    {prefix_filter}
+                    COLLECT word = w WITH COUNT INTO n
+                    RETURN {{ word: word, n: n }}
+        )
+        LET sorted = (FOR r IN rows {sort_clause} RETURN r)
+        RETURN {{
+            count: LENGTH(sorted),
+            total: SUM(sorted[*].n),
+            results: (
+                FOR r IN SLICE(sorted, @offset, @page_size)
+                    RETURN {{ word: r.word, count: r.n }}
+            )
+        }}
+    """
+    bind = {"sample_refs": sample_refs, "offset": opts["offset"], "page_size": opts["page_size"]}
+    if opts["prefix"]:
+        bind["prefix"] = opts["prefix"]
+    summary = next(db.aql.execute(aql, bind_vars=bind), {}) or {}
+    summary.update(page=opts["page"], page_size=opts["page_size"])
+    return summary
 
 
 def _get_question_hierarchy_ids(db, question_id):
@@ -510,7 +579,7 @@ class PhraseViewSet(ArangoModelViewSet):
     # POST actions that only read (search / export / frequency for the
     # concordance + cross-sample search) — public, like their
     # TranscriptionViewSet counterparts; visibility is enforced in the query.
-    PUBLIC_POST_ACTIONS = {"search", "export", "frequency"}
+    PUBLIC_POST_ACTIONS = {"search", "export", "frequency", "wordlist"}
 
     def get_permissions(self):
         if self.request.method in ("PATCH", "POST", "DELETE") and getattr(
@@ -1096,6 +1165,12 @@ class PhraseViewSet(ArangoModelViewSet):
         - field (optional, default 'both'): Text search field — 'romani', 'english', or 'both'. Ignored when phrase_ref is given.
         - page (optional, default 1): Page number. Ignored when phrase_ref is given (all results returned).
         - page_size (optional, default 50, max 200): Results per page. Ignored when phrase_ref is given.
+        - match ('substring' default | 'whole_word'), fold (bool, default true): concordance matching.
+        - country_codes (optional): ISO alpha-2 codes to scope by.
+        - group ('concept'): collapse free-text results to one row per (phrase_ref,
+          distinct Romani form) — {phrase_ref, phrase, english, count, samples:[{sample,
+          sample_label}]} — capped at 3000 rows. Response also carries `grouped: true`
+          and `group_count` (total distinct forms, may exceed the 3000 returned).
         """
         phrase_ref = request.data.get("phrase_ref", "").strip()
         query = request.data.get("query", "").strip()
@@ -1107,8 +1182,14 @@ class PhraseViewSet(ArangoModelViewSet):
         sort = request.data.get("sort", "phrase_ref")
         field = request.data.get("field", "both")  # 'romani', 'english', or 'both'
         match, fold = _parse_concord_options(request)
+        # group='concept' collapses the free-text results to one row per
+        # (phrase_ref, distinct Romani form) with its list of attesting samples,
+        # so a caller grouping client-side gets the COMPLETE set of forms/
+        # concepts without paging through every per-sample record.
+        grouped = request.data.get("group") == "concept"
         page = int(request.data.get("page", 1))
-        page_size = min(int(request.data.get("page_size", 50)), 200)
+        default_size, max_size = (3000, 3000) if grouped else (50, 200)
+        page_size = min(int(request.data.get("page_size", default_size)), max_size)
         offset = (page - 1) * page_size
 
         db = request.arangodb
@@ -1223,6 +1304,37 @@ class PhraseViewSet(ArangoModelViewSet):
                         sample_label: sample_map[phrase.sample]
                     }})
             """
+            grouped_aql = f"""
+                {candidates_aql}
+                LET sample_lookup = (
+                    FOR s IN Samples
+                        RETURN {{ref: s.sample_ref, label: CONCAT_SEPARATOR(', ', s.dialect_name, s.location)}}
+                )
+                LET sample_map = ZIP(sample_lookup[*].ref, sample_lookup[*].label)
+                LET grouped = (
+                    FOR key IN candidate_keys
+                        LET sp = DOCUMENT(CONCAT("SamplePhrases/", key))
+                        COLLECT phrase_ref = sp.phrase_ref, form = sp.phrase INTO g KEEP sp
+                        SORT TO_NUMBER(REGEX_REPLACE(phrase_ref, '[^0-9].*$', '')),
+                             REGEX_REPLACE(phrase_ref, '^[0-9]+', ''), form
+                        RETURN {{
+                            phrase_ref: phrase_ref,
+                            phrase: form,
+                            english: DOCUMENT(CONCAT("MasterPhrases/", phrase_ref)).english,
+                            count: LENGTH(g),
+                            samples: (
+                                FOR row IN g
+                                    SORT row.sp.sample
+                                    RETURN {{ sample: row.sp.sample, sample_label: sample_map[row.sp.sample] }}
+                            )
+                        }}
+                )
+                RETURN {{
+                    count: LENGTH(candidate_keys),
+                    group_count: LENGTH(grouped),
+                    results: SLICE(grouped, @offset, @page_size)
+                }}
+            """
             bind = {
                 "query": query_bind,
                 "sample_refs": sample_refs,
@@ -1233,6 +1345,17 @@ class PhraseViewSet(ArangoModelViewSet):
             results_bind = {**bind, "offset": offset, "page_size": page_size}
 
         try:
+            if not phrase_ref and grouped:
+                summary = next(db.aql.execute(grouped_aql, bind_vars=results_bind), {}) or {}
+                return Response({
+                    "count": summary.get("count", 0),
+                    "group_count": summary.get("group_count", 0),
+                    "grouped": True,
+                    "page": page,
+                    "page_size": page_size,
+                    "results": summary.get("results", []),
+                })
+
             count_cursor = db.aql.execute(count_aql, bind_vars=count_bind)
             total = next(count_cursor, 0)
 
@@ -1488,6 +1611,33 @@ class PhraseViewSet(ArangoModelViewSet):
         except Exception as e:
             print(f"Error computing phrase frequency: {e}")
             raise ValidationError(f"Frequency failed: {str(e)}")
+
+    @action(detail=False, methods=["post"], url_path="wordlist")
+    def wordlist(self, request):
+        """
+        Alphabetical, de-duplicated word list ("word index") over the Romani
+        `phrase` text of the elicited-phrase corpus, scoped by sample_refs /
+        country_codes and visibility. No query term.
+
+        Body: sample_refs?, country_codes?, fold (bool, default true),
+        prefix? ("starts with" filter), sort ('alpha' default | 'count'),
+        page (default 1), page_size (default 200, max 1000).
+
+        Response: {count, total, page, page_size, results: [{word, count}]}.
+        """
+        db = request.arangodb
+        opts = _parse_wordlist_options(request)
+        sample_refs = _resolve_country_scope(
+            db, request,
+            request.data.get("sample_refs", []),
+            request.data.get("country_codes", []),
+            _visible_sample_refs(db, request.user),
+        )
+        try:
+            return Response(_wordlist_response(db, "SamplePhrases", "phrase", sample_refs, opts))
+        except Exception as e:
+            print(f"Error building phrase word list: {e}")
+            raise ValidationError(f"Word list failed: {str(e)}")
 
 
 class MasterPhraseViewSet(ArangoModelViewSet):
@@ -3113,12 +3263,7 @@ class TranscriptionViewSet(ArangoModelViewSet):
 
     def _get_visible_sample_refs(self, request):
         """Get sample refs respecting the show_hidden_samples preference."""
-        db = request.arangodb
-        if user_sees_hidden_samples(request.user):
-            cursor = db.aql.execute("FOR s IN Samples RETURN s.sample_ref")
-        else:
-            cursor = db.aql.execute("FOR s IN Samples FILTER s.visible == 'Yes' RETURN s.sample_ref")
-        return list(cursor)
+        return _visible_sample_refs(request.arangodb, request.user)
 
     def _concord_query_params(self, request, *, with_paging):
         """
@@ -3358,6 +3503,34 @@ class TranscriptionViewSet(ArangoModelViewSet):
         except Exception as e:
             print(f"Error computing transcription frequency: {e}")
             raise ValidationError(f"Frequency failed: {str(e)}")
+
+    @action(detail=False, methods=["post"], url_path="wordlist")
+    def wordlist(self, request):
+        """
+        Alphabetical, de-duplicated word list ("word index") over the Romani
+        `transcription` text, scoped by sample_refs / country_codes and
+        visibility. No query term.
+
+        Body: sample_refs?, country_codes?, fold (bool, default true),
+        prefix? ("starts with" filter), sort ('alpha' default | 'count'),
+        page (default 1), page_size (default 200, max 1000).
+
+        Response: {count, total, page, page_size, results: [{word, count}]}
+        where count = distinct word forms (after prefix), total = token sum.
+        """
+        db = request.arangodb
+        opts = _parse_wordlist_options(request)
+        sample_refs = _resolve_country_scope(
+            db, request,
+            request.data.get("sample_refs", []),
+            request.data.get("country_codes", []),
+            self._get_visible_sample_refs(request),
+        )
+        try:
+            return Response(_wordlist_response(db, "Transcriptions", "transcription", sample_refs, opts))
+        except Exception as e:
+            print(f"Error building transcription word list: {e}")
+            raise ValidationError(f"Word list failed: {str(e)}")
 
 
 class RelatedContentViewSet(ViewSet):

@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+import unicodedata
 import uuid
 from datetime import datetime
 
@@ -54,6 +55,89 @@ from data.serializers import (
 )
 from roma.views import ArangoModelViewSet
 from user.permissions import CanEditSample, IsGlobalAdmin, IsGlobalOrProjectAdmin, IsProjectEditor
+
+
+# --- Concordance / word-level search helpers --------------------------------
+#
+# The substring path (default) matches with LIKE over the `norm_lower` analyzer,
+# exactly as the pre-existing cross-sample search did. The whole-word path
+# matches a field token against the tokens of the query, using one of two
+# tokenising analyzers provisioned by `manage.py ensure_search_views`:
+#   concord       - segmentation, accent-PRESERVING  ("match diacritics" on)
+#   concord_fold  - text (no stemming), accent-FOLDED (default)
+CONCORD_ANALYZER = "concord"
+CONCORD_ANALYZER_FOLD = "concord_fold"
+
+
+def _fold_text(s):
+    """Lowercase and strip diacritics — mirrors the client's foldText()."""
+    return "".join(
+        c
+        for c in unicodedata.normalize("NFD", (s or "").lower())
+        if unicodedata.category(c) != "Mn"
+    )
+
+
+def _concord_analyzer(fold):
+    return CONCORD_ANALYZER_FOLD if fold else CONCORD_ANALYZER
+
+
+def _parse_concord_options(request):
+    """match ('substring'|'whole_word') and fold (bool, default True) from a request body."""
+    match = request.data.get("match", "substring")
+    if match not in ("substring", "whole_word"):
+        match = "substring"
+    fold = request.data.get("fold", True)
+    if isinstance(fold, str):
+        fold = fold.strip().lower() not in ("0", "false", "no", "")
+    return match, bool(fold)
+
+
+def _resolve_country_scope(db, request, sample_refs, country_codes, visible_refs):
+    """
+    Final list of sample refs: the caller's explicit `sample_refs` (or, when
+    none given, the visibility-filtered set) narrowed to `country_codes`.
+
+    Consistent with the existing search actions: an explicit `sample_refs`
+    still bypasses the visible-set filter; the country filter is applied on
+    top of whichever base set is in play.
+    """
+    base = set(sample_refs) if sample_refs else set(visible_refs)
+    if country_codes:
+        cc_refs = set(
+            db.aql.execute(
+                "FOR s IN Samples FILTER s.country_code IN @codes RETURN s.sample_ref",
+                bind_vars={"codes": list(country_codes)},
+            )
+        )
+        base &= cc_refs
+    return list(base)
+
+
+def _concord_search_filter(alias, fields, match, fold):
+    """
+    Build the ArangoSearch SEARCH clause + the `query` bind value for a
+    substring or whole-word match over one or more doc fields.
+
+    Returns (search_clause: str, query_bind: str). The analyzer name is
+    whitelisted (never user input) so string-interpolating it is safe.
+    """
+    if match == "whole_word":
+        analyzer = _concord_analyzer(fold)
+        parts = [f'{alias}.{f} IN TOKENS(@query, "{analyzer}")' for f in fields]
+        expr = parts[0] if len(parts) == 1 else "(" + " OR ".join(parts) + ")"
+        return f'SEARCH ANALYZER({expr}, "{analyzer}")', None  # query bound raw by caller
+    parts = [f'LIKE({alias}.{f}, CONCAT("%", @query, "%"))' for f in fields]
+    return f'SEARCH ANALYZER({" OR ".join(parts)}, "norm_lower")', None
+
+
+def _concord_fields(field, romani_field, english_field="english"):
+    """Map the `field` param to the doc field name(s) to match against."""
+    if field == "romani":
+        return [romani_field]
+    if field == "english":
+        return [english_field]
+    return [romani_field, english_field]
 
 
 def _get_question_hierarchy_ids(db, question_id):
@@ -423,8 +507,15 @@ class PhraseViewSet(ArangoModelViewSet):
         "(sp.category_overrides.exclude || []))"
     )
 
+    # POST actions that only read (search / export / frequency for the
+    # concordance + cross-sample search) — public, like their
+    # TranscriptionViewSet counterparts; visibility is enforced in the query.
+    PUBLIC_POST_ACTIONS = {"search", "export", "frequency"}
+
     def get_permissions(self):
-        if self.request.method in ("PATCH", "POST", "DELETE"):
+        if self.request.method in ("PATCH", "POST", "DELETE") and getattr(
+            self, "action", None
+        ) not in self.PUBLIC_POST_ACTIONS:
             return [CanEditSample()]
         return [AllowAny()]
 
@@ -1012,8 +1103,10 @@ class PhraseViewSet(ArangoModelViewSet):
             raise ValidationError("Query must be at least 2 characters")
 
         sample_refs = request.data.get("sample_refs", [])
+        country_codes = request.data.get("country_codes", [])
         sort = request.data.get("sort", "phrase_ref")
         field = request.data.get("field", "both")  # 'romani', 'english', or 'both'
+        match, fold = _parse_concord_options(request)
         page = int(request.data.get("page", 1))
         page_size = min(int(request.data.get("page_size", 50)), 200)
         offset = (page - 1) * page_size
@@ -1064,26 +1157,33 @@ class PhraseViewSet(ArangoModelViewSet):
                 print(f"Error searching phrases by phrase_ref: {e}")
                 raise ValidationError(f"Search failed: {str(e)}")
         else:
-            # Resolve sample refs upfront (once) instead of a subquery per phrase
+            # Resolve sample refs upfront (once) instead of a subquery per phrase,
+            # then narrow to country_codes if given.
             if not sample_refs:
                 if user_sees_hidden_samples(request.user):
                     sample_refs = list(db.aql.execute("FOR s IN Samples RETURN s.sample_ref"))
                 else:
                     sample_refs = list(db.aql.execute("FOR s IN Samples FILTER s.visible == 'Yes' RETURN s.sample_ref"))
+            sample_refs = _resolve_country_scope(db, request, sample_refs, country_codes, sample_refs)
 
             # Romani text ('phrase') lives per-sample on SamplePhrases, indexed by the
             # SamplePhraseSearch ArangoSearch view (norm_lower analyzer). English lives
             # once per phrase_ref on the small MasterPhrases collection (~1,100 docs) —
             # a plain LIKE scan there is cheap and avoids re-denormalizing english onto
             # every sample row just for search convenience.
+            #
+            # match='whole_word' swaps the Romani predicate to token equality via the
+            # concord[/_fold] analyzer; English stays a substring LIKE scan either way.
             query_lower = query.lower()
+            query_bind = query if match == "whole_word" else query_lower
             search_romani = field in ("romani", "both")
             search_english = field in ("english", "both")
+            romani_search, _ = _concord_search_filter("sp", ["phrase"], match, fold)
 
-            candidates_aql = """
+            candidates_aql = f"""
                 LET romani_keys = @search_romani ? (
                     FOR sp IN SamplePhraseSearch
-                        SEARCH ANALYZER(LIKE(sp.phrase, CONCAT("%", @query, "%")), "norm_lower")
+                        {romani_search}
                         FILTER sp.sample IN @sample_refs
                         RETURN sp._key
                 ) : []
@@ -1124,7 +1224,7 @@ class PhraseViewSet(ArangoModelViewSet):
                     }})
             """
             bind = {
-                "query": query_lower,
+                "query": query_bind,
                 "sample_refs": sample_refs,
                 "search_romani": search_romani,
                 "search_english": search_english,
@@ -1172,8 +1272,10 @@ class PhraseViewSet(ArangoModelViewSet):
             raise ValidationError("Query must be at least 2 characters")
 
         sample_refs = request.data.get("sample_refs", [])
+        country_codes = request.data.get("country_codes", [])
         sort = request.data.get("sort", "phrase_ref")
         field = request.data.get("field", "both")
+        match, fold = _parse_concord_options(request)
 
         db = request.arangodb
 
@@ -1226,12 +1328,15 @@ class PhraseViewSet(ArangoModelViewSet):
                     sample_refs = list(db.aql.execute("FOR s IN Samples RETURN s.sample_ref"))
                 else:
                     sample_refs = list(db.aql.execute("FOR s IN Samples FILTER s.visible == 'Yes' RETURN s.sample_ref"))
+            sample_refs = _resolve_country_scope(db, request, sample_refs, country_codes, sample_refs)
 
             query_lower = query.lower()
+            query_bind = query if match == "whole_word" else query_lower
             search_romani = field in ("romani", "both")
             search_english = field in ("english", "both")
+            romani_search, _ = _concord_search_filter("sp", ["phrase"], match, fold)
             bind = {
-                "query": query_lower,
+                "query": query_bind,
                 "sample_refs": sample_refs,
                 "search_romani": search_romani,
                 "search_english": search_english,
@@ -1239,7 +1344,7 @@ class PhraseViewSet(ArangoModelViewSet):
             export_aql = f"""
                 LET romani_keys = @search_romani ? (
                     FOR sp IN SamplePhraseSearch
-                        SEARCH ANALYZER(LIKE(sp.phrase, CONCAT("%", @query, "%")), "norm_lower")
+                        {romani_search}
                         FILTER sp.sample IN @sample_refs
                         RETURN sp._key
                 ) : []
@@ -1277,6 +1382,112 @@ class PhraseViewSet(ArangoModelViewSet):
         except Exception as e:
             print(f"Error exporting phrases: {e}")
             raise ValidationError(f"Export failed: {str(e)}")
+
+    @action(detail=False, methods=["post"], url_path="frequency")
+    def frequency(self, request):
+        """
+        Frequency summary for a concordance term over the elicited-phrase
+        corpus (the Romani `phrase` field), scoped by sample_refs /
+        country_codes and visibility.
+
+        Body params as `search` (paging / `field` ignored — phrase frequency
+        always counts Romani forms). Response mirrors
+        /transcriptions/frequency/ plus `concept_count` (distinct phrase_ref).
+        """
+        query = request.data.get("query", "").strip()
+        if not query or len(query) < 2:
+            raise ValidationError("Query must be at least 2 characters")
+
+        db = request.arangodb
+        match, fold = _parse_concord_options(request)
+        analyzer = _concord_analyzer(fold)
+
+        if user_sees_hidden_samples(request.user):
+            visible = list(db.aql.execute("FOR s IN Samples RETURN s.sample_ref"))
+        else:
+            visible = list(db.aql.execute("FOR s IN Samples FILTER s.visible == 'Yes' RETURN s.sample_ref"))
+        sample_refs = _resolve_country_scope(
+            db, request, request.data.get("sample_refs", []),
+            request.data.get("country_codes", []), visible,
+        )
+
+        # Narrow to matching docs via the SamplePhraseSearch view first, then
+        # tokenise only those (a full 128k-doc TOKENS scan takes seconds).
+        search_filter, _ = _concord_search_filter("sp", ["phrase"], match, fold)
+        if match == "whole_word":
+            token_match = "w IN qtokens"
+            search_query = query
+            needle = None
+        else:
+            token_match = "CONTAINS(w, @qneedle)"
+            search_query = query.lower()
+            needle = _fold_text(query) if fold else query.lower()
+
+        aql = f"""
+            LET qtokens = TOKENS(@query, "{analyzer}")
+            LET smap = MERGE(
+                FOR x IN Samples
+                    RETURN {{ [x.sample_ref]: {{ cc: x.country_code, d: x.dialect_name }} }}
+            )
+            LET cand = (
+                FOR sp IN SamplePhraseSearch
+                    {search_filter}
+                    FILTER sp.sample IN @sample_refs
+                    RETURN {{ sample: sp.sample, phrase_ref: sp.phrase_ref, phrase: sp.phrase }}
+            )
+            LET rows = (
+                FOR c IN cand
+                    LET hits = LENGTH(
+                        FOR w IN TOKENS(c.phrase, "{analyzer}")
+                            FILTER {token_match}
+                            RETURN 1
+                    )
+                    FILTER hits > 0
+                    RETURN {{
+                        sample: c.sample,
+                        phrase_ref: c.phrase_ref,
+                        country_code: smap[c.sample].cc,
+                        dialect: smap[c.sample].d,
+                        hits: hits
+                    }}
+            )
+            LET forms = (
+                FOR c IN cand
+                    FOR w IN TOKENS(c.phrase, "{analyzer}")
+                        FILTER {token_match}
+                        COLLECT form = w WITH COUNT INTO n
+                        SORT n DESC
+                        LIMIT 25
+                        RETURN {{ form: form, count: n }}
+            )
+            RETURN {{
+                total_occurrences: SUM(rows[*].hits),
+                document_matches: LENGTH(rows),
+                sample_count: LENGTH(UNIQUE(rows[*].sample)),
+                concept_count: LENGTH(UNIQUE(rows[*].phrase_ref)),
+                dialect_count: LENGTH(UNIQUE(rows[* FILTER CURRENT.dialect != null].dialect)),
+                country_count: LENGTH(UNIQUE(rows[* FILTER CURRENT.country_code != null].country_code)),
+                by_country: (
+                    FOR r IN rows
+                        FILTER r.country_code != null
+                        COLLECT cc = r.country_code AGGREGATE c = SUM(r.hits)
+                        SORT c DESC
+                        RETURN {{ country_code: cc, count: c }}
+                ),
+                forms: forms
+            }}
+        """
+        bind = {"query": search_query, "sample_refs": sample_refs}
+        if needle is not None:
+            bind["qneedle"] = needle
+
+        try:
+            summary = next(db.aql.execute(aql, bind_vars=bind), {}) or {}
+            summary.update(query=query, match=match, fold=fold)
+            return Response(summary)
+        except Exception as e:
+            print(f"Error computing phrase frequency: {e}")
+            raise ValidationError(f"Frequency failed: {str(e)}")
 
 
 class MasterPhraseViewSet(ArangoModelViewSet):
@@ -2909,6 +3120,42 @@ class TranscriptionViewSet(ArangoModelViewSet):
             cursor = db.aql.execute("FOR s IN Samples FILTER s.visible == 'Yes' RETURN s.sample_ref")
         return list(cursor)
 
+    def _concord_query_params(self, request, *, with_paging):
+        """
+        Shared parsing for search / export / frequency.
+
+        Returns a dict: query, query_lower, sample_refs (scoped by visibility
+        + country), sort, field, match, fold, and (when with_paging) page /
+        page_size / offset.
+        """
+        query = request.data.get("query", "").strip()
+        if not query or len(query) < 2:
+            raise ValidationError("Query must be at least 2 characters")
+
+        db = request.arangodb
+        match, fold = _parse_concord_options(request)
+        sample_refs = _resolve_country_scope(
+            db,
+            request,
+            request.data.get("sample_refs", []),
+            request.data.get("country_codes", []),
+            self._get_visible_sample_refs(request),
+        )
+        params = {
+            "query": query,
+            "query_lower": query.lower(),
+            "sample_refs": sample_refs,
+            "sort": request.data.get("sort", "segment_no"),
+            "field": request.data.get("field", "both"),
+            "match": match,
+            "fold": fold,
+        }
+        if with_paging:
+            page = max(1, int(request.data.get("page", 1)))
+            page_size = min(int(request.data.get("page_size", 50)), 200)
+            params.update(page=page, page_size=page_size, offset=(page - 1) * page_size)
+        return params
+
     @action(detail=False, methods=["post"], url_path="search")
     def search(self, request):
         """
@@ -2916,42 +3163,26 @@ class TranscriptionViewSet(ArangoModelViewSet):
 
         Request Body:
         - query (required, min 2 chars): Search term
-        - sample_refs (optional): List of sample refs to limit search
-        - sort (optional, default 'segment_no'): Sort field — 'segment_no' or 'sample'
+        - sample_refs (optional): List of sample refs to limit the search
+        - country_codes (optional): List of ISO alpha-2 codes to limit the search
+        - match (optional, default 'substring'): 'substring' or 'whole_word'
+        - fold (optional, default true): fold diacritics for whole-word matching
+        - sort (optional, default 'segment_no'): 'segment_no' or 'sample'
         - page (optional, default 1): Page number
         - page_size (optional, default 50, max 200): Results per page
         - field (optional, default 'both'): 'romani', 'english', or 'both'
         """
-        query = request.data.get("query", "").strip()
-        if not query or len(query) < 2:
-            raise ValidationError("Query must be at least 2 characters")
-
-        sample_refs = request.data.get("sample_refs", [])
-        sort = request.data.get("sort", "segment_no")
-        field = request.data.get("field", "both")
-        page = int(request.data.get("page", 1))
-        page_size = min(int(request.data.get("page_size", 50)), 200)
-        offset = (page - 1) * page_size
-
+        p = self._concord_query_params(request, with_paging=True)
         db = request.arangodb
-        query_lower = query.lower()
 
-        sort_clauses = {
+        sort_aql = {
             "segment_no": "SORT t.sample, t.segment_no",
             "sample": "SORT t.sample, t.segment_no",
-        }
-        sort_aql = sort_clauses.get(sort, sort_clauses["segment_no"])
+        }.get(p["sort"], "SORT t.sample, t.segment_no")
 
-        if not sample_refs:
-            sample_refs = self._get_visible_sample_refs(request)
-
-        if field == "romani":
-            like_expr = 'LIKE(t.transcription, CONCAT("%", @query, "%"))'
-        elif field == "english":
-            like_expr = 'LIKE(t.english, CONCAT("%", @query, "%"))'
-        else:
-            like_expr = 'LIKE(t.transcription, CONCAT("%", @query, "%")) OR LIKE(t.english, CONCAT("%", @query, "%"))'
-        search_filter = f'SEARCH ANALYZER({like_expr}, "norm_lower")'
+        fields = _concord_fields(p["field"], "transcription")
+        search_filter, _ = _concord_search_filter("t", fields, p["match"], p["fold"])
+        query_bind = p["query"] if p["match"] == "whole_word" else p["query_lower"]
 
         count_aql = f"""
             FOR t IN TranscriptionSearch
@@ -2960,7 +3191,6 @@ class TranscriptionViewSet(ArangoModelViewSet):
                 COLLECT WITH COUNT INTO total
                 RETURN total
         """
-
         results_aql = f"""
             LET sample_lookup = (
                 FOR s IN Samples
@@ -2972,29 +3202,20 @@ class TranscriptionViewSet(ArangoModelViewSet):
                 FILTER t.sample IN @sample_refs
                 {sort_aql}
                 LIMIT @offset, @page_size
-                RETURN MERGE(t, {{
-                    sample_label: sample_map[t.sample]
-                }})
+                RETURN MERGE(t, {{ sample_label: sample_map[t.sample] }})
         """
 
-        count_bind = {"query": query_lower, "sample_refs": sample_refs}
-        results_bind = {"query": query_lower, "sample_refs": sample_refs, "offset": offset, "page_size": page_size}
+        count_bind = {"query": query_bind, "sample_refs": p["sample_refs"]}
+        results_bind = {**count_bind, "offset": p["offset"], "page_size": p["page_size"]}
 
         try:
-            count_cursor = db.aql.execute(count_aql, bind_vars=count_bind)
-            total = next(count_cursor, 0)
-
-            results_cursor = db.aql.execute(results_aql, bind_vars=results_bind)
-            results = list(results_cursor)
-
-            serializer = self.serializer_class(
-                results, many=True, context={"request": request}
-            )
-
+            total = next(db.aql.execute(count_aql, bind_vars=count_bind), 0)
+            results = list(db.aql.execute(results_aql, bind_vars=results_bind))
+            serializer = self.serializer_class(results, many=True, context={"request": request})
             return Response({
                 "count": total,
-                "page": page,
-                "page_size": page_size,
+                "page": p["page"],
+                "page_size": p["page_size"],
                 "results": serializer.data,
             })
         except Exception as e:
@@ -3007,33 +3228,17 @@ class TranscriptionViewSet(ArangoModelViewSet):
         Export all matching transcriptions (no pagination) for download.
         Same parameters as search but returns all results.
         """
-        query = request.data.get("query", "").strip()
-        if not query or len(query) < 2:
-            raise ValidationError("Query must be at least 2 characters")
-
-        sample_refs = request.data.get("sample_refs", [])
-        sort = request.data.get("sort", "segment_no")
-        field = request.data.get("field", "both")
-
+        p = self._concord_query_params(request, with_paging=False)
         db = request.arangodb
-        query_lower = query.lower()
 
-        sort_clauses = {
+        sort_aql = {
             "segment_no": "SORT t.sample, t.segment_no",
             "sample": "SORT t.sample, t.segment_no",
-        }
-        sort_aql = sort_clauses.get(sort, sort_clauses["segment_no"])
+        }.get(p["sort"], "SORT t.sample, t.segment_no")
 
-        if not sample_refs:
-            sample_refs = self._get_visible_sample_refs(request)
-
-        if field == "romani":
-            like_expr = 'LIKE(t.transcription, CONCAT("%", @query, "%"))'
-        elif field == "english":
-            like_expr = 'LIKE(t.english, CONCAT("%", @query, "%"))'
-        else:
-            like_expr = 'LIKE(t.transcription, CONCAT("%", @query, "%")) OR LIKE(t.english, CONCAT("%", @query, "%"))'
-        search_filter = f'SEARCH ANALYZER({like_expr}, "norm_lower")'
+        fields = _concord_fields(p["field"], "transcription")
+        search_filter, _ = _concord_search_filter("t", fields, p["match"], p["fold"])
+        query_bind = p["query"] if p["match"] == "whole_word" else p["query_lower"]
 
         export_aql = f"""
             LET sample_lookup = (
@@ -3056,11 +3261,103 @@ class TranscriptionViewSet(ArangoModelViewSet):
         """
 
         try:
-            cursor = db.aql.execute(export_aql, bind_vars={"query": query_lower, "sample_refs": sample_refs})
+            cursor = db.aql.execute(
+                export_aql, bind_vars={"query": query_bind, "sample_refs": p["sample_refs"]}
+            )
             return Response(list(cursor))
         except Exception as e:
             print(f"Error exporting transcriptions: {e}")
             raise ValidationError(f"Export failed: {str(e)}")
+
+    @action(detail=False, methods=["post"], url_path="frequency")
+    def frequency(self, request):
+        """
+        Frequency summary for a concordance term over the connected-speech
+        corpus, scoped by sample_refs / country_codes and visibility.
+
+        Same body params as `search` (paging is ignored). `field` selects the
+        text the tokens come from: 'english' counts the translation, anything
+        else ('romani' / 'both') counts the Romani `transcription`.
+
+        Response:
+        {
+          "query", "match", "fold",
+          "total_occurrences", "document_matches",
+          "sample_count", "dialect_count", "country_count",
+          "by_country": [{"country_code", "count"}, ...],
+          "forms": [{"form", "count"}, ...]   # distinct matched word forms
+        }
+        """
+        p = self._concord_query_params(request, with_paging=False)
+        db = request.arangodb
+
+        text_field = "english" if p["field"] == "english" else "transcription"
+        analyzer = _concord_analyzer(p["fold"])
+        # whole-word: token equals one of the query's tokens; substring: token
+        # contains the folded/lowered query string.
+        if p["match"] == "whole_word":
+            token_match = "w IN qtokens"
+            query_bind = p["query"]
+        else:
+            token_match = "CONTAINS(w, @qneedle)"
+            query_bind = _fold_text(p["query"]) if p["fold"] else p["query_lower"]
+
+        aql = f"""
+            LET qtokens = TOKENS(@query, "{analyzer}")
+            LET rows = (
+                FOR t IN Transcriptions
+                    FILTER t.sample IN @sample_refs
+                    LET hits = LENGTH(
+                        FOR w IN TOKENS(t.{text_field}, "{analyzer}")
+                            FILTER {token_match}
+                            RETURN 1
+                    )
+                    FILTER hits > 0
+                    LET s = FIRST(FOR x IN Samples FILTER x.sample_ref == t.sample RETURN x)
+                    RETURN {{
+                        sample: t.sample,
+                        country_code: s.country_code,
+                        dialect: s.dialect_name,
+                        hits: hits
+                    }}
+            )
+            LET forms = (
+                FOR t IN Transcriptions
+                    FILTER t.sample IN @sample_refs
+                    FOR w IN TOKENS(t.{text_field}, "{analyzer}")
+                        FILTER {token_match}
+                        COLLECT form = w WITH COUNT INTO n
+                        SORT n DESC
+                        LIMIT 25
+                        RETURN {{ form: form, count: n }}
+            )
+            RETURN {{
+                total_occurrences: SUM(rows[*].hits),
+                document_matches: LENGTH(rows),
+                sample_count: LENGTH(UNIQUE(rows[*].sample)),
+                dialect_count: LENGTH(UNIQUE(rows[* FILTER CURRENT.dialect != null].dialect)),
+                country_count: LENGTH(UNIQUE(rows[* FILTER CURRENT.country_code != null].country_code)),
+                by_country: (
+                    FOR r IN rows
+                        FILTER r.country_code != null
+                        COLLECT cc = r.country_code AGGREGATE c = SUM(r.hits)
+                        SORT c DESC
+                        RETURN {{ country_code: cc, count: c }}
+                ),
+                forms: forms
+            }}
+        """
+        bind = {"query": query_bind, "sample_refs": p["sample_refs"]}
+        if p["match"] != "whole_word":
+            bind["qneedle"] = query_bind
+
+        try:
+            summary = next(db.aql.execute(aql, bind_vars=bind), {}) or {}
+            summary.update(query=p["query"], match=p["match"], fold=p["fold"])
+            return Response(summary)
+        except Exception as e:
+            print(f"Error computing transcription frequency: {e}")
+            raise ValidationError(f"Frequency failed: {str(e)}")
 
 
 class RelatedContentViewSet(ViewSet):

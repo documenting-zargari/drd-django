@@ -1,5 +1,4 @@
-import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from django.contrib.auth.models import AnonymousUser
 from django.test import RequestFactory, SimpleTestCase
@@ -16,9 +15,9 @@ def _mock_user(is_admin=False, show_hidden=False):
 
 
 ALL_SAMPLES = [
-    {"sample_ref": "AL-001", "dialect_name": "Dialect A", "visible": "Yes"},
-    {"sample_ref": "AL-002", "dialect_name": "Dialect B", "visible": "Yes"},
-    {"sample_ref": "HIDDEN-01", "dialect_name": "Dialect Hidden", "visible": "No"},
+    {"sample_ref": "AL-001", "dialect_name": "Dialect A", "visible": "Yes", "country_code": "AL"},
+    {"sample_ref": "AL-002", "dialect_name": "Dialect B", "visible": "Yes", "country_code": "AL"},
+    {"sample_ref": "HIDDEN-01", "dialect_name": "Dialect Hidden", "visible": "No", "country_code": "AL"},
 ]
 
 
@@ -280,6 +279,10 @@ class _FakePhraseDB:
             return iter([s["sample_ref"] for s in self.samples])
         if query == "FOR s IN Samples FILTER s.visible == 'Yes' RETURN s.sample_ref":
             return iter([s["sample_ref"] for s in self.samples if s.get("visible") == "Yes"])
+        # _resolve_country_scope: country_code -> sample_refs
+        if "FILTER s.country_code IN @codes" in query:
+            codes = set(bv.get("codes") or [])
+            return iter([s["sample_ref"] for s in self.samples if s.get("country_code") in codes])
 
         # get_queryset: GET /phrases/?sample=
         if "FOR sp IN SamplePhrases" in query and "FILTER sp.sample == @sample" in query and "DOCUMENT" in query:
@@ -974,3 +977,168 @@ class TranscriptionsByAnswerTests(SimpleTestCase):
         question = {"hierarchy_ids": [1, 10]}
         response = self._call(answer, question=question, transcriptions=[t1])
         self.assertEqual(list(response.data), [])
+
+
+# ---------------------------------------------------------------------------
+# Concordance: whole-word / diacritics-fold / country-scope helpers
+# ---------------------------------------------------------------------------
+
+class ConcordanceHelperTests(SimpleTestCase):
+    """Pure-function coverage for the concordance search helpers in data.views."""
+
+    def test_fold_text_strips_diacritics_and_lowercases(self):
+        from data.views import _fold_text
+        self.assertEqual(_fold_text("Čhavo ŠUKAR džala"), "chavo sukar dzala")
+        self.assertEqual(_fold_text("phral"), "phral")
+        self.assertEqual(_fold_text(None), "")
+
+    def test_parse_concord_options_defaults(self):
+        from data.views import _parse_concord_options
+        req = MagicMock()
+        req.data ={}
+        self.assertEqual(_parse_concord_options(req), ("substring", True))
+
+    def test_parse_concord_options_reads_match_and_fold(self):
+        from data.views import _parse_concord_options
+        req = MagicMock()
+        req.data ={"match": "whole_word", "fold": False}
+        self.assertEqual(_parse_concord_options(req), ("whole_word", False))
+        req.data = {"match": "bogus", "fold": "0"}
+        self.assertEqual(_parse_concord_options(req), ("substring", False))
+        req.data = {"fold": "true"}
+        self.assertEqual(_parse_concord_options(req), ("substring", True))
+
+    def test_concord_search_filter_substring_uses_norm_lower_like(self):
+        from data.views import _concord_search_filter
+        clause, _ = _concord_search_filter("t", ["transcription"], "substring", True)
+        self.assertIn('LIKE(t.transcription, CONCAT("%", @query, "%"))', clause)
+        self.assertIn('"norm_lower"', clause)
+
+    def test_concord_search_filter_whole_word_uses_token_analyzer(self):
+        from data.views import _concord_search_filter
+        folded, _ = _concord_search_filter("sp", ["phrase"], "whole_word", True)
+        self.assertIn('sp.phrase IN TOKENS(@query, "concord_fold")', folded)
+        self.assertIn('ANALYZER(sp.phrase IN TOKENS(@query, "concord_fold"), "concord_fold")', folded)
+        preserving, _ = _concord_search_filter("sp", ["phrase"], "whole_word", False)
+        self.assertIn('"concord"', preserving)
+        self.assertNotIn("concord_fold", preserving)
+
+    def test_concord_search_filter_both_fields_ored(self):
+        from data.views import _concord_search_filter
+        clause, _ = _concord_search_filter("t", ["transcription", "english"], "whole_word", True)
+        self.assertIn(" OR ", clause)
+        self.assertIn("t.transcription IN TOKENS", clause)
+        self.assertIn("t.english IN TOKENS", clause)
+
+    def test_concord_fields_maps_field_param(self):
+        from data.views import _concord_fields
+        self.assertEqual(_concord_fields("romani", "transcription"), ["transcription"])
+        self.assertEqual(_concord_fields("english", "transcription"), ["english"])
+        self.assertEqual(_concord_fields("both", "transcription"), ["transcription", "english"])
+
+    def test_resolve_country_scope_intersects_with_country(self):
+        from data.views import _resolve_country_scope
+        db = MagicMock()
+        db.aql.execute.side_effect = lambda q, bind_vars=None: iter(["AL-001", "AL-002"])
+        req = MagicMock()
+        out = _resolve_country_scope(db, req, [], ["AL"], ["AL-001", "AL-002", "RO-009"])
+        self.assertEqual(sorted(out), ["AL-001", "AL-002"])
+
+    def test_resolve_country_scope_no_country_returns_base(self):
+        from data.views import _resolve_country_scope
+        out = _resolve_country_scope(MagicMock(), MagicMock(), [], [], ["AL-001", "RO-009"])
+        self.assertEqual(sorted(out), ["AL-001", "RO-009"])
+
+    def test_resolve_country_scope_explicit_refs_win_then_narrowed(self):
+        from data.views import _resolve_country_scope
+        db = MagicMock()
+        db.aql.execute.side_effect = lambda q, bind_vars=None: iter(["AL-001"])
+        out = _resolve_country_scope(db, MagicMock(), ["AL-001", "AL-002"], ["AL"], ["AL-001", "AL-002"])
+        self.assertEqual(out, ["AL-001"])
+
+
+class PhraseSearchConcordanceTests(SimpleTestCase):
+    """POST /phrases/search/ with the new match / country_codes params."""
+
+    def setUp(self):
+        self.user = _mock_user()
+
+    def _search(self, data):
+        from data.views import PhraseViewSet
+        vs = PhraseViewSet()
+        vs.request = _phrase_request(self.user, method="post", data=data)
+        vs.kwargs = {}
+        vs.format_kwarg = None
+        vs.action = "search"
+        return vs.search(vs.request)
+
+    def test_country_codes_scope_restricts_to_matching_country(self):
+        resp = self._search({"query": "phr", "field": "romani", "country_codes": ["AL"]})
+        self.assertEqual(resp.status_code, 200)
+        samples = {r["sample"] for r in resp.data["results"]}
+        self.assertTrue(samples <= {"AL-001", "AL-002"})
+        self.assertTrue(len(resp.data["results"]) > 0)
+
+    def test_country_codes_with_no_matching_country_returns_nothing(self):
+        resp = self._search({"query": "phr", "field": "romani", "country_codes": ["RO"]})
+        self.assertEqual(resp.data["count"], 0)
+
+    def test_match_whole_word_is_accepted(self):
+        resp = self._search({"query": "phral", "field": "romani", "match": "whole_word"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("results", resp.data)
+
+
+class ConcordanceFrequencyTests(SimpleTestCase):
+    """POST /{phrases,transcriptions}/frequency/ input validation + echo."""
+
+    def setUp(self):
+        self.user = _mock_user()
+
+    def _phrase_freq(self, data):
+        from data.views import PhraseViewSet
+        vs = PhraseViewSet()
+        vs.request = _phrase_request(self.user, method="post", data=data)
+        vs.kwargs = {}
+        vs.format_kwarg = None
+        vs.action = "frequency"
+        return vs.frequency(vs.request)
+
+    def _transcription_freq(self, data):
+        from data.views import TranscriptionViewSet
+        req = MagicMock(spec=Request)
+        req.data = data
+        req.user = self.user
+        db = MagicMock()
+        # visible-refs + country + frequency AQL all funnel through here
+        db.aql.execute.side_effect = lambda q, bind_vars=None: iter(
+            ["AL-001", "AL-002"] if "RETURN s.sample_ref" in q
+            else [{"total_occurrences": 3, "document_matches": 2, "sample_count": 1,
+                   "dialect_count": 1, "country_count": 1,
+                   "by_country": [{"country_code": "AL", "count": 3}],
+                   "forms": [{"form": "gaba", "count": 3}]}]
+        )
+        req.arangodb = db
+        req.arango_error = None
+        vs = TranscriptionViewSet()
+        vs.request = req
+        vs.kwargs = {}
+        vs.format_kwarg = None
+        vs.action = "frequency"
+        return vs.frequency(req)
+
+    def test_phrase_frequency_rejects_short_query(self):
+        with self.assertRaises(ValidationError):
+            self._phrase_freq({"query": "a"})
+
+    def test_transcription_frequency_rejects_short_query(self):
+        with self.assertRaises(ValidationError):
+            self._transcription_freq({"query": "a"})
+
+    def test_transcription_frequency_echoes_match_and_fold(self):
+        resp = self._transcription_freq({"query": "gaba", "match": "whole_word", "fold": False})
+        self.assertEqual(resp.data["query"], "gaba")
+        self.assertEqual(resp.data["match"], "whole_word")
+        self.assertEqual(resp.data["fold"], False)
+        self.assertEqual(resp.data["total_occurrences"], 3)
+        self.assertEqual(resp.data["by_country"], [{"country_code": "AL", "count": 3}])

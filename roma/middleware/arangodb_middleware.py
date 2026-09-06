@@ -60,6 +60,11 @@ class ArangoDBMiddleware:
         try:
             db.collection("SamplePhrases").add_persistent_index(fields=["phrase_ref"])
             db.collection("Samples").add_persistent_index(fields=["sample_ref"])
+            # Category / research-question hierarchy is now expressed only by
+            # parent_id (the IsParentCategory edge was dropped 2026-09-06);
+            # index it so subtree lookups don't full-scan.
+            db.collection("Categories").add_persistent_index(fields=["parent_id"])
+            db.collection("ResearchQuestions").add_persistent_index(fields=["parent_id"])
         except Exception as e:
             logger.warning(f"Could not ensure ArangoDB indexes: {e}")
 

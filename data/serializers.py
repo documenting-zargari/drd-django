@@ -12,7 +12,6 @@ from data.models import (
     SamplePhrase,
     Source,
     Transcription,
-    Translation,
     View,
 )
 from roma.serializers import ArangoModelSerializer
@@ -115,16 +114,6 @@ class CategorySerializer(ArangoModelSerializer):
             result.pop("path", None)
         
         return result
-
-
-class TranslationSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = Translation
-        fields = [
-            "id",
-            "conjugated",
-            "english",
-        ]
 
 
 class ResearchQuestionSerializer(ArangoModelSerializer):

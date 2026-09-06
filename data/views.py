@@ -2099,7 +2099,7 @@ class SampleViewSet(ArangoModelViewSet):
 
         sample = cursor[0]
         phrase_count = next(db.aql.execute(
-            "FOR p IN Phrases FILTER p.sample == @s COLLECT WITH COUNT INTO n RETURN n",
+            "FOR p IN SamplePhrases FILTER p.sample == @s COLLECT WITH COUNT INTO n RETURN n",
             bind_vars={"s": ref},
         ), 0)
 
@@ -2118,10 +2118,8 @@ class SampleViewSet(ArangoModelViewSet):
 
         db = request.arangodb
         cursor = db.aql.execute("""
-            FOR p IN Phrases
-                COLLECT ref = p.phrase_ref INTO g
-                LET doc = FIRST(g[*].p)
-                RETURN { phrase_ref: doc.phrase_ref, english: doc.english }
+            FOR m IN MasterPhrases
+                RETURN { phrase_ref: m.phrase_ref, english: m.english }
         """)
         phrases = natsorted(list(cursor), key=lambda x: x["phrase_ref"])
 
@@ -2163,7 +2161,7 @@ class SampleViewSet(ArangoModelViewSet):
         if existing and not upgrade:
             try:
                 existing_phrase_count = next(db.aql.execute(
-                    "FOR p IN Phrases FILTER p.sample == @s COLLECT WITH COUNT INTO n RETURN n",
+                    "FOR p IN SamplePhrases FILTER p.sample == @s COLLECT WITH COUNT INTO n RETURN n",
                     bind_vars={"s": sample_ref},
                 ), 0)
             except Exception as exc:
@@ -2211,14 +2209,26 @@ class SampleViewSet(ArangoModelViewSet):
                          f"Found columns: {', '.join(fieldnames)}"
             }, status=400)
 
+        # english/conjugated live on MasterPhrases now (shared across every
+        # sample of a phrase_ref); the CSV still carries them for reference.
+        # We validate phrase_ref against MasterPhrases and only write the
+        # per-sample Romani `phrase` to SamplePhrases — a CSV english/
+        # conjugated that disagrees with the master is reported in `warnings`,
+        # not applied.
         try:
-            canonical_refs = set(db.aql.execute(
-                "FOR p IN Phrases COLLECT ref = p.phrase_ref RETURN ref"
-            ))
+            master_by_ref = {
+                m["phrase_ref"]: m
+                for m in db.aql.execute(
+                    "FOR m IN MasterPhrases "
+                    "RETURN {phrase_ref: m.phrase_ref, english: m.english, conjugated: m.conjugated}"
+                )
+            }
         except Exception as exc:
             return Response({"error": f"Database error loading phrase references: {exc}"}, status=500)
+        canonical_refs = set(master_by_ref)
 
         errors = []
+        warnings = []
         phrases_to_create = []
 
         for i, row in enumerate(rows, start=2):
@@ -2260,12 +2270,27 @@ class SampleViewSet(ArangoModelViewSet):
                 })
                 continue
 
+            # Non-blocking: flag CSV english/conjugated that disagree with the
+            # shared MasterPhrase record (import does not change master data).
+            master = master_by_ref[phrase_ref]
+            if english and english != (master.get("english") or "").strip():
+                warnings.append({
+                    "row": i, "phrase_ref": phrase_ref, "field": "english",
+                    "csv_value": english, "master_value": master.get("english"),
+                })
+            if conjugated is not None and conjugated != master.get("conjugated"):
+                warnings.append({
+                    "row": i, "phrase_ref": phrase_ref, "field": "conjugated",
+                    "csv_value": conjugated, "master_value": master.get("conjugated"),
+                })
+
             phrases_to_create.append({
-                "phrase_ref": phrase_ref,
-                "phrase": phrase,
-                "english": english,
-                "conjugated": conjugated,
+                "_key": f"{sample_ref}_{phrase_ref}",
                 "sample": sample_ref,
+                "phrase_ref": phrase_ref,
+                "phrase": phrase or None,
+                "question_overrides": {"include": [], "exclude": []},
+                "category_overrides": {"include": [], "exclude": []},
             })
 
         if errors:
@@ -2302,9 +2327,16 @@ class SampleViewSet(ArangoModelViewSet):
                 p["import_batch_id"] = batch_id
 
             try:
-                db.collection("Phrases").insert_many(phrases_to_create)
+                result = db.collection("SamplePhrases").insert_many(phrases_to_create)
+                insert_errs = [r for r in result if isinstance(r, Exception)]
+                if insert_errs:
+                    raise insert_errs[0]
             except Exception as exc:
                 try:
+                    db.aql.execute(
+                        "FOR sp IN SamplePhrases FILTER sp.import_batch_id == @bid REMOVE sp IN SamplePhrases",
+                        bind_vars={"bid": batch_id},
+                    )
                     db.aql.execute(
                         "FOR s IN Samples FILTER s.import_batch_id == @bid REMOVE s IN Samples",
                         bind_vars={"bid": batch_id},
@@ -2319,12 +2351,11 @@ class SampleViewSet(ArangoModelViewSet):
 
         # ── Upgrade mode ─────────────────────────────────────────────────────
         else:
-            # Load existing phrases for this sample keyed by phrase_ref
+            # Load existing per-sample phrase recordings keyed by phrase_ref
             try:
                 existing_cursor = db.aql.execute(
-                    "FOR p IN Phrases FILTER p.sample == @s "
-                    "RETURN {phrase_ref: p.phrase_ref, _key: p._key, "
-                    "phrase: p.phrase, english: p.english, conjugated: p.conjugated}",
+                    "FOR p IN SamplePhrases FILTER p.sample == @s "
+                    "RETURN {phrase_ref: p.phrase_ref, _key: p._key, phrase: p.phrase}",
                     bind_vars={"s": sample_ref},
                 )
                 existing_by_ref = {p["phrase_ref"]: p for p in existing_cursor}
@@ -2333,7 +2364,7 @@ class SampleViewSet(ArangoModelViewSet):
 
             to_insert = []
             to_update = []
-            rollback_updates = []  # stores old values so rollback can restore them
+            rollback_updates = []  # stores old per-sample text so rollback can restore it
 
             for p in phrases_to_create:
                 ref = p["phrase_ref"]
@@ -2342,21 +2373,23 @@ class SampleViewSet(ArangoModelViewSet):
                     rollback_updates.append({
                         "_key": old["_key"],
                         "phrase": old.get("phrase"),
-                        "english": old.get("english"),
-                        "conjugated": old.get("conjugated"),
                     })
-                    to_update.append({"_key": old["_key"], "phrase": p["phrase"],
-                                      "english": p["english"], "conjugated": p["conjugated"],
-                                      "import_batch_id": batch_id})
+                    # NB: no import_batch_id stamped on pre-existing docs —
+                    # rollback deletes by import_batch_id, and these must be
+                    # restored (via rollback_updates) not deleted.
+                    to_update.append({
+                        "_key": old["_key"],
+                        "phrase": p["phrase"],
+                    })
                 else:
                     p["import_batch_id"] = batch_id
                     to_insert.append(p)
 
             try:
                 if to_insert:
-                    db.collection("Phrases").insert_many(to_insert)
+                    db.collection("SamplePhrases").insert_many(to_insert)
                 for upd in to_update:
-                    db.collection("Phrases").update(upd)
+                    db.collection("SamplePhrases").update(upd)
             except Exception as exc:
                 return Response({"error": f"Failed to write phrases: {exc}"}, status=500)
 
@@ -2374,6 +2407,7 @@ class SampleViewSet(ArangoModelViewSet):
             "upgrade": upgrade,
             "rolled_back": False,
             "rollback_updates": rollback_updates,
+            "warnings": warnings,
         }
         try:
             db.collection("ImportBatches").insert(batch_record)
@@ -2386,6 +2420,7 @@ class SampleViewSet(ArangoModelViewSet):
             "phrase_count": inserted_count,
             "updated_count": updated_count,
             "skipped_count": skipped_empty_count,
+            "warnings": warnings,
             "created_at": now,
         }, status=201)
 
@@ -2396,8 +2431,9 @@ class SampleViewSet(ArangoModelViewSet):
     )
     def rollback_import_batch(self, request, batch_id=None):
         """
-        DELETE /samples/import-batch/{batch_id}/ — delete a sample and all its phrases
-        created by a specific import batch. Admin only.
+        DELETE /samples/import-batch/{batch_id}/ — delete a sample and all its
+        per-sample phrase recordings (SamplePhrases) created by a specific
+        import batch. Admin only.
         """
         if not IsGlobalOrProjectAdmin().has_permission(request, self):
             return Response({"error": "Admin access required"}, status=403)
@@ -2419,22 +2455,20 @@ class SampleViewSet(ArangoModelViewSet):
         if batch_doc.get("rolled_back"):
             return Response({"error": "This import has already been rolled back"}, status=400)
 
-        # Delete newly inserted phrases (tagged with batch_id)
+        # Delete newly inserted phrase recordings (tagged with batch_id)
         phrases_cursor = db.aql.execute(
-            "FOR p IN Phrases FILTER p.import_batch_id == @bid REMOVE p IN Phrases RETURN 1",
+            "FOR p IN SamplePhrases FILTER p.import_batch_id == @bid REMOVE p IN SamplePhrases RETURN 1",
             bind_vars={"bid": batch_id},
         )
         deleted_phrases = len(list(phrases_cursor))
 
-        # Restore previously updated phrases to their old values
+        # Restore previously updated phrase recordings to their old Romani text
         restored_count = 0
         for old in batch_doc.get("rollback_updates", []):
             try:
-                db.collection("Phrases").update({
+                db.collection("SamplePhrases").update({
                     "_key": old["_key"],
                     "phrase": old.get("phrase"),
-                    "english": old.get("english"),
-                    "conjugated": old.get("conjugated"),
                 })
                 restored_count += 1
             except Exception:
@@ -2616,26 +2650,18 @@ class AnswerViewSet(ArangoModelViewSet):
         except (TypeError, ValueError):
             return Response({"error": "question_id must be an integer"}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Find the question document
-        cursor = db.aql.execute(
-            "FOR q IN ResearchQuestions FILTER q.id == @id RETURN q",
+        # Validate that the question exists (question_id on the answer is the link)
+        question_exists = list(db.aql.execute(
+            "FOR q IN ResearchQuestions FILTER q.id == @id LIMIT 1 RETURN 1",
             bind_vars={"id": question_id},
-        )
-        questions = list(cursor)
-        if not questions:
+        ))
+        if not question_exists:
             raise NotFound(detail=f"Question {question_id} not found")
-        question = questions[0]
 
         # Insert the new answer document
         new_doc = {"sample": sample, "question_id": question_id, field: value}
         result = db.collection("Answers").insert(new_doc, return_new=True)
         answer_doc = result["new"]
-
-        # Create the GivesAnswer edge from question → answer
-        db.collection("GivesAnswer").insert({
-            "_from": question["_id"],
-            "_to": answer_doc["_id"],
-        })
 
         return Response(answer_doc, status=status.HTTP_201_CREATED)
 
@@ -2685,19 +2711,13 @@ class AnswerViewSet(ArangoModelViewSet):
 
     def destroy(self, request, pk=None):
         """
-        DELETE /answers/{key}/ — delete an answer document and its GivesAnswer edge.
+        DELETE /answers/{key}/ — delete an answer document.
         Requires editor+ role.
         """
         db = request.arangodb
         doc = db.collection(self.model.collection_name).get(pk)
         if not doc:
             raise NotFound(detail="Answer not found")
-
-        # Remove the GivesAnswer edge(s) pointing to this answer
-        db.aql.execute(
-            "FOR e IN GivesAnswer FILTER e._to == @id REMOVE e IN GivesAnswer",
-            bind_vars={"id": doc["_id"]},
-        )
 
         db.collection(self.model.collection_name).delete(pk)
         return Response(status=status.HTTP_204_NO_CONTENT)
@@ -2859,11 +2879,10 @@ class AnswerViewSet(ArangoModelViewSet):
                 # Only return answers for samples that have answers to ALL selected questions
                 aql = f"""
                 LET all_answers = (
-                  FOR question IN ResearchQuestions
-                    FILTER question.id IN @question_ids
-                    FOR answer IN 1..1 OUTBOUND question GivesAnswer
-                      {filter_clause}
-                      RETURN MERGE(answer, {{question_id: question.id}})
+                  FOR answer IN Answers
+                    FILTER answer.question_id IN @question_ids
+                    {filter_clause}
+                    RETURN answer
                 )
                 LET qualified_samples = (
                   FOR a IN all_answers
@@ -2877,11 +2896,10 @@ class AnswerViewSet(ArangoModelViewSet):
                 """
             else:
                 aql = f"""
-                FOR question IN ResearchQuestions
-                  FILTER question.id IN @question_ids
-                  FOR answer IN 1..1 OUTBOUND question GivesAnswer
-                    {filter_clause}
-                    RETURN MERGE(answer, {{question_id: question.id}})
+                FOR answer IN Answers
+                  FILTER answer.question_id IN @question_ids
+                  {filter_clause}
+                  RETURN answer
                 """
 
             cursor = db.aql.execute(aql, bind_vars=bind_vars)

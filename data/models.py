@@ -1,5 +1,3 @@
-from django.db import models
-
 from roma.models import ArangoModel
 
 
@@ -23,15 +21,6 @@ class ResearchQuestion(ArangoModel):
 
     def _str_(self):
         return self.name
-
-
-class Translation(models.Model):
-    class Meta:
-        db_table = "phrase_anchors"
-
-    conjugated = models.BooleanField(null=True, blank=True)
-    english = models.TextField(blank=True, null=True)
-    phrase_ref = models.IntegerField()
 
 
 class MasterPhrase(ArangoModel):

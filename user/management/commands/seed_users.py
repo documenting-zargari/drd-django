@@ -3,50 +3,21 @@ Idempotent user seeding — safe to run on every container start.
 Only creates users that don't already exist. Skips silently if
 users are already present.
 
+If the database isn't ready yet (migrations not applied, tables
+missing, DB unreachable) the command prints a hint and exits 0
+instead of crashing, so it's harmless in a container start script.
+
 Usage:
     python manage.py seed_users
     python manage.py seed_users --default-password changeme123
 """
 
 from django.core.management.base import BaseCommand
+from django.db import DatabaseError, connection
+from django.db.migrations.executor import MigrationExecutor
 
 from user.models import CustomUser, UserProjectRole
-
-
-USERS = [
-    {
-        "username": "mundstein",
-        "email": "smundstein@gmail.com",
-        "first_name": "Sascha",
-        "last_name": "Mundstein",
-        "is_global_admin": True,
-        "project_roles": [{"project": "rms", "role": "admin"}],
-    },
-    {
-        "username": "wiedner",
-        "email": "jakob.wiedner@uni-graz.ac.at",
-        "first_name": "Jakob",
-        "last_name": "Wiedner",
-        "is_global_admin": False,
-        "project_roles": [{"project": "rms", "role": "editor"}],
-    },
-    {
-        "username": "aminian",
-        "email": "Ioana.Aminian@oeaw.ac.at",
-        "first_name": "Ioana",
-        "last_name": "Aminian-Jazi",
-        "is_global_admin": False,
-        "project_roles": [{"project": "rms", "role": "editor"}],
-    },
-    {
-        "username": "yaron",
-        "email": "y.matras@aston.ac.uk",
-        "first_name": "Yaron",
-        "last_name": "Matras",
-        "is_global_admin": False,
-        "project_roles": [{"project": "rms", "role": "admin"}],
-    },
-]
+from user.seed_data import SEED_USERS
 
 
 class Command(BaseCommand):
@@ -64,11 +35,40 @@ class Command(BaseCommand):
             help="Run without prompts.",
         )
 
+    def _database_not_ready(self):
+        """Return a reason string if the DB can't be seeded yet, else None."""
+        try:
+            executor = MigrationExecutor(connection)
+            targets = executor.loader.graph.leaf_nodes()
+            if executor.migration_plan(targets):
+                return "there are unapplied migrations"
+        except DatabaseError as exc:
+            return f"the database is not reachable ({exc})"
+
+        if CustomUser._meta.db_table not in connection.introspection.table_names():
+            return "the user tables do not exist yet"
+        return None
+
     def handle(self, *args, **options):
+        not_ready = self._database_not_ready()
+        if not_ready:
+            self.stdout.write(
+                self.style.WARNING(
+                    f"Skipping user seeding: {not_ready}.\n"
+                    "\nRun the database setup first, then seed:\n"
+                    "  python manage.py migrate\n"
+                    "  python manage.py seed_users\n"
+                    "\nOr, to migrate + flush all data + recreate the default users\n"
+                    "in one step:\n"
+                    "  python manage.py setup_auth\n"
+                )
+            )
+            return
+
         default_password = options["default_password"]
         created_count = 0
 
-        for u in USERS:
+        for u in SEED_USERS:
             if CustomUser.objects.filter(username=u["username"]).exists():
                 continue
 

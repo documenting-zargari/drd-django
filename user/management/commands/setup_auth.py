@@ -18,41 +18,7 @@ Usage:
 from django.core.management import call_command
 from django.core.management.base import BaseCommand
 
-
-USERS = [
-    {
-        "username": "mundstein",
-        "email": "smundstein@gmail.com",
-        "first_name": "Sascha",
-        "last_name": "Mundstein",
-        "is_global_admin": True,
-        "project_roles": [{"project": "rms", "role": "admin"}],
-    },
-    {
-        "username": "wiedner",
-        "email": "jakob.wiedner@uni-graz.ac.at",
-        "first_name": "Jakob",
-        "last_name": "Wiedner",
-        "is_global_admin": False,
-        "project_roles": [{"project": "rms", "role": "editor"}],
-    },
-    {
-        "username": "aminian",
-        "email": "Ioana.Aminian@oeaw.ac.at",
-        "first_name": "Ioana",
-        "last_name": "Aminian-Jazi",
-        "is_global_admin": False,
-        "project_roles": [{"project": "rms", "role": "editor"}],
-    },
-    {
-        "username": "yaron",
-        "email": "y.matras@aston.ac.uk",
-        "first_name": "Yaron",
-        "last_name": "Matras",
-        "is_global_admin": False,
-        "project_roles": [{"project": "rms", "role": "admin"}],
-    },
-]
+from user.seed_data import SEED_USERS
 
 
 class Command(BaseCommand):
@@ -76,10 +42,10 @@ class Command(BaseCommand):
         call_command("flush", interactive=False, verbosity=0)
         self.stdout.write(self.style.SUCCESS("   Database flushed."))
 
-        self.stdout.write(f"\n3. Seeding {len(USERS)} users (password: {default_password})...")
+        self.stdout.write(f"\n3. Seeding {len(SEED_USERS)} users (password: {default_password})...")
         from user.models import CustomUser, UserProjectRole
 
-        for u in USERS:
+        for u in SEED_USERS:
             user = CustomUser.objects.create_user(
                 username=u["username"],
                 email=u["email"],

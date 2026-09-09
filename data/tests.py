@@ -1242,3 +1242,283 @@ class ConcordanceWordlistTests(SimpleTestCase):
     def test_page_size_capped_at_1000(self):
         self._run("TranscriptionViewSet", {"page_size": 99999})
         self.assertEqual(self._wordlist_bind()["page_size"], 1000)
+
+
+# ---------------------------------------------------------------------------
+# POST / PATCH / DELETE /transcriptions/ — create, partial_update, destroy
+# ---------------------------------------------------------------------------
+
+class _FakeTranscriptionWriteDB:
+    """Minimal fake for the transcription write endpoints: a set of known
+    sample_refs, an in-memory Transcriptions collection, and the leaf /
+    branch id sets the link validation queries check against."""
+
+    def __init__(self, samples=None, transcriptions=None,
+                 leaf_question_ids=None, branch_category_ids=None):
+        self.samples = samples if samples is not None else ["AL-001"]
+        self.transcriptions = {t["_key"]: dict(t) for t in (transcriptions or [])}
+        self.leaf_question_ids = set(leaf_question_ids if leaf_question_ids is not None else [10, 11])
+        self.branch_category_ids = set(branch_category_ids if branch_category_ids is not None else [4, 5])
+        self._auto = 0
+
+    def collection(self, name):
+        col = MagicMock()
+        if name == "Samples":
+            col.find.side_effect = lambda spec, limit=None: (
+                [{"sample_ref": spec["sample_ref"]}]
+                if spec.get("sample_ref") in self.samples else []
+            )
+        elif name == "Transcriptions":
+            col.get.side_effect = lambda key: self.transcriptions.get(key)
+
+            def _insert(doc):
+                self._auto += 1
+                key = doc.get("_key") or f"auto{self._auto}"
+                self.transcriptions[key] = {**doc, "_key": key}
+                return {"_key": key}
+
+            def _update(doc):
+                key = doc["_key"]
+                self.transcriptions[key].update({k: v for k, v in doc.items() if k != "_key"})
+                return {"_key": key}
+
+            col.insert.side_effect = _insert
+            col.update.side_effect = _update
+            col.delete.side_effect = lambda key: self.transcriptions.pop(key, None)
+        return col
+
+    def aql_execute(self, query, bind_vars=None):
+        bv = bind_vars or {}
+        if "FILTER t.sample == @s AND t.segment_no == @n" in query:
+            hits = [1 for t in self.transcriptions.values()
+                    if t.get("sample") == bv["s"] and t.get("segment_no") == bv["n"]]
+            return iter(hits[:1])
+        if "ResearchQuestions" in query and "is_leaf == true" in query:
+            return iter([i for i in bv["ids"] if i in self.leaf_question_ids])
+        if "Categories" in query and "is_leaf != true" in query:
+            return iter([i for i in bv["ids"] if i in self.branch_category_ids])
+        return iter([])
+
+
+def _transcription_write_viewset(data=None, pk=None, db=None):
+    from data.views import TranscriptionViewSet
+    fake = db or _FakeTranscriptionWriteDB()
+    mock_db = MagicMock()
+    mock_db.aql.execute.side_effect = fake.aql_execute
+    mock_db.collection.side_effect = fake.collection
+    req = MagicMock(spec=Request)
+    req.data = data or {}
+    req.arangodb = mock_db
+    req.arango_error = None
+    vs = TranscriptionViewSet()
+    vs.request = req
+    vs.kwargs = {"pk": pk} if pk else {}
+    vs.format_kwarg = None
+    return vs, fake
+
+
+class TranscriptionCreateTests(SimpleTestCase):
+
+    def test_creates_segment(self):
+        vs, fake = _transcription_write_viewset(
+            {"sample": "AL-001", "segment_no": 3, "transcription": "text",
+             "question_ids": [10], "category_ids": [4]}
+        )
+        resp = vs.create(vs.request)
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["sample"], "AL-001")
+        self.assertEqual(resp.data["segment_no"], 3)
+        self.assertEqual(resp.data["question_ids"], [10])
+        self.assertEqual(len(fake.transcriptions), 1)
+
+    def test_missing_segment_no_is_400(self):
+        vs, _ = _transcription_write_viewset({"sample": "AL-001"})
+        resp = vs.create(vs.request)
+        self.assertEqual(resp.status_code, 400)
+
+    def test_non_integer_segment_no_is_400(self):
+        vs, _ = _transcription_write_viewset({"sample": "AL-001", "segment_no": "abc"})
+        resp = vs.create(vs.request)
+        self.assertEqual(resp.status_code, 400)
+
+    def test_unknown_sample_is_400(self):
+        vs, _ = _transcription_write_viewset({"sample": "NOPE-001", "segment_no": 1})
+        resp = vs.create(vs.request)
+        self.assertEqual(resp.status_code, 400)
+
+    def test_duplicate_segment_is_409(self):
+        db = _FakeTranscriptionWriteDB(
+            transcriptions=[{"_key": "t1", "sample": "AL-001", "segment_no": 1}]
+        )
+        vs, _ = _transcription_write_viewset({"sample": "AL-001", "segment_no": 1}, db=db)
+        resp = vs.create(vs.request)
+        self.assertEqual(resp.status_code, 409)
+
+    def test_invalid_question_id_is_400(self):
+        vs, _ = _transcription_write_viewset(
+            {"sample": "AL-001", "segment_no": 2, "question_ids": [999]}
+        )
+        resp = vs.create(vs.request)
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("999", resp.data["error"])
+
+    def test_branch_id_rejected_as_question_id(self):
+        # a branch category id is not a valid leaf research question id
+        vs, _ = _transcription_write_viewset(
+            {"sample": "AL-001", "segment_no": 2, "question_ids": [4]}
+        )
+        resp = vs.create(vs.request)
+        self.assertEqual(resp.status_code, 400)
+
+
+class TranscriptionPartialUpdateTests(SimpleTestCase):
+
+    def _db(self):
+        return _FakeTranscriptionWriteDB(transcriptions=[{
+            "_key": "t1", "sample": "AL-001", "segment_no": 1,
+            "transcription": "old", "question_ids": [], "category_ids": [],
+        }])
+
+    def test_updates_question_ids(self):
+        db = self._db()
+        vs, _ = _transcription_write_viewset({"question_ids": [10, 11]}, pk="t1", db=db)
+        resp = vs.partial_update(vs.request, pk="t1")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(db.transcriptions["t1"]["question_ids"], [10, 11])
+
+    def test_invalid_question_id_is_400(self):
+        vs, _ = _transcription_write_viewset({"question_ids": [999]}, pk="t1", db=self._db())
+        resp = vs.partial_update(vs.request, pk="t1")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_invalid_category_id_is_400(self):
+        vs, _ = _transcription_write_viewset({"category_ids": [999]}, pk="t1", db=self._db())
+        resp = vs.partial_update(vs.request, pk="t1")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_no_editable_fields_is_400(self):
+        vs, _ = _transcription_write_viewset({"sample": "XX"}, pk="t1", db=self._db())
+        resp = vs.partial_update(vs.request, pk="t1")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_missing_transcription_is_404(self):
+        from rest_framework.exceptions import NotFound
+        vs, _ = _transcription_write_viewset({"transcription": "x"}, pk="nope", db=self._db())
+        with self.assertRaises(NotFound):
+            vs.partial_update(vs.request, pk="nope")
+
+    def test_still_allows_plain_text_edit(self):
+        db = self._db()
+        vs, _ = _transcription_write_viewset({"transcription": "new"}, pk="t1", db=db)
+        resp = vs.partial_update(vs.request, pk="t1")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(db.transcriptions["t1"]["transcription"], "new")
+
+
+class TranscriptionDestroyTests(SimpleTestCase):
+
+    def test_deletes_segment(self):
+        db = _FakeTranscriptionWriteDB(
+            transcriptions=[{"_key": "t1", "sample": "AL-001", "segment_no": 1}]
+        )
+        vs, _ = _transcription_write_viewset(pk="t1", db=db)
+        resp = vs.destroy(vs.request, pk="t1")
+        self.assertEqual(resp.status_code, 204)
+        self.assertNotIn("t1", db.transcriptions)
+
+    def test_missing_segment_is_404(self):
+        from rest_framework.exceptions import NotFound
+        vs, _ = _transcription_write_viewset(pk="nope")
+        with self.assertRaises(NotFound):
+            vs.destroy(vs.request, pk="nope")
+
+
+class TranscriptionWritePermissionTests(SimpleTestCase):
+    """get_permissions routes writes (except the public concordance POSTs)
+    through CanEditSample, and get_sample_ref resolves the target sample for
+    both the pk and the create-body cases."""
+
+    def _vs(self, method, action, data=None, pk=None):
+        from data.views import TranscriptionViewSet
+        vs = TranscriptionViewSet()
+        req = MagicMock(spec=Request)
+        req.method = method
+        req.data = data or {}
+        vs.request = req
+        vs.action = action
+        vs.kwargs = {"pk": pk} if pk else {}
+        return vs
+
+    def test_write_actions_require_can_edit_sample(self):
+        from user.permissions import CanEditSample
+        for method, action in [("PATCH", "partial_update"),
+                               ("POST", "create"),
+                               ("DELETE", "destroy")]:
+            perms = self._vs(method, action).get_permissions()
+            self.assertEqual(len(perms), 1)
+            self.assertIsInstance(perms[0], CanEditSample)
+
+    def test_public_concordance_posts_stay_open(self):
+        from rest_framework.permissions import AllowAny
+        for action in ["search", "export", "frequency", "wordlist"]:
+            perms = self._vs("POST", action).get_permissions()
+            self.assertIsInstance(perms[0], AllowAny)
+
+    def test_get_sample_ref_from_create_body(self):
+        vs = self._vs("POST", "create", data={"sample": "AL-007"})
+        self.assertEqual(vs.get_sample_ref(vs.request), "AL-007")
+
+    def test_get_sample_ref_from_existing_doc(self):
+        db = _FakeTranscriptionWriteDB(
+            transcriptions=[{"_key": "t1", "sample": "AL-001", "segment_no": 1}]
+        )
+        mock_db = MagicMock()
+        mock_db.collection.side_effect = db.collection
+        vs = self._vs("PATCH", "partial_update", pk="t1")
+        vs.request.arangodb = mock_db
+        self.assertEqual(vs.get_sample_ref(vs.request), "AL-001")
+
+
+# ---------------------------------------------------------------------------
+# GET /research-questions/search/ — name OR ancestor-category-name match
+# ---------------------------------------------------------------------------
+
+class ResearchQuestionSearchTests(SimpleTestCase):
+
+    def _run(self, q):
+        from data.views import ResearchQuestionViewSet
+        captured = {}
+
+        def aql_execute(query, bind_vars=None):
+            captured["query"] = query
+            captured["bind_vars"] = bind_vars or {}
+            return iter([])
+
+        mock_db = MagicMock()
+        mock_db.aql.execute.side_effect = aql_execute
+        factory = RequestFactory()
+        req = Request(factory.get("/research-questions/search/", {"q": q}))
+        req.user = _mock_user()
+        req.arangodb = mock_db
+        vs = ResearchQuestionViewSet()
+        vs.request = req
+        vs.kwargs = {}
+        vs.format_kwarg = None
+        vs.action = "search"
+        resp = vs.search(req)
+        return resp, captured
+
+    def test_short_query_returns_empty_without_hitting_db(self):
+        resp, captured = self._run("a")
+        self.assertEqual(list(resp.data), [])
+        self.assertNotIn("query", captured)
+
+    def test_still_matches_question_name(self):
+        _, captured = self._run("andre")
+        self.assertIn("REGEX_TEST(q.name", captured["query"])
+        self.assertEqual(captured["bind_vars"]["pattern"], ".*andre.*")
+
+    def test_also_matches_ancestor_category_name(self):
+        _, captured = self._run("Adpositions")
+        self.assertIn("q.hierarchy[*", captured["query"])
+        self.assertIn("is_leaf == true", captured["query"])

@@ -491,8 +491,12 @@ class ResearchQuestionViewSet(ArangoModelViewSet):
     def search(self, request):
         """
         GET /research-questions/search/?q=<term> - search ResearchQuestions
-        by name (case-insensitive substring, minimum 2 characters), sorted
-        by id, capped at 50 results.
+        (case-insensitive substring, minimum 2 characters), sorted by id,
+        capped at 50 results.
+
+        Matches the question's own name OR any ancestor category name in its
+        hierarchy — so searching a category name (e.g. "Adpositions") surfaces
+        the research questions under it rather than the category itself.
         """
         query = request.query_params.get("q", "").strip()
         if not query or len(query) < 2:
@@ -502,8 +506,9 @@ class ResearchQuestionViewSet(ArangoModelViewSet):
         cursor = db.aql.execute(
             """
             FOR q IN ResearchQuestions
-                FILTER REGEX_TEST(q.name, @pattern, true)
                 FILTER q.is_leaf == true
+                FILTER REGEX_TEST(q.name, @pattern, true)
+                    OR LENGTH(q.hierarchy[* FILTER REGEX_TEST(CURRENT, @pattern, true)]) > 0
                 SORT q.id
                 LIMIT 50
                 RETURN q
@@ -3062,24 +3067,136 @@ class TranscriptionViewSet(ArangoModelViewSet):
 
     model = Transcription
     serializer_class = TranscriptionSerializer
-    http_method_names = ["get", "post", "patch", "head", "options"]
-    permission_classes = [AllowAny]  # GET and search POST are public; PATCH uses per-action override
+    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
+    permission_classes = [AllowAny]  # GET and search POST are public; writes use per-action override
 
-    EDITABLE_FIELDS = {"transcription", "english", "gloss", "segment_no"}
+    # Concordance POST actions that stay public (never gated by CanEditSample).
+    PUBLIC_POST_ACTIONS = {"search", "export", "frequency", "wordlist"}
+
+    EDITABLE_FIELDS = {
+        "transcription",
+        "english",
+        "gloss",
+        "segment_no",
+        "question_ids",
+        "category_ids",
+    }
 
     def get_permissions(self):
-        if self.request.method == "PATCH":
+        if self.request.method in ("PATCH", "POST", "DELETE") and getattr(
+            self, "action", None
+        ) not in self.PUBLIC_POST_ACTIONS:
             return [CanEditSample()]
         return [AllowAny()]
 
     def get_sample_ref(self, request):
         """Required by CanEditSample to resolve the target sample."""
         pk = self.kwargs.get("pk")
-        if not pk:
-            return None
+        if pk:
+            db = request.arangodb
+            doc = db.collection(self.model.collection_name).get(pk)
+            return doc.get("sample") if doc else None
+        # POST (create): no pk yet, take the target sample straight from the body.
+        return request.data.get("sample")
+
+    @staticmethod
+    def _validate_link_ids(db, question_ids, category_ids):
+        """Same is_leaf split MasterPhraseViewSet uses for question_ids /
+        category_ids (see its create()/partial_update()): research questions
+        must be leaves, categories must be branches. Returns an error Response
+        on the first invalid list, else None. has_children is unset on every
+        Categories doc, so is_leaf is the only reliable branch/leaf signal."""
+        if question_ids:
+            valid = set(db.aql.execute(
+                "FOR q IN ResearchQuestions FILTER q.id IN @ids AND q.is_leaf == true RETURN q.id",
+                bind_vars={"ids": list(question_ids)},
+            ))
+            bad = set(question_ids) - valid
+            if bad:
+                return Response(
+                    {"error": f"Not valid research question ids: {sorted(bad)}"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        if category_ids:
+            valid = set(db.aql.execute(
+                "FOR c IN Categories FILTER c.id IN @ids AND c.is_leaf != true RETURN c.id",
+                bind_vars={"ids": list(category_ids)},
+            ))
+            bad = set(category_ids) - valid
+            if bad:
+                return Response(
+                    {"error": f"Not valid category ids: {sorted(bad)}"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        return None
+
+    def create(self, request):
+        """
+        POST /transcriptions/ — add a new transcription segment to a sample.
+        Requires editor+ role for the target sample (editors with sample
+        restrictions may only add segments for their allowed samples).
+
+        Required: sample (must name an existing Sample), segment_no (int).
+        Optional: transcription, english, gloss (strings), question_ids,
+        category_ids (validated the same way as PATCH). The _key is left to
+        Arango — existing Transcription keys are opaque.
+        """
         db = request.arangodb
-        doc = db.collection(self.model.collection_name).get(pk)
-        return doc.get("sample") if doc else None
+        data = request.data
+
+        sample_ref = str(data.get("sample", "")).strip()
+        if not sample_ref:
+            return Response({"error": "sample is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        raw_segment = data.get("segment_no")
+        try:
+            segment_no = int(raw_segment)
+        except (TypeError, ValueError):
+            return Response(
+                {"error": "segment_no is required and must be an integer"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        for field in ("transcription", "english", "gloss"):
+            if data.get(field) is not None and not isinstance(data.get(field), str):
+                return Response(
+                    {"error": f"{field} must be a string"}, status=status.HTTP_400_BAD_REQUEST
+                )
+
+        if not list(db.collection(Sample.collection_name).find({"sample_ref": sample_ref}, limit=1)):
+            return Response(
+                {"error": f"No such sample '{sample_ref}'"}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        dup = list(db.aql.execute(
+            "FOR t IN Transcriptions FILTER t.sample == @s AND t.segment_no == @n LIMIT 1 RETURN 1",
+            bind_vars={"s": sample_ref, "n": segment_no},
+        ))
+        if dup:
+            return Response(
+                {"error": f"Segment {segment_no} already exists for sample '{sample_ref}'."},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        question_ids = data.get("question_ids") or []
+        category_ids = data.get("category_ids") or []
+        err = self._validate_link_ids(db, question_ids, category_ids)
+        if err:
+            return err
+
+        doc = {
+            "sample": sample_ref,
+            "segment_no": segment_no,
+            "transcription": data.get("transcription") or None,
+            "english": data.get("english") or None,
+            "gloss": data.get("gloss") or None,
+            "question_ids": question_ids,
+            "category_ids": category_ids,
+        }
+        meta = db.collection(self.model.collection_name).insert(doc)
+        created = db.collection(self.model.collection_name).get(meta["_key"])
+        serializer = self.serializer_class(created, context={"request": request})
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
 
     def partial_update(self, request, pk=None):
         """
@@ -3087,7 +3204,8 @@ class TranscriptionViewSet(ArangoModelViewSet):
         Requires editor+ role. Editors with sample restrictions may only
         edit transcriptions belonging to their allowed samples.
 
-        Allowed fields: transcription, english, gloss, segment_no
+        Allowed fields: transcription, english, gloss, segment_no,
+        question_ids, category_ids
         """
         db = request.arangodb
         doc = db.collection(self.model.collection_name).get(pk)
@@ -3101,10 +3219,31 @@ class TranscriptionViewSet(ArangoModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        err = self._validate_link_ids(
+            db,
+            updates.get("question_ids") if "question_ids" in updates else None,
+            updates.get("category_ids") if "category_ids" in updates else None,
+        )
+        if err:
+            return err
+
         db.collection(self.model.collection_name).update({"_key": pk, **updates})
         updated = db.collection(self.model.collection_name).get(pk)
         serializer = self.serializer_class(updated, context={"request": request})
         return Response(serializer.data)
+
+    def destroy(self, request, pk=None):
+        """
+        DELETE /transcriptions/{key}/ — delete a single transcription segment.
+        Requires editor+ role for this transcription's sample. Transcriptions
+        have no dependents, so nothing cascades.
+        """
+        db = request.arangodb
+        collection = db.collection(self.model.collection_name)
+        if not collection.get(pk):
+            raise NotFound(detail="Transcription not found")
+        collection.delete(pk)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     def get_queryset(self):
         try:

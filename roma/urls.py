@@ -79,7 +79,10 @@ def api_root(request, format=None):
             "transcriptions": {
                 "url": reverse("transcriptions-list", request=request, format=format),
                 "description": "Connected-speech transcriptions linked to samples and research data. "
-                               "GET ?sample=<ref> for one sample's transcriptions.",
+                               "GET ?sample=<ref> for one sample's transcriptions. POST to create a "
+                               "segment, PATCH/DELETE a detail url to edit or remove one "
+                               "(editor+ role for the sample; editable fields: transcription, english, "
+                               "gloss, segment_no, question_ids, category_ids).",
                 "search": reverse("transcriptions-search", request=request, format=format),
                 "export": reverse("transcriptions-export", request=request, format=format),
                 "frequency": reverse("transcriptions-frequency", request=request, format=format),

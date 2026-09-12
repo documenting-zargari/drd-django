@@ -42,16 +42,20 @@ class ArangoModelViewSet(viewsets.ViewSet):
         # Return a list of all objects.
         return self.model.all()
 
+    #: extra document fields (besides ``_key`` / ``id``) a subclass allows
+    #: ``get_object`` to resolve a pk against, e.g. ``["slug"]``.
+    lookup_fields = ()
+
     def get_object(self, pk):
         # Smart lookup: try _key first (efficient), fallback to id field (backward compatible)
         db = self.request.arangodb
         collection = db.collection(self.model.collection_name)
-        
+
         # Try _key first (most efficient)
         doc = collection.get(pk)
         if doc:
             return doc
-        
+
         # Fallback to id field search (less efficient but backward compatible)
         if isinstance(pk, str) and pk.isdigit():
             pk = int(pk)
@@ -59,7 +63,13 @@ class ArangoModelViewSet(viewsets.ViewSet):
         docs = list(cursor)
         if docs:
             return docs[0]
-        
+
+        # Subclass-declared human-readable identifiers (e.g. View.slug).
+        for field in self.lookup_fields:
+            docs = list(collection.find({field: pk}, limit=1))
+            if docs:
+                return docs[0]
+
         raise NotFound(detail="Object not found")
 
     def list(self, request):

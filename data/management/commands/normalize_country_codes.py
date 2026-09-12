@@ -17,21 +17,8 @@ Usage:
 
 from django.core.management.base import BaseCommand
 
+from data.country_codes import ISO_REMAP
 from data.models import Sample
-
-
-# Non-standard stored code -> ISO 3166-1 alpha-2.
-# Codes already valid alpha-2 (AL, AT, BG, CZ, DE, FR, GB, GR, HR, HU, IR, IT,
-# LT, LV, MD, MK, MX, NO, PL, RO, SE, SK, TR) are intentionally absent.
-ISO_REMAP = {
-    "EST": "EE",  # Estonia
-    "FIN": "FI",  # Finland
-    "RUS": "RU",  # Russia
-    "UKR": "UA",  # Ukraine
-    "SLO": "SI",  # Slovenia (Prekmurje varieties; Slovakia is the separate "SK" set)
-    "SP": "ES",   # Spain
-    "N": "NO",    # Norway (single PUB sample, Trondheim)
-}
 
 # "YU" is deliberately kept: the samples span Serbia, Kosovo and Montenegro,
 # so no single successor state is correct. "YU" is an exceptionally reserved

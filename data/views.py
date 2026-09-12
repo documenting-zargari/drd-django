@@ -30,6 +30,7 @@ from rest_framework.viewsets import ViewSet
 from natsort import natsorted
 from arango.exceptions import DocumentInsertError
 
+from data.country_codes import expand_with_legacy_aliases
 from data.models import (
     Answer,
     Category,
@@ -111,13 +112,19 @@ def _resolve_country_scope(db, request, sample_refs, country_codes, visible_refs
     Consistent with the existing search actions: an explicit `sample_refs`
     still bypasses the visible-set filter; the country filter is applied on
     top of whichever base set is in play.
+
+    `country_codes` are canonical ISO alpha-2 (what the client sends), but
+    Sample.country_code may still hold legacy un-normalized values (e.g.
+    "FIN") on databases where `normalize_country_codes` hasn't been (re)run
+    or on records reintroduced since — so the lookup is expanded to match
+    those aliases too, rather than assuming the data is clean.
     """
     base = set(sample_refs) if sample_refs else set(visible_refs)
     if country_codes:
         cc_refs = set(
             db.aql.execute(
                 "FOR s IN Samples FILTER s.country_code IN @codes RETURN s.sample_ref",
-                bind_vars={"codes": list(country_codes)},
+                bind_vars={"codes": list(expand_with_legacy_aliases(country_codes))},
             )
         )
         base &= cc_refs

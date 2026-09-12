@@ -983,6 +983,21 @@ class TranscriptionsByAnswerTests(SimpleTestCase):
 # Concordance: whole-word / diacritics-fold / country-scope helpers
 # ---------------------------------------------------------------------------
 
+class CountryCodeAliasTests(SimpleTestCase):
+    def test_expand_with_legacy_aliases_adds_known_alias(self):
+        from data.country_codes import expand_with_legacy_aliases
+        self.assertEqual(expand_with_legacy_aliases(["FI"]), {"FI", "FIN"})
+
+    def test_expand_with_legacy_aliases_passes_through_unmapped_code(self):
+        from data.country_codes import expand_with_legacy_aliases
+        self.assertEqual(expand_with_legacy_aliases(["AL"]), {"AL"})
+
+    def test_expand_with_legacy_aliases_handles_multiple_codes(self):
+        from data.country_codes import expand_with_legacy_aliases
+        out = expand_with_legacy_aliases(["FI", "AL"])
+        self.assertEqual(out, {"FI", "FIN", "AL"})
+
+
 class ConcordanceHelperTests(SimpleTestCase):
     """Pure-function coverage for the concordance search helpers in data.views."""
 
@@ -1055,6 +1070,24 @@ class ConcordanceHelperTests(SimpleTestCase):
         db.aql.execute.side_effect = lambda q, bind_vars=None: iter(["AL-001"])
         out = _resolve_country_scope(db, MagicMock(), ["AL-001", "AL-002"], ["AL"], ["AL-001", "AL-002"])
         self.assertEqual(out, ["AL-001"])
+
+    def test_resolve_country_scope_matches_legacy_unnormalized_country_code(self):
+        # Regression: querying "FI" (the canonical code the client sends) must
+        # still match samples whose Sample.country_code was never normalized
+        # from the legacy "FIN" value (e.g. because normalize_country_codes
+        # hasn't been run on this database, or a record was reintroduced by
+        # import). Previously an exact IN match against @codes=["FI"] missed
+        # such records entirely, silently zeroing out results.
+        from data.views import _resolve_country_scope
+        db = MagicMock()
+
+        def fake_execute(q, bind_vars=None):
+            self.assertIn("FIN", bind_vars["codes"])  # legacy alias expanded in
+            return iter(["FIN-002"])  # stored as legacy "FIN", not "FI"
+
+        db.aql.execute.side_effect = fake_execute
+        out = _resolve_country_scope(db, MagicMock(), [], ["FI"], ["FIN-002", "AL-001"])
+        self.assertEqual(out, ["FIN-002"])
 
 
 class PhraseSearchConcordanceTests(SimpleTestCase):

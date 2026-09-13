@@ -349,8 +349,8 @@ class CategoryViewSet(ArangoModelViewSet):
                 hierarchy = doc.get("hierarchy", [])
                 if isinstance(hierarchy, str):
                     try:
-                        hierarchy = eval(hierarchy)
-                    except Exception as _:
+                        hierarchy = ast.literal_eval(hierarchy)
+                    except (ValueError, SyntaxError):
                         hierarchy = []
                 results.append(
                     {

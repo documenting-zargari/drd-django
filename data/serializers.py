@@ -1,3 +1,5 @@
+import ast
+
 from django.conf import settings
 from cryptography.fernet import InvalidToken
 from rest_framework import serializers
@@ -57,9 +59,8 @@ class CategorySerializer(ArangoModelSerializer):
 
         if isinstance(hierarchy, str):
             try:
-                hierarchy = eval(hierarchy)  # Convert string representation to list
-            except Exception as e:
-                print(f"Error parsing hierarchy: {e}")
+                hierarchy = ast.literal_eval(hierarchy)  # Convert string representation to list
+            except (ValueError, SyntaxError):
                 hierarchy = []
         return hierarchy
 
@@ -72,9 +73,8 @@ class CategorySerializer(ArangoModelSerializer):
 
         if isinstance(hierarchy_ids, str):
             try:
-                hierarchy_ids = eval(hierarchy_ids)
-            except Exception as e:
-                print(f"Error parsing hierarchy_ids: {e}")
+                hierarchy_ids = ast.literal_eval(hierarchy_ids)
+            except (ValueError, SyntaxError):
                 hierarchy_ids = []
         return hierarchy_ids
 

@@ -1,3 +1,4 @@
+import ast
 import csv
 import io
 import json
@@ -261,11 +262,20 @@ class CategoryViewSet(ArangoModelViewSet):
     def get_queryset(self):
         parent_id = self.request.query_params.get("parent_id")
         db = self.request.arangodb
-        collection = db.collection(self.model.collection_name)
-        exclude_ids = [2, 3]
-        id = int(parent_id) if parent_id else 1
-        categories_cursor = collection.find({"parent_id": id})
-        return [c for c in categories_cursor if c["id"] not in exclude_ids]
+        pid = int(parent_id) if parent_id else 1
+        # Explicit SORT: the child order is the authored hierarchy order (id
+        # ascending). Without it, ArangoDB returns documents in storage order,
+        # which shifts whenever a doc is updated (e.g. stamping `view_slug`).
+        cursor = db.aql.execute(
+            """
+            FOR doc IN Categories
+              FILTER doc.parent_id == @pid AND doc.id NOT IN [2, 3]
+              SORT doc.id ASC
+              RETURN doc
+            """,
+            bind_vars={"pid": pid},
+        )
+        return list(cursor)
 
 
     def list(self, request, *args, **kwargs):
@@ -339,8 +349,8 @@ class CategoryViewSet(ArangoModelViewSet):
                 hierarchy = doc.get("hierarchy", [])
                 if isinstance(hierarchy, str):
                     try:
-                        hierarchy = eval(hierarchy)
-                    except Exception as _:
+                        hierarchy = ast.literal_eval(hierarchy)
+                    except (ValueError, SyntaxError):
                         hierarchy = []
                 results.append(
                     {
@@ -403,21 +413,26 @@ class CategoryViewSet(ArangoModelViewSet):
             return Response({"error": "Database not available"}, status=500)
 
         query = request.query_params.get("q", "").strip()
+        _fields = (
+            '{ "id": doc.id, "name": doc.name, "hierarchy": doc.hierarchy, '
+            '"parent_id": doc.parent_id, "path": doc.path, "view_slug": doc.view_slug }'
+        )
+        _filter = "doc.view_slug != null OR (doc.path != null AND doc.path != \"\")"
         if query:
             search_pattern = f".*{query}.*"
-            aql_query = """
+            aql_query = f"""
             FOR doc IN Categories
-            FILTER doc.path != null AND doc.path != "" AND REGEX_TEST(doc.name, @search_pattern, 'i')
+            FILTER ({_filter}) AND REGEX_TEST(doc.name, @search_pattern, 'i')
             SORT doc.id ASC
-            RETURN { "id": doc.id, "name": doc.name, "hierarchy": doc.hierarchy, "parent_id": doc.parent_id, "path": doc.path }
+            RETURN {_fields}
             """
             bind_vars = {"search_pattern": search_pattern}
         else:
-            aql_query = """
+            aql_query = f"""
             FOR doc IN Categories
-            FILTER doc.path != null AND doc.path != ""
+            FILTER {_filter}
             SORT doc.id ASC
-            RETURN { "id": doc.id, "name": doc.name, "hierarchy": doc.hierarchy, "parent_id": doc.parent_id, "path": doc.path }
+            RETURN {_fields}
             """
             bind_vars = {}
 
@@ -428,8 +443,8 @@ class CategoryViewSet(ArangoModelViewSet):
                 hierarchy = doc.get("hierarchy", [])
                 if isinstance(hierarchy, str):
                     try:
-                        hierarchy = eval(hierarchy)
-                    except Exception as _:
+                        hierarchy = ast.literal_eval(hierarchy)
+                    except (ValueError, SyntaxError):
                         hierarchy = []
                 results.append(
                     {
@@ -437,7 +452,9 @@ class CategoryViewSet(ArangoModelViewSet):
                         "name": doc["name"],
                         "hierarchy": hierarchy if len(hierarchy) > 2 else [],
                         "parent_id": doc["parent_id"],
-                        "path": doc["path"],
+                        "path": doc.get("path"),
+                        "view_slug": doc.get("view_slug"),
+                        "has_table": bool(doc.get("view_slug") or doc.get("path")),
                         "has_children": False,
                     }
                 )
@@ -3019,31 +3036,49 @@ class AnswerViewSet(ArangoModelViewSet):
 
 class ViewViewSet(ArangoModelViewSet):
     """
-    API endpoint for retrieving HTML template views.
+    API endpoint for table Views.
 
-    Views contain HTML templates with associated filenames and parent categories.
+    Each View carries a declarative ``spec`` (schema v1, see ``data.table_spec``)
+    describing a set of Categories/ResearchQuestions/Answers tables. ``content``
+    (the legacy HTML template string) is still returned during the transition.
 
     Available endpoints:
-    - GET /views/ - List all views
-    - GET /views/?filename=<filename> - Retrieve a specific view by filename
-    - GET /views/<_key>/ - Retrieve specific view by _key
+    - GET /views/ - list all views
+    - GET /views/<slug>/ - retrieve one view by slug (also accepts _key)
+    - GET /views/?filename=<filename> - legacy lookup, still supported
     """
 
     model = View
     serializer_class = ViewSerializer
-    http_method_names = ["get", "head", "options"]  # Read-only access
+    http_method_names = ["get", "head", "options"]  # Read-only (writable in a later phase)
+    lookup_fields = ("slug", "filename")
 
     def list(self, request):
-        filename = request.query_params.get("filename")
-        if filename:
-            doc = View.get_by_field("filename", filename)
+        key = request.query_params.get("slug") or request.query_params.get("filename")
+        if key:
+            doc = self._resolve(key)
             if not doc:
-                raise NotFound(detail=f"View not found for filename: {filename}")
+                raise NotFound(detail=f"View not found: {key}")
             serializer = self.serializer_class(
                 doc, context={"request": request, "view": self}
             )
             return Response([serializer.data])
         return super().list(request)
+
+    @staticmethod
+    def _resolve(key):
+        """Accept a slug, a legacy `.php` filename, or an old `browse-` URL id."""
+        bare = re.sub(r"\.php$", "", key, flags=re.IGNORECASE)
+        for field, value in (
+            ("slug", key),
+            ("slug", re.sub(r"^browse-", "", bare)),
+            ("filename", key),
+            ("filename", f"{bare}.php"),
+        ):
+            doc = View.get_by_field(field, value)
+            if doc:
+                return doc
+        return None
 
 
 class TranscriptionViewSet(ArangoModelViewSet):

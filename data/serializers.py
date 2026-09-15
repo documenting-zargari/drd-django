@@ -1,3 +1,5 @@
+import ast
+
 from django.conf import settings
 from cryptography.fernet import InvalidToken
 from rest_framework import serializers
@@ -25,6 +27,7 @@ class CategorySerializer(ArangoModelSerializer):
     drill = serializers.SerializerMethodField()
     hierarchy = serializers.SerializerMethodField()
     hierarchy_ids = serializers.SerializerMethodField()
+    has_table = serializers.SerializerMethodField()
 
     class Meta:
         model = Category
@@ -38,7 +41,13 @@ class CategorySerializer(ArangoModelSerializer):
             "is_leaf",
             "drill",
             "path",
+            "view_slug",
+            "has_table",
         )
+
+    def get_has_table(self, obj):
+        get = obj.get if isinstance(obj, dict) else lambda k, d=None: getattr(obj, k, d)
+        return bool(get("view_slug") or get("path"))
 
     def get_hierarchy(self, obj):
         # this contains a json string - return a list
@@ -50,9 +59,8 @@ class CategorySerializer(ArangoModelSerializer):
 
         if isinstance(hierarchy, str):
             try:
-                hierarchy = eval(hierarchy)  # Convert string representation to list
-            except Exception as e:
-                print(f"Error parsing hierarchy: {e}")
+                hierarchy = ast.literal_eval(hierarchy)  # Convert string representation to list
+            except (ValueError, SyntaxError):
                 hierarchy = []
         return hierarchy
 
@@ -65,9 +73,8 @@ class CategorySerializer(ArangoModelSerializer):
 
         if isinstance(hierarchy_ids, str):
             try:
-                hierarchy_ids = eval(hierarchy_ids)
-            except Exception as e:
-                print(f"Error parsing hierarchy_ids: {e}")
+                hierarchy_ids = ast.literal_eval(hierarchy_ids)
+            except (ValueError, SyntaxError):
                 hierarchy_ids = []
         return hierarchy_ids
 
@@ -312,51 +319,23 @@ class AnswerSerializer(ArangoModelSerializer):
 
 
 class ViewSerializer(ArangoModelSerializer):
-    parent_category = serializers.SerializerMethodField()
+    """Serialises a table View. ``spec`` (schema v1) is the source of truth;
+    ``filename`` / ``content`` are legacy fields returned only during the
+    transition."""
+
+    #: fields dropped from the wire representation
+    _EXCLUDE = {"_rev", "_key", "_id"}
+    #: legacy fields still emitted until Phase 3
+    _LEGACY = {"filename", "content"}
 
     class Meta:
         model = View
-        fields = ["filename", "content", "parent_id", "parent_category"]
-
-    def get_parent_category(self, obj):
-        request = self.context.get("request")
-        if not request:
-            raise serializers.ValidationError(
-                "Request context is required for parent category lookup."
-            )
-        if not request or not hasattr(request, "arangodb"):
-            raise serializers.ValidationError(
-                "ArangoDB connection is required in the request context."
-            )
-
-        parent_id = (
-            obj.get("parent_id")
-            if isinstance(obj, dict)
-            else getattr(obj, "parent_id", None)
-        )
-        if not parent_id:
-            raise serializers.ValidationError(
-                "Parent ID is required to fetch parent category."
-            )
-
-        db = request.arangodb
-        if not db:
-            raise serializers.ValidationError("ArangoDB connection is not available.")
-        collection = db.collection(Category.collection_name)
-        cursor = collection.find({"id": parent_id}, limit=1)
-        docs = list(cursor)
-
-        if docs:
-            return CategorySerializer(docs[0], context={"request": request}).data
-        return None
+        fields = ["slug", "spec", "schema_version", "parent_id", "filename", "content"]
 
     def to_representation(self, instance):
-        result = super().to_representation(instance)
-        # Handle both dict objects (from ArangoDB) and model objects
         if isinstance(instance, dict):
-            exclude_fields = ["_rev", "_key"]
-            result = {k: v for k, v in instance.items() if k not in exclude_fields}
-        return result
+            return {k: v for k, v in instance.items() if k not in self._EXCLUDE}
+        return super().to_representation(instance)
 
 
 class TranscriptionSerializer(ArangoModelSerializer):

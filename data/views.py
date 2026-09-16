@@ -107,12 +107,18 @@ def _visible_sample_refs(db, user):
 
 def _resolve_country_scope(db, request, sample_refs, country_codes, visible_refs):
     """
-    Final list of sample refs: the caller's explicit `sample_refs` (or, when
-    none given, the visibility-filtered set) narrowed to `country_codes`.
+    Final list of sample refs: the caller's explicit `sample_refs` intersected
+    with `visible_refs` (or, when none given, `visible_refs` itself), then
+    narrowed to `country_codes`.
 
-    Consistent with the existing search actions: an explicit `sample_refs`
-    still bypasses the visible-set filter; the country filter is applied on
-    top of whichever base set is in play.
+    `visible_refs` must already be the caller's authorized set (every sample,
+    if they've opted into hidden ones — see `_visible_sample_refs` — else
+    visible=='Yes' only). An explicit `sample_refs` is never trusted on its
+    own: the client is not an authorization boundary (a stale client-side
+    cache, e.g., can hand back a hidden sample_ref for a now-anonymous
+    session — see conversation 2026-09-16), so a caller-supplied ref for a
+    sample the requester isn't authorized to see is silently dropped here
+    rather than served.
 
     `country_codes` are canonical ISO alpha-2 (what the client sends), but
     Sample.country_code may still hold legacy un-normalized values (e.g.
@@ -120,7 +126,7 @@ def _resolve_country_scope(db, request, sample_refs, country_codes, visible_refs
     or on records reintroduced since — so the lookup is expanded to match
     those aliases too, rather than assuming the data is clean.
     """
-    base = set(sample_refs) if sample_refs else set(visible_refs)
+    base = (set(sample_refs) & set(visible_refs)) if sample_refs else set(visible_refs)
     if country_codes:
         cc_refs = set(
             db.aql.execute(
@@ -1267,14 +1273,13 @@ class PhraseViewSet(ArangoModelViewSet):
                 print(f"Error searching phrases by phrase_ref: {e}")
                 raise ValidationError(f"Search failed: {str(e)}")
         else:
-            # Resolve sample refs upfront (once) instead of a subquery per phrase,
-            # then narrow to country_codes if given.
-            if not sample_refs:
-                if user_sees_hidden_samples(request.user):
-                    sample_refs = list(db.aql.execute("FOR s IN Samples RETURN s.sample_ref"))
-                else:
-                    sample_refs = list(db.aql.execute("FOR s IN Samples FILTER s.visible == 'Yes' RETURN s.sample_ref"))
-            sample_refs = _resolve_country_scope(db, request, sample_refs, country_codes, sample_refs)
+            # Resolve the caller's authorized sample set upfront (once) instead of
+            # a subquery per phrase, then narrow to sample_refs/country_codes if given.
+            if user_sees_hidden_samples(request.user):
+                visible_refs = list(db.aql.execute("FOR s IN Samples RETURN s.sample_ref"))
+            else:
+                visible_refs = list(db.aql.execute("FOR s IN Samples FILTER s.visible == 'Yes' RETURN s.sample_ref"))
+            sample_refs = _resolve_country_scope(db, request, sample_refs, country_codes, visible_refs)
 
             # Romani text ('phrase') lives per-sample on SamplePhrases, indexed by the
             # SamplePhraseSearch ArangoSearch view (norm_lower analyzer). English lives
@@ -1475,12 +1480,11 @@ class PhraseViewSet(ArangoModelViewSet):
                         {export_fields}
             """
         else:
-            if not sample_refs:
-                if user_sees_hidden_samples(request.user):
-                    sample_refs = list(db.aql.execute("FOR s IN Samples RETURN s.sample_ref"))
-                else:
-                    sample_refs = list(db.aql.execute("FOR s IN Samples FILTER s.visible == 'Yes' RETURN s.sample_ref"))
-            sample_refs = _resolve_country_scope(db, request, sample_refs, country_codes, sample_refs)
+            if user_sees_hidden_samples(request.user):
+                visible_refs = list(db.aql.execute("FOR s IN Samples RETURN s.sample_ref"))
+            else:
+                visible_refs = list(db.aql.execute("FOR s IN Samples FILTER s.visible == 'Yes' RETURN s.sample_ref"))
+            sample_refs = _resolve_country_scope(db, request, sample_refs, country_codes, visible_refs)
 
             query_lower = query.lower()
             query_bind = query if match == "whole_word" else query_lower

@@ -1064,11 +1064,29 @@ class ConcordanceHelperTests(SimpleTestCase):
         out = _resolve_country_scope(MagicMock(), MagicMock(), [], [], ["AL-001", "RO-009"])
         self.assertEqual(sorted(out), ["AL-001", "RO-009"])
 
-    def test_resolve_country_scope_explicit_refs_win_then_narrowed(self):
+    def test_resolve_country_scope_explicit_refs_narrowed_by_country(self):
         from data.views import _resolve_country_scope
         db = MagicMock()
         db.aql.execute.side_effect = lambda q, bind_vars=None: iter(["AL-001"])
         out = _resolve_country_scope(db, MagicMock(), ["AL-001", "AL-002"], ["AL"], ["AL-001", "AL-002"])
+        self.assertEqual(out, ["AL-001"])
+
+    def test_resolve_country_scope_explicit_ref_excluded_when_not_visible(self):
+        # Regression: an explicit sample_refs entry the caller isn't
+        # authorized to see (e.g. a hidden sample handed back by a stale
+        # client-side cache after logout, or crafted directly) must never be
+        # served just because the client asked for it by name. The caller's
+        # authorized set (visible_refs) is the only thing that grants access;
+        # explicit refs narrow it, they don't extend it.
+        # See conversation 2026-09-16: a client cache bug surfaced exactly
+        # this — a hidden sample kept appearing to anonymous/logged-out
+        # visitors because sample_refs alone used to bypass this filter.
+        from data.views import _resolve_country_scope
+        out = _resolve_country_scope(
+            MagicMock(), MagicMock(),
+            ["AL-001", "HIDDEN-01"], [],  # HIDDEN-01 requested explicitly...
+            ["AL-001", "AL-002"],         # ...but not in the caller's visible set
+        )
         self.assertEqual(out, ["AL-001"])
 
     def test_resolve_country_scope_matches_legacy_unnormalized_country_code(self):

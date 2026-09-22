@@ -3044,13 +3044,45 @@ class AnswerViewSet(ArangoModelViewSet):
             answers = [doc for doc in cursor]
             # sort by sample reference
             answers.sort(key=lambda x: x.get("sample", ""))
+
+            # Stamp on the field name that actually satisfied the search, so
+            # display code (map/table/legend - see views.component.ts
+            # getAnswerValue) doesn't have to guess which of an answer's
+            # several fields is the one the user searched for. AQL's FILTER
+            # doesn't expose which OR-branch matched, so it's recomputed
+            # here in Python against the same LIKE-as-substring semantics.
+            for answer in answers:
+                answer["matched_field"] = self._matched_field(answer, search_filters)
+
             return answers
-            
+
         except (NotFound, ValidationError):
             raise
         except Exception as e:
             print(f"Error fetching answers with field filters: {e}")
             return []
+
+    @staticmethod
+    def _matched_field(answer, search_filters):
+        """The field name of the first search criterion (matching this
+        answer's question_id) whose value is a substring of the answer's
+        value for that field - mirrors the ``LIKE @value`` ("%value%")
+        condition each criterion compiled to in AQL. An empty-value
+        criterion ("search all answers for this question", compiled to
+        ``LIKE "%%"``) always matches once the question_id matches - even
+        when the answer has no value at all for that field, since AQL's
+        ``null LIKE "%%"`` is true too (verified live) - so the field the
+        user searched still gets attributed instead of falling through to
+        None."""
+        for filter_obj in search_filters:
+            if filter_obj["question_id"] != answer.get("question_id"):
+                continue
+            if filter_obj["value"] == "":
+                return filter_obj["field"]
+            field_value = answer.get(filter_obj["field"])
+            if field_value is not None and filter_obj["value"] in str(field_value):
+                return filter_obj["field"]
+        return None
 
 
 class ViewViewSet(ArangoModelViewSet):

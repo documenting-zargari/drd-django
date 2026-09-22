@@ -134,6 +134,59 @@ class AnswerIncludeHiddenTests(SimpleTestCase):
         self.assertFalse(vs.include_hidden())
 
 
+class AnswerMatchedFieldTests(SimpleTestCase):
+    """Unit test AnswerViewSet._matched_field() — regression for the map
+    display bug (24 Sept 2026 agenda): a searched-field's answer must be
+    stamped with the field that actually matched, not left for the client
+    to guess (it used to fall back to a hardcoded 'form'/'marker'/
+    'inflection' priority, which is wrong whenever the answer also happens
+    to carry a 'form' field alongside the field that was searched)."""
+
+    def test_matches_the_searched_field_not_form(self):
+        from data.views import AnswerViewSet
+        answer = {"question_id": 42, "form": "jakh", "phonology": "j-"}
+        search_filters = [{"question_id": 42, "field": "phonology", "value": "j-"}]
+        self.assertEqual(AnswerViewSet._matched_field(answer, search_filters), "phonology")
+
+    def test_matches_correct_criterion_among_several_on_same_question(self):
+        from data.views import AnswerViewSet
+        answer = {"question_id": 7, "preposition_origin": "inherited", "preposition_type": "ANDE"}
+        search_filters = [
+            {"question_id": 7, "field": "preposition_type", "value": "ANDE"},
+        ]
+        self.assertEqual(AnswerViewSet._matched_field(answer, search_filters), "preposition_type")
+
+    def test_ignores_criteria_for_a_different_question(self):
+        from data.views import AnswerViewSet
+        answer = {"question_id": 7, "case": "nominative"}
+        search_filters = [{"question_id": 99, "field": "case", "value": "nominative"}]
+        self.assertIsNone(AnswerViewSet._matched_field(answer, search_filters))
+
+    def test_no_matching_value_returns_none(self):
+        from data.views import AnswerViewSet
+        answer = {"question_id": 7, "case": "nominative"}
+        search_filters = [{"question_id": 7, "field": "case", "value": "locative"}]
+        self.assertIsNone(AnswerViewSet._matched_field(answer, search_filters))
+
+    def test_empty_value_criterion_matches_field_present(self):
+        # "search all answers for this question" for a specific field
+        # (tables.component.ts onSearchCriterionConfirmed) - still
+        # attributes the field, same as any other criterion.
+        from data.views import AnswerViewSet
+        answer = {"question_id": 1483, "form": "jakh", "phonology": "j-"}
+        search_filters = [{"question_id": 1483, "field": "phonology", "value": ""}]
+        self.assertEqual(AnswerViewSet._matched_field(answer, search_filters), "phonology")
+
+    def test_empty_value_criterion_matches_even_when_field_missing(self):
+        # AQL's `null LIKE "%%"` is true, so an answer with no value at all
+        # for the searched field is still included by the query - it must
+        # still be attributed to that field, not silently fall through.
+        from data.views import AnswerViewSet
+        answer = {"question_id": 1483, "form": "jakh"}  # no 'phonology' key
+        search_filters = [{"question_id": 1483, "field": "phonology", "value": ""}]
+        self.assertEqual(AnswerViewSet._matched_field(answer, search_filters), "phonology")
+
+
 class AnswerSuggestionsTests(SimpleTestCase):
     """Unit test AnswerViewSet.suggestions() — request validation and AQL wiring."""
 

@@ -90,6 +90,31 @@ NESTED_FIELDS = """
 </table>
 """
 
+FILTERED_CELLS = """
+<h1>Adjective Inflection - Comparative</h1>
+<h3>Irregularities</h3>
+<table>
+ <tr><th></th><th>Adjective</th><th>Adverb</th></tr>
+ <tr><th>'better'</th>
+   <td>[{id: 122, field: stem, filter: {word_class: 'Adjective'}}]</td>
+   <td>[{id: 122, field: stem, filter: {word_class: 'Adverb'}}]</td>
+ </tr>
+ <tr><th>'worse'</th>
+   <td>[{id: 125, field: stem, filter: {word_class: 'Adjective'}}]</td>
+   <td>[{id: 125, field: stem, filter: {word_class: 'Adverb'}}]</td>
+ </tr>
+</table>
+"""
+
+NO_HEADER_LIST = """
+<h1>Case representation - Object</h1>
+<h2>Direct Object</h2>
+<table>
+ <tr><th>Nominatives with animates</th><td>[{id: 624, field: answer}]</td></tr>
+ <tr><th>Nominatives with kinship terms</th><td>[{id: 625, field: answer}]</td></tr>
+</table>
+"""
+
 FIXTURES = {
     "header_only": HEADER_ONLY,
     "flat_template": FLAT_TEMPLATE,
@@ -97,6 +122,8 @@ FIXTURES = {
     "deep_template": DEEP_TEMPLATE,
     "ragged_grid": RAGGED_GRID,
     "nested_fields": NESTED_FIELDS,
+    "filtered_cells": FILTERED_CELLS,
+    "no_header_list": NO_HEADER_LIST,
 }
 
 
@@ -145,6 +172,43 @@ class ConverterParityTests(SimpleTestCase):
         self.assertEqual([r["questionId"] for r in t["rows"]], [2558, 2559])
         self.assertEqual([r["labels"] for r in t["rows"]], [["marker"], ["once"]])
 
+    def test_filter_clause_parses_and_data_rows_are_not_swallowed_as_header(self):
+        # Regression: a JAML cell with a nested `filter: {...}` object used
+        # to fail the (nested-brace-intolerant) JAML regex entirely, which
+        # made _header_rows treat every row - including the two real data
+        # rows - as header, and the corner-case ended up rendering raw JAML
+        # text ("[{id: 122, field: stem, filter: ...}]") as a literal label.
+        spec = parse_view_content(FILTERED_CELLS)
+        t = spec["sections"][0]["tables"][0]
+        self.assertEqual(t["kind"], "grid")
+        self.assertEqual(len(t["columnHeader"]), 1)  # only the real header row
+        self.assertEqual(
+            [r["labels"] for r in t["rows"]], [["'better'"], ["'worse'"]],
+        )
+        better_cells = t["rows"][0]["cells"]
+        self.assertEqual([c["field"] for c in better_cells], ["stem", "stem"])
+        self.assertEqual([c["questionId"] for c in better_cells], [122, 122])
+        self.assertEqual(
+            [c["filter"] for c in better_cells],
+            [{"word_class": "Adjective"}, {"word_class": "Adverb"}],
+        )
+
+    def test_table_with_no_header_row_gets_empty_column_header(self):
+        # Regression: a table with no real header <tr> used to get a
+        # synthetic single-cell columnHeader ([[{"label": ""}]]) that only
+        # ever spanned 1 of the table's N physical columns, rendering as a
+        # stray partial-width grey bar. An empty list means "no header at
+        # all", which the client renders as no <thead> row - correct for
+        # every plain <tr><th>label</th><td>...</td></tr> list table.
+        spec = parse_view_content(NO_HEADER_LIST)
+        t = spec["sections"][0]["tables"][0]
+        self.assertEqual(t["columnHeader"], [])
+        self.assertEqual(t["rowHeaderWidth"], 1)
+        self.assertEqual(
+            [r["labels"] for r in t["rows"]],
+            [["Nominatives with animates"], ["Nominatives with kinship terms"]],
+        )
+
 
 class ValidatorTests(SimpleTestCase):
     def _valid(self):
@@ -178,6 +242,11 @@ class ValidatorTests(SimpleTestCase):
         spec["sections"][0]["tables"][0]["rows"][0].pop("questionId")
         with self.assertRaises(ValidationError):
             validate_spec(spec)
+
+    def test_accepts_empty_column_header(self):
+        spec = self._valid()
+        spec["sections"][0]["tables"][0]["columnHeader"] = []
+        validate_spec(spec)  # must not raise - "no header row" is valid
 
     def test_slug_rules(self):
         validate_slug("adpositions-borrowed")

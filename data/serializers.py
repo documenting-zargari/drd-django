@@ -328,6 +328,15 @@ class ViewSerializer(ArangoModelSerializer):
     #: legacy fields still emitted until Phase 3
     _LEGACY = {"filename", "content"}
 
+    # Declared explicitly so ArangoModelSerializer's Meta.fields loop (which
+    # auto-assigns a plain CharField to any name not already declared) never
+    # gets to it - a CharField calls str() on a dict, turning `spec` into a
+    # Python repr string ("{'schemaVersion': 1, ...}") the client can't
+    # parse. Only bites when to_representation falls through to the base
+    # per-field serialization (a View() model instance, e.g. via _resolve's
+    # get_by_field) - the dict-passthrough branch below was never affected.
+    spec = serializers.JSONField(required=False, allow_null=True)
+
     class Meta:
         model = View
         fields = ["slug", "spec", "schema_version", "parent_id", "filename", "content"]

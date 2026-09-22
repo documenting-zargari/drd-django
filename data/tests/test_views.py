@@ -1573,3 +1573,47 @@ class ResearchQuestionSearchTests(SimpleTestCase):
         _, captured = self._run("Adpositions")
         self.assertIn("q.hierarchy[*", captured["query"])
         self.assertIn("is_leaf == true", captured["query"])
+
+
+class ValidateQuestionsTests(SimpleTestCase):
+    """AnswerViewSet.validate_questions - see get_answers_for_questions.
+
+    Regression: a Tables view's bulk answers fetch used to 404 (no answers
+    at all) if even one of the many question ids compiled from its spec was
+    stale/orphaned (e.g. a Views.content reference to a research question
+    since deleted or renumbered) - one bad id blanked an entire otherwise-
+    valid table. Non-strict mode now drops unknown ids instead of raising."""
+
+    def _viewset(self, existing_ids):
+        from data.views import AnswerViewSet
+        vs = AnswerViewSet()
+        req = MagicMock()
+        db = MagicMock()
+        db.aql.execute.side_effect = lambda q, bind_vars=None: iter(
+            [i for i in bind_vars["question_ids"] if i in existing_ids]
+        )
+        req.arangodb = db
+        vs.request = req
+        return vs
+
+    def test_strict_raises_on_any_missing_id(self):
+        from rest_framework.exceptions import NotFound
+        vs = self._viewset(existing_ids={100, 101})
+        with self.assertRaises(NotFound):
+            vs.validate_questions([100, 999], strict=True)
+
+    def test_strict_is_the_default(self):
+        from rest_framework.exceptions import NotFound
+        vs = self._viewset(existing_ids={100})
+        with self.assertRaises(NotFound):
+            vs.validate_questions([100, 999])
+
+    def test_non_strict_drops_missing_ids_instead_of_raising(self):
+        vs = self._viewset(existing_ids={100, 101})
+        result = vs.validate_questions([100, 999, 101], strict=False)
+        self.assertEqual(sorted(result), [100, 101])
+
+    def test_non_strict_all_missing_returns_empty(self):
+        vs = self._viewset(existing_ids={100})
+        result = vs.validate_questions([998, 999], strict=False)
+        self.assertEqual(result, [])

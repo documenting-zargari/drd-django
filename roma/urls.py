@@ -114,7 +114,8 @@ def api_root(request, format=None):
             },
             "views": {
                 "url": reverse("views-list", request=request, format=format),
-                "description": "HTML template views (JAML) for data visualization",
+                "description": "Declarative table specs (schema v1) for data visualization. "
+                               "PATCH a detail url (by slug) to update a view's spec.",
             },
             "backups": {
                 "url": reverse("backups-list", request=request, format=format),

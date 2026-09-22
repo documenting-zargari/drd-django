@@ -31,6 +31,7 @@ from rest_framework.viewsets import ViewSet
 from natsort import natsorted
 from arango.exceptions import DocumentInsertError
 
+from data import table_spec
 from data.country_codes import expand_with_legacy_aliases
 from data.models import (
     Answer,
@@ -2841,15 +2842,26 @@ class AnswerViewSet(ArangoModelViewSet):
             print(f"Error fetching answers: {e}")
             return []
 
-    def validate_questions(self, question_ids):
-        """Validate all question IDs exist"""
+    def validate_questions(self, question_ids, strict=True):
+        """Validate question IDs exist. In strict mode (default - used for a
+        user-driven search filter, where a typo'd/bad id should error
+        clearly), raises 404 if any are missing. In non-strict mode (used
+        for a Tables view's bulk answers fetch, which can legitimately
+        compile dozens of ids from a view's spec), silently drops any
+        missing ids and returns the filtered survivors instead - a single
+        stale/orphaned question id (e.g. a Views.content reference to a
+        research question that was since deleted or renumbered) must not
+        blank out an entire table's worth of otherwise-valid data."""
         db = self.request.arangodb
         aql = "FOR q IN ResearchQuestions FILTER q.id IN @question_ids RETURN q.id"
         cursor = db.aql.execute(aql, bind_vars={"question_ids": question_ids})
-        existing_questions = [qid for qid in cursor]
-        missing_questions = set(question_ids) - set(existing_questions)
+        existing_questions = set(cursor)
+        missing_questions = set(question_ids) - existing_questions
         if missing_questions:
-            raise NotFound(detail=f"Questions not found: {sorted(missing_questions)}")
+            if strict:
+                raise NotFound(detail=f"Questions not found: {sorted(missing_questions)}")
+            print(f"Warning: ignoring unknown question ids in bulk answers fetch: {sorted(missing_questions)}")
+        return [qid for qid in question_ids if qid in existing_questions]
 
     def validate_samples(self, sample_refs):
         """Validate all sample references exist"""
@@ -2888,8 +2900,11 @@ class AnswerViewSet(ArangoModelViewSet):
             # Convert to integers
             question_ids = [int(qid) for qid in question_ids]
 
-            # Validate all inputs upfront
-            self.validate_questions(question_ids)
+            # Drop any ids that aren't real research questions rather than
+            # failing the whole bulk fetch (see validate_questions docstring).
+            question_ids = self.validate_questions(question_ids, strict=False)
+            if not question_ids:
+                return []
             if sample_refs:
                 self.validate_samples(sample_refs)
 
@@ -3050,12 +3065,76 @@ class ViewViewSet(ArangoModelViewSet):
     - GET /views/ - list all views
     - GET /views/<slug>/ - retrieve one view by slug (also accepts _key)
     - GET /views/?filename=<filename> - legacy lookup, still supported
+    - PATCH /views/<slug>/ - update this view's spec (global admin only)
     """
 
     model = View
     serializer_class = ViewSerializer
-    http_method_names = ["get", "head", "options"]  # Read-only (writable in a later phase)
+    http_method_names = ["get", "patch", "head", "options"]
     lookup_fields = ("slug", "filename")
+
+    EDITABLE_FIELDS = {"spec"}
+
+    def get_permissions(self):
+        if self.request.method == "PATCH":
+            return [IsGlobalAdmin()]
+        return [AllowAny()]
+
+    def partial_update(self, request, pk=None):
+        """
+        PATCH /views/{slug}/ — replace this view's spec.
+
+        Body: {"spec": {...}}. The spec is validated against the schema
+        (data.table_spec.validate_spec) before it is written; an invalid
+        spec is rejected with 400 and the stored doc is left untouched.
+        """
+        db = request.arangodb
+        doc = self._resolve_via_db(db, pk)
+        if not doc:
+            raise NotFound(detail=f"View not found: {pk}")
+
+        updates = {k: v for k, v in request.data.items() if k in self.EDITABLE_FIELDS}
+        if not updates:
+            return Response(
+                {"error": f"No editable fields provided. Allowed: {sorted(self.EDITABLE_FIELDS)}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            table_spec.validate_spec(updates["spec"])
+        except ValidationError as e:
+            return Response({"error": str(e.detail[0] if isinstance(e.detail, list) else e.detail)},
+                             status=status.HTTP_400_BAD_REQUEST)
+
+        db.collection(self.model.collection_name).update({
+            "_key": doc["_key"],
+            "spec": updates["spec"],
+            "schema_version": table_spec.SCHEMA_VERSION,
+        })
+        updated = db.collection(self.model.collection_name).get(doc["_key"])
+        serializer = self.serializer_class(updated, context={"request": request, "view": self})
+        return Response(serializer.data)
+
+    def _resolve_via_db(self, db, key):
+        """Same lookup chain as ``_resolve`` (slug / browse-<slug> / filename /
+        filename.php), but scoped to the request's ``db`` handle instead of
+        opening a fresh connection via ``View.get_by_field`` - keeps this
+        testable and consistent with the rest of the write path."""
+        bare = re.sub(r"\.php$", "", key, flags=re.IGNORECASE)
+        collection = self.model.collection_name
+        for field, value in (
+            ("slug", key),
+            ("slug", re.sub(r"^browse-", "", bare)),
+            ("filename", key),
+            ("filename", f"{bare}.php"),
+        ):
+            docs = list(db.aql.execute(
+                f"FOR doc IN {collection} FILTER doc.{field} == @value LIMIT 1 RETURN doc",
+                bind_vars={"value": value},
+            ))
+            if docs:
+                return docs[0]
+        return None
 
     def list(self, request):
         key = request.query_params.get("slug") or request.query_params.get("filename")

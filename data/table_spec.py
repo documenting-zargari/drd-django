@@ -24,7 +24,7 @@ Schema (v1)::
       kind: "template" | "grid" | "list",
       caption: str|None,
       rowHeaderWidth: int >= 0,
-      columnHeader: [[ HeaderCell ]],      # header rows, verbatim (corner + data cols)
+      columnHeader: [[ HeaderCell ]],      # header rows, verbatim (corner + data cols); [] if none
       columns: [ { cell: CellBinding|None } ],
       multiAnswer: "rows" | "combine",     # template only; converter always emits "rows"
       rows: [ Row ],
@@ -32,7 +32,8 @@ Schema (v1)::
     HeaderCell = { label: str, colspan?: int, rowspan?: int }
     Row (template) = { labels: [str], questionId: int }
     Row (grid/list) = { labels: [str], cells: [ CellBinding|None ] }
-    CellBinding = { field: str, questionId?: int, layout: "inline" | "stack" }
+    CellBinding = { field: str, questionId?: int, layout: "inline" | "stack",
+                    filter?: {str: str} }
 
 ``field`` is a ``|``-separated list of ``.``-separated key paths. Resolution
 (done in the client renderer, not here): walk the dots into the answer; if a
@@ -40,6 +41,11 @@ segment lands on a list, map the remainder over each element; join the ``|``
 parts of one value with ``": "``. ``layout:"stack"`` renders one value per line,
 ``"inline"`` (default) comma-joins. This subsumes the old ``tableField`` key and
 the ``[foreach]<div>`` cell wrapper.
+
+``filter`` (optional): when a questionId has more than one Answer document
+(e.g. one recording an Adjective form, another an Adverb form of the same
+research question), restrict resolution to the answer(s) whose fields match
+every ``{key: value}`` pair given. Done in the client renderer.
 """
 
 import html
@@ -84,14 +90,23 @@ def _check_cell(cell, *, allow_question_id, where):
             _fail(f"{where}: cell.questionId only allowed on grid/list rows")
         if not isinstance(cell["questionId"], int) or cell["questionId"] <= 0:
             _fail(f"{where}: cell.questionId must be a positive int")
-    extra = set(cell) - {"field", "layout", "questionId"}
+    if "filter" in cell:
+        filt = cell["filter"]
+        if not isinstance(filt, dict) or not filt or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in filt.items()
+        ):
+            _fail(f"{where}: cell.filter must be a non-empty object of string -> string")
+    extra = set(cell) - {"field", "layout", "questionId", "filter"}
     if extra:
         _fail(f"{where}: unexpected cell keys {sorted(extra)}")
 
 
 def _check_header(rows, where):
-    if not isinstance(rows, list) or not rows:
-        _fail(f"{where}: columnHeader must be a non-empty list of rows")
+    # Empty means the source table had no real header row at all - a valid,
+    # common shape (most `list`/`grid` tables converted from a plain
+    # <tr><th>label</th><td>...</td></tr> layout have none).
+    if not isinstance(rows, list):
+        _fail(f"{where}: columnHeader must be a list of rows")
     for ri, row in enumerate(rows):
         if not isinstance(row, list) or not row:
             _fail(f"{where}: columnHeader[{ri}] must be a non-empty list")
@@ -211,9 +226,22 @@ _ENDFOREACH_ROW_RE = re.compile(r"</tr>\s*\[endforeach\]", re.IGNORECASE)
 # `[foreach]<div>…[endforeach]` cell wrappers carry no `</tr>` so they don't match.
 _ROW_FOREACH_RE = re.compile(r"\[foreach\]\s*(<tr\b.*?</tr>)\s*\[endforeach\]", re.IGNORECASE | re.DOTALL)
 
-_JAML_RE = re.compile(r"\{[^{}]*\bid\b\s*:\s*\"?(\d+)\"?[^{}]*\}", re.IGNORECASE)
+_JAML_RE = re.compile(
+    # tolerates ONE level of nested `{...}` inside the payload (e.g. a
+    # `filter: {word_class: 'Adjective'}` clause) - a plain `[^{}]*` payload
+    # regex can't skip over that nested brace pair and never matches at all,
+    # which silently misclassifies the whole row as a header row (see
+    # _header_rows) instead of a data row.
+    r"\{(?:[^{}]|\{[^{}]*\})*\bid\b\s*:\s*\"?(\d+)\"?(?:[^{}]|\{[^{}]*\})*\}",
+    re.IGNORECASE,
+)
 _JAML_FIELD_RE = re.compile(r"\bfield\s*:\s*\"?([^,}\"]+?)\"?\s*(?=[,}])", re.IGNORECASE)
 _JAML_TABLEFIELD_RE = re.compile(r"\btableField\s*:\s*\"?([^,}\"]+?)\"?\s*(?=[,}])", re.IGNORECASE)
+# `filter: {key: 'val', ...}` - selects which of several Answer docs sharing
+# the same questionId this cell shows (e.g. distinguishing an Adjective stem
+# from an Adverb stem recorded under the same research question).
+_JAML_FILTER_RE = re.compile(r"\bfilter\s*:\s*\{([^{}]*)\}", re.IGNORECASE)
+_FILTER_PAIR_RE = re.compile(r"[\"']?(\w+)[\"']?\s*:\s*\"?'?([^,\"'}]+?)'?\"?\s*(?=,|\Z)")
 _FOREACH_DIV_RE = re.compile(r"\[foreach\]\s*<div>", re.IGNORECASE)
 
 
@@ -284,6 +312,11 @@ def _cell_binding(inner):
     binding = {"field": field, "layout": layout}
     if id_m:
         binding["questionId"] = int(id_m.group(1))
+    filter_m = _JAML_FILTER_RE.search(inner)
+    if filter_m:
+        pairs = _FILTER_PAIR_RE.findall(filter_m.group(1))
+        if pairs:
+            binding["filter"] = dict(pairs)
     return binding
 
 
@@ -455,7 +488,12 @@ def _parse_table(raw_table):
         "kind": kind,
         "caption": caption,
         "rowHeaderWidth": row_header_width,
-        "columnHeader": column_header or [[{"label": ""}]],
+        # Empty (not a synthetic single blank cell) when the source table had
+        # no real header <tr> at all - a fabricated single-column blank
+        # header used to render as a stray partial-width bar next to the
+        # data columns it didn't cover, since it only ever spanned 1 of N
+        # physical columns.
+        "columnHeader": column_header,
         "columns": columns,
         "rows": rows,
     }

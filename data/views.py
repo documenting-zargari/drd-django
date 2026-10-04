@@ -2721,8 +2721,19 @@ class AnswerViewSet(ArangoModelViewSet):
             question_id = int(question_id)
         except (TypeError, ValueError):
             return Response({"error": "question_id must be an integer"}, status=status.HTTP_400_BAD_REQUEST)
-        if field in self.PROTECTED_FIELDS:
-            return Response({"error": f"Field '{field}' is not suggestible."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # A `|`-compound field (e.g. "source|language", from a Tables cell
+        # covering several sub-fields - see field-eval.ts splitFieldNames)
+        # used to get passed straight through as a single AQL attribute
+        # name, which never exists on an Answer doc - silently returning no
+        # suggestions (27 Sept 2026). Suggest across every sub-field instead,
+        # same split already used by get_queryset for search filtering.
+        field_names = [f.strip() for f in field.split('|') if f.strip()]
+        if not field_names:
+            return Response({"error": "field is required"}, status=status.HTTP_400_BAD_REQUEST)
+        for field_name in field_names:
+            if field_name in self.PROTECTED_FIELDS:
+                return Response({"error": f"Field '{field_name}' is not suggestible."}, status=status.HTTP_400_BAD_REQUEST)
 
         sample_refs = None if self.include_hidden() else self.get_visible_sample_refs()
 
@@ -2731,15 +2742,16 @@ class AnswerViewSet(ArangoModelViewSet):
             """
             FOR a IN Answers
               FILTER a.question_id == @qid
-              FILTER a[@field] != null AND a[@field] != ""
               FILTER @sample_refs == null OR a.sample IN @sample_refs
-              FILTER @q == "" OR CONTAINS(LOWER(a[@field]), @q)
-              COLLECT value = a[@field] WITH COUNT INTO freq
-              SORT freq DESC, value ASC
-              LIMIT 20
-              RETURN { value, count: freq }
+              FOR f IN @field_names
+                FILTER a[f] != null AND a[f] != ""
+                FILTER @q == "" OR CONTAINS(LOWER(a[f]), @q)
+                COLLECT value = a[f] WITH COUNT INTO freq
+                SORT freq DESC, value ASC
+                LIMIT 20
+                RETURN { value, count: freq }
             """,
-            bind_vars={"qid": question_id, "field": field, "q": query, "sample_refs": sample_refs},
+            bind_vars={"qid": question_id, "field_names": field_names, "q": query, "sample_refs": sample_refs},
         )
         return Response(list(cursor))
 
@@ -2802,15 +2814,29 @@ class AnswerViewSet(ArangoModelViewSet):
             search_params = self.request.GET.getlist("search")
             search_filters = []
 
-            for param in search_params:
+            for group, param in enumerate(search_params):
                 parts = param.split(',', 2)  # Limit to 3 parts to handle commas in values
                 if len(parts) == 3:
-                    # Question ID + field + value (required format)
-                    search_filters.append({
-                        "question_id": int(parts[0]),
-                        "field": parts[1].strip(),
-                        "value": parts[2].strip()
-                    })
+                    # Question ID + field + value (required format). A
+                    # `|`-joined field (e.g. "source|language", from a
+                    # Tables cell covering several sub-fields - see
+                    # field-eval.ts splitFieldNames) expands into one
+                    # filter per sub-field, tagged with the same `group` so
+                    # they're OR'd together as a unit rather than each
+                    # being treated as its own criterion (see `operator`
+                    # handling below).
+                    question_id = int(parts[0])
+                    value = parts[2].strip()
+                    field_names = [f.strip() for f in parts[1].split('|') if f.strip()]
+                    if not field_names:
+                        raise ValidationError(f"Invalid search parameter format: {param}. Use 'question_id,field,value' format")
+                    for field_name in field_names:
+                        search_filters.append({
+                            "question_id": question_id,
+                            "field": field_name,
+                            "value": value,
+                            "group": group,
+                        })
                 else:
                     raise ValidationError(f"Invalid search parameter format: {param}. Use 'question_id,field,value' format")
 
@@ -3011,20 +3037,29 @@ class AnswerViewSet(ArangoModelViewSet):
 
             match_clause = " OR ".join(conditions)
 
-            if operator == "AND" and len(conditions) > 1:
+            # Group conditions by their originating request criterion (a
+            # `|`-compound field expands into several conditions sharing one
+            # group - see get_queryset) so AND-mode intersects one sample
+            # set per *criterion the user entered*, not per expanded
+            # sub-field - a compound field should stay an OR internally.
+            groups = {}
+            for i, filter_obj in enumerate(search_filters):
+                groups.setdefault(filter_obj.get("group", i), []).append(i)
+
+            if operator == "AND" and len(groups) > 1:
                 # "AND" means every criterion must be satisfied *within the
                 # same sample* (criteria commonly target different
                 # questions, so no single Answer doc can match all of them
                 # at once). Find the samples that satisfy every criterion,
                 # then return the matching answers for those samples.
                 sample_lookups = "\n".join(
-                    f"LET sample_match_{i} = (FOR answer IN Answers "
-                    f"FILTER {conditions[i]}{extra_filters} "
+                    f"LET sample_match_{gi} = (FOR answer IN Answers "
+                    f"FILTER ({' OR '.join(conditions[i] for i in idxs)}){extra_filters} "
                     f"RETURN DISTINCT answer.sample)"
-                    for i in range(len(conditions))
+                    for gi, idxs in enumerate(groups.values())
                 )
                 intersection = "INTERSECTION(" + ", ".join(
-                    f"sample_match_{i}" for i in range(len(conditions))
+                    f"sample_match_{gi}" for gi in range(len(groups))
                 ) + ")"
                 aql = f"""
                 {sample_lookups}

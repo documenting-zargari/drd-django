@@ -187,6 +187,76 @@ class AnswerMatchedFieldTests(SimpleTestCase):
         self.assertEqual(AnswerViewSet._matched_field(answer, search_filters), "phonology")
 
 
+class AnswerCompoundFieldSearchTests(SimpleTestCase):
+    """Regression for the Tables '|'-compound field zero-results bug (25
+    Sept 2026): a cell whose spec field is e.g. "source|language" (see
+    field-eval.ts splitFieldNames) used to get passed verbatim into AQL as
+    `answer.source|language LIKE ...` - not valid attribute syntax - which
+    the surrounding except-and-return-[] swallowed, silently returning zero
+    results. get_queryset now expands a compound field into one condition
+    per sub-field, OR'd together."""
+
+    def _request(self, query):
+        factory = RequestFactory()
+        raw = factory.get("/answers/", query)
+        req = Request(raw)
+        req.user = _mock_user()
+
+        captured = {}
+
+        def aql_execute(q, bind_vars=None):
+            if "ResearchQuestions" in q:
+                return iter([753, 42])  # questions exist
+            if "FOR s IN Samples" in q:
+                return iter(["AL-001"])
+            captured["aql"] = q
+            captured["bind_vars"] = bind_vars
+            return iter([{"question_id": 753, "sample": "AL-001", "source": "Inherited"}])
+
+        db = MagicMock()
+        db.aql.execute.side_effect = aql_execute
+        req.arangodb = db
+        req.arango_error = None
+        return req, captured
+
+    def _make_viewset(self, request):
+        from data.views import AnswerViewSet
+        vs = AnswerViewSet()
+        vs.request = request
+        return vs
+
+    def test_compound_field_expands_to_or_across_subfields(self):
+        req, captured = self._request({"search": "753,source|language,Inherited"})
+        results = list(self._make_viewset(req).get_queryset())
+        self.assertEqual(len(results), 1)
+        self.assertIn(" OR ", captured["aql"])
+        self.assertIn("answer.source LIKE", captured["aql"])
+        self.assertIn("answer.language LIKE", captured["aql"])
+        self.assertEqual(results[0]["matched_field"], "source")
+
+    def test_single_compound_criterion_under_and_operator_is_not_an_intersection(self):
+        # Only one criterion was entered (a single cell click) - it just
+        # expands to two possible fields. operator=AND must not treat those
+        # two expanded conditions as two separate criteria to intersect.
+        req, captured = self._request({
+            "search": "753,source|language,Inherited",
+            "operator": "AND",
+        })
+        list(self._make_viewset(req).get_queryset())
+        self.assertNotIn("INTERSECTION", captured["aql"])
+
+    def test_two_real_criteria_with_one_compound_still_intersect_by_criterion(self):
+        # Two actual criteria (different questions), one of them compound -
+        # AND must intersect by criterion (2 sample sets), not by expanded
+        # condition count (3).
+        req, captured = self._request({
+            "search": ["753,source|language,Inherited", "42,form,jakh"],
+            "operator": "AND",
+        })
+        list(self._make_viewset(req).get_queryset())
+        self.assertIn("INTERSECTION(sample_match_0, sample_match_1)", captured["aql"])
+
+
 class AnswerSuggestionsTests(SimpleTestCase):
     """Unit test AnswerViewSet.suggestions() — request validation and AQL wiring."""
 
@@ -245,8 +315,27 @@ class AnswerSuggestionsTests(SimpleTestCase):
         collect_call = next(c for c in db.aql.execute.call_args_list if "COLLECT" in c.args[0])
         bind_vars = collect_call.kwargs["bind_vars"]
         self.assertEqual(bind_vars["qid"], 1)
-        self.assertEqual(bind_vars["field"], "form")
+        self.assertEqual(bind_vars["field_names"], ["form"])
         self.assertEqual(bind_vars["q"], "y")
+
+    # Regression for the Origin-cell "no autocomplete options" bug (27 Sept
+    # 2026): a `|`-compound field (e.g. "source|language") used to be
+    # passed straight through as a single AQL attribute name, which never
+    # exists on an Answer doc, so ArangoDB found nothing and the
+    # autocomplete silently showed no options.
+    def test_compound_field_splits_into_field_names(self):
+        req, db = self._request({"question_id": "754", "field": "source|language", "q": ""})
+        resp = self._make_viewset(req).suggestions(req)
+        self.assertEqual(resp.status_code, 200)
+
+        collect_call = next(c for c in db.aql.execute.call_args_list if "COLLECT" in c.args[0])
+        bind_vars = collect_call.kwargs["bind_vars"]
+        self.assertEqual(bind_vars["field_names"], ["source", "language"])
+
+    def test_compound_field_rejected_if_any_subfield_protected(self):
+        req, _ = self._request({"question_id": "1", "field": "form|sample"})
+        resp = self._make_viewset(req).suggestions(req)
+        self.assertEqual(resp.status_code, 400)
 
 
 # ---------------------------------------------------------------------------

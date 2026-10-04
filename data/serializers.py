@@ -138,6 +138,10 @@ class ResearchQuestionSerializer(ArangoModelSerializer):
         ]
 
     def to_representation(self, instance):
+        # batch/search/retrieve pass raw AQL dicts, but the default list()
+        # passes ResearchQuestion model instances (from Model.all()).
+        if not isinstance(instance, dict):
+            instance = instance.to_dict()
         exclude_fields = ["_rev", "_id", "tag_ids", "is_leaf"]
         result = {k: v for k, v in instance.items() if k not in exclude_fields}
         return result
@@ -311,7 +315,9 @@ class AnswerSerializer(ArangoModelSerializer):
     def to_representation(self, instance):
         # Handle both dict objects (from ArangoDB) and model objects
         if isinstance(instance, dict):
-            exclude_fields = ["_rev", "_id"]
+            # legacy_origin_language is a migration backup (see
+            # backup_origin_languages), not answer data for the client.
+            exclude_fields = ["_rev", "_id", "legacy_origin_language"]
             return {k: v for k, v in instance.items() if k not in exclude_fields}
         else:
             # For model instances, use the parent serializer's method

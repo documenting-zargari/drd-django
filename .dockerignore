@@ -1,0 +1,19 @@
+# Keep secrets, local environments and build artefacts out of the image.
+.env
+.env.*
+db-settings
+venv/
+.venv/
+**/__pycache__/
+*.pyc
+.git/
+.github/
+.claude/
+.ruff_cache/
+.DS_Store
+.vscode/
+.history/
+media/
+static/
+staticfiles/
+backups/

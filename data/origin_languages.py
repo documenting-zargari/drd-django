@@ -61,7 +61,7 @@ def sample_language_levels(contact_languages):
         if not isinstance(entry, dict) or not entry.get("language"):
             continue
         key = entry["language"].strip().lower()
-        levels.setdefault(key, set()).add(normalize_level(entry.get("source")))
+        levels.setdefault(key, set()).add(normalize_level(entry.get("level") or entry.get("source")))
     return levels
 
 
@@ -73,3 +73,126 @@ def classify(language, level, sample_levels):
     if levels is None:
         return "not_in_sample"
     return "ok" if level in levels else "level_mismatch"
+
+
+# --- Unification -----------------------------------------------------------
+#
+# Target format: an answer carries at most one ``origin`` level (string, one of
+# LEVELS); ``base_origin`` and ``markers[i].origin`` are level strings too.
+# ``source``, ``language``, ``preposition_origin`` and the ``{source, language}``
+# / ``"Level: Language"`` variants are dropped (languages are preserved in
+# ``legacy_origin_language`` by ``backup_origin_languages`` first).
+
+LEGACY_TOP_LEVEL = ("source", "language", "preposition_origin")
+
+
+def _level_of(value):
+    """Level from any legacy origin-ish value (string, ``"L: lang"`` or object)."""
+    if isinstance(value, dict):
+        return normalize_level(value.get("source"))
+    if isinstance(value, str):
+        return normalize_level(value.split(":", 1)[0])
+    return None
+
+
+def unify_answer(answer):
+    """Return ``(patch, problem)`` turning ``answer`` into the unified format.
+
+    ``patch`` maps attributes to new values (``None`` = remove); it is ``{}``
+    when the answer is already unified. ``problem`` is set (and ``patch`` is
+    ``None``) when the answer can't be converted without losing information:
+    two different top-level levels, or a value that isn't one of LEVELS.
+    """
+    levels = {
+        lvl for lvl in (
+            _level_of(answer.get("source")),
+            _level_of(answer.get("origin")),
+            _level_of(answer.get("preposition_origin")),
+        ) if lvl
+    }
+    nested = [_level_of(answer.get("base_origin"))] + [
+        _level_of(m.get("origin")) for m in answer.get("markers") or [] if isinstance(m, dict)
+    ]
+    unknown = sorted(lvl for lvl in levels | set(nested) if lvl and lvl not in LEVELS)
+    if unknown:
+        return None, f"unknown level: {', '.join(unknown)}"
+    if len(levels) > 1:
+        return None, f"conflicting levels: {', '.join(sorted(levels))}"
+
+    patch = {}
+    for key in LEGACY_TOP_LEVEL:
+        if key in answer:
+            patch[key] = None
+    origin = levels.pop() if levels else None
+    if answer.get("origin") != origin and not (origin is None and "origin" not in answer):
+        patch["origin"] = origin
+
+    if "base_origin" in answer:
+        base = _level_of(answer["base_origin"])
+        if answer["base_origin"] != base:
+            patch["base_origin"] = base
+
+    markers = answer.get("markers")
+    if isinstance(markers, list):
+        new_markers = []
+        for m in markers:
+            if isinstance(m, dict) and "origin" in m:
+                m = dict(m)
+                level = _level_of(m["origin"])
+                if level:
+                    m["origin"] = level
+                else:
+                    del m["origin"]
+            new_markers.append(m)
+        if new_markers != markers:
+            patch["markers"] = new_markers
+    return patch, None
+
+
+def unify_contact_languages(contact_languages):
+    """``contact_languages`` with each entry's ``source`` key renamed to ``level``."""
+    out = []
+    for entry in contact_languages or []:
+        if isinstance(entry, dict) and "source" in entry:
+            source = entry["source"]
+            entry = {k: v for k, v in entry.items() if k != "source"}
+            entry["level"] = normalize_level(entry.get("level") or source)
+        out.append(entry)
+    return out
+
+
+# --- Contact-language sample filter ----------------------------------------
+#
+# "Current L2 = Russian" narrows the *samples* searched (it's a Sample
+# attribute, see module docstring). Tokens are "<level>:<language>" with level
+# one of the L2 LEVELS or "any"; several tokens match a sample having any one.
+
+ANY_LEVEL = "any"
+
+
+def parse_contact_language_filters(tokens):
+    """``[{level, language}]`` (level None = any L2, language lowercased) from tokens."""
+    filters = []
+    for token in tokens or []:
+        if not isinstance(token, str) or ":" not in token:
+            continue
+        level, language = token.split(":", 1)
+        language = language.strip().lower()
+        level = None if level.strip().lower() == ANY_LEVEL else normalize_level(level)
+        if language and (level is None or level in LEVELS[1:]):
+            filters.append({"level": level, "language": language})
+    return filters
+
+
+CONTACT_LANGUAGE_SAMPLES_AQL = """
+FOR s IN Samples
+  FILTER LENGTH(
+    FOR e IN (IS_ARRAY(s.contact_languages) ? s.contact_languages : [])
+      FOR f IN @filters
+        FILTER LOWER(TRIM(e.language)) == f.language
+          AND (f.level == null OR e.level == f.level)
+        LIMIT 1
+        RETURN 1
+  ) > 0
+  RETURN s.sample_ref
+"""

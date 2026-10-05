@@ -186,6 +186,19 @@ class AnswerMatchedFieldTests(SimpleTestCase):
         search_filters = [{"question_id": 1483, "field": "phonology", "value": ""}]
         self.assertEqual(AnswerViewSet._matched_field(answer, search_filters), "phonology")
 
+    def test_matched_fields_lists_every_matching_criterion_once(self):
+        # Origin + form=(any) on one question: the comparison table needs
+        # both, to show "form (origin)" (5 Oct 2026).
+        from data.views import AnswerViewSet
+        answer = {"question_id": 1936, "form": "trebul", "origin": "Current-L2"}
+        search_filters = [
+            {"question_id": 1936, "field": "origin", "value": "Current-L2"},
+            {"question_id": 1936, "field": "form", "value": ""},
+            {"question_id": 1936, "field": "origin", "value": "L2"},
+            {"question_id": 1936, "field": "case", "value": "nominative"},
+        ]
+        self.assertEqual(AnswerViewSet._matched_fields(answer, search_filters), ["origin", "form"])
+
 
 class AnswerCompoundFieldSearchTests(SimpleTestCase):
     """Regression for the Tables '|'-compound field zero-results bug (25

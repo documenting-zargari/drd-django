@@ -33,6 +33,7 @@ from arango.exceptions import DocumentInsertError
 
 from data import table_spec
 from data.country_codes import expand_with_legacy_aliases
+from data.origin_languages import CONTACT_LANGUAGE_SAMPLES_AQL, parse_contact_language_filters
 from data.models import (
     Answer,
     Category,
@@ -110,7 +111,9 @@ def _resolve_country_scope(db, request, sample_refs, country_codes, visible_refs
     """
     Final list of sample refs: the caller's explicit `sample_refs` intersected
     with `visible_refs` (or, when none given, `visible_refs` itself), then
-    narrowed to `country_codes`.
+    narrowed to `country_codes`, then to the request's `contact_languages`
+    (["Current-L2:Russian", "any:Turkish", ...]: samples listing any of them,
+    see data.origin_languages.parse_contact_language_filters).
 
     `visible_refs` must already be the caller's authorized set (every sample,
     if they've opted into hidden ones — see `_visible_sample_refs` — else
@@ -136,6 +139,11 @@ def _resolve_country_scope(db, request, sample_refs, country_codes, visible_refs
             )
         )
         base &= cc_refs
+    contact_filters = parse_contact_language_filters(
+        request.data.get("contact_languages") if request is not None else None
+    )
+    if contact_filters:
+        base &= set(db.aql.execute(CONTACT_LANGUAGE_SAMPLES_AQL, bind_vars={"filters": contact_filters}))
     return list(base)
 
 
@@ -3086,8 +3094,12 @@ class AnswerViewSet(ArangoModelViewSet):
             # several fields is the one the user searched for. AQL's FILTER
             # doesn't expose which OR-branch matched, so it's recomputed
             # here in Python against the same LIKE-as-substring semantics.
+            # ``matched_fields`` lists every criterion field that matched (in
+            # criterion order), so e.g. the comparison table can show the
+            # answer's form alongside a searched attribute like ``origin``.
             for answer in answers:
-                answer["matched_field"] = self._matched_field(answer, search_filters)
+                answer["matched_fields"] = self._matched_fields(answer, search_filters)
+                answer["matched_field"] = answer["matched_fields"][0] if answer["matched_fields"] else None
 
             return answers
 
@@ -3099,8 +3111,14 @@ class AnswerViewSet(ArangoModelViewSet):
 
     @staticmethod
     def _matched_field(answer, search_filters):
-        """The field name of the first search criterion (matching this
-        answer's question_id) whose value is a substring of the answer's
+        """First of ``_matched_fields`` (None if no criterion matched)."""
+        fields = AnswerViewSet._matched_fields(answer, search_filters)
+        return fields[0] if fields else None
+
+    @staticmethod
+    def _matched_fields(answer, search_filters):
+        """Field names of the search criteria (matching this answer's
+        question_id, in criterion order, de-duplicated) whose value is a substring of the answer's
         value for that field - mirrors the ``LIKE @value`` ("%value%")
         condition each criterion compiled to in AQL. An empty-value
         criterion ("search all answers for this question", compiled to
@@ -3109,15 +3127,14 @@ class AnswerViewSet(ArangoModelViewSet):
         ``null LIKE "%%"`` is true too (verified live) - so the field the
         user searched still gets attributed instead of falling through to
         None."""
+        fields = []
         for filter_obj in search_filters:
-            if filter_obj["question_id"] != answer.get("question_id"):
+            if filter_obj["question_id"] != answer.get("question_id") or filter_obj["field"] in fields:
                 continue
-            if filter_obj["value"] == "":
-                return filter_obj["field"]
             field_value = answer.get(filter_obj["field"])
-            if field_value is not None and filter_obj["value"] in str(field_value):
-                return filter_obj["field"]
-        return None
+            if filter_obj["value"] == "" or (field_value is not None and filter_obj["value"] in str(field_value)):
+                fields.append(filter_obj["field"])
+        return fields
 
 
 class ViewViewSet(ArangoModelViewSet):

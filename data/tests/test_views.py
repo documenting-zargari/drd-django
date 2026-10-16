@@ -218,7 +218,7 @@ class AnswerCompoundFieldSearchTests(SimpleTestCase):
         captured = {}
 
         def aql_execute(q, bind_vars=None):
-            if "ResearchQuestions" in q:
+            if "c.is_leaf == true" in q:
                 return iter([753, 42])  # questions exist
             if "FOR s IN Samples" in q:
                 return iter(["AL-001"])
@@ -873,7 +873,7 @@ class _FakeByAnswerPhraseDB:
     def aql_execute(self, query, bind_vars=None):
         bv = bind_vars or {}
 
-        if "ResearchQuestions" in query and "hierarchy_ids" in query:
+        if "RETURN c.hierarchy_ids" in query:
             return iter([self.question["hierarchy_ids"]] if self.question else [])
 
         # question_overrides.include/exclude live on SamplePhrases now; the
@@ -1035,7 +1035,7 @@ class _FakeByAnswerTranscriptionDB:
     def aql_execute(self, query, bind_vars=None):
         bv = bind_vars or {}
 
-        if "ResearchQuestions" in query and "hierarchy_ids" in query:
+        if "RETURN c.hierarchy_ids" in query:
             return iter([self.question["hierarchy_ids"]] if self.question else [])
 
         if "FOR key IN @include" in query:
@@ -1499,7 +1499,7 @@ class _FakeTranscriptionWriteDB:
             hits = [1 for t in self.transcriptions.values()
                     if t.get("sample") == bv["s"] and t.get("segment_no") == bv["n"]]
             return iter(hits[:1])
-        if "ResearchQuestions" in query and "is_leaf == true" in query:
+        if "Categories" in query and "is_leaf == true" in query:
             return iter([i for i in bv["ids"] if i in self.leaf_question_ids])
         if "Categories" in query and "is_leaf != true" in query:
             return iter([i for i in bv["ids"] if i in self.branch_category_ids])
@@ -1721,13 +1721,70 @@ class ResearchQuestionSearchTests(SimpleTestCase):
 
     def test_still_matches_question_name(self):
         _, captured = self._run("andre")
-        self.assertIn("REGEX_TEST(q.name", captured["query"])
+        self.assertIn("REGEX_TEST(c.name", captured["query"])
         self.assertEqual(captured["bind_vars"]["pattern"], ".*andre.*")
 
     def test_also_matches_ancestor_category_name(self):
         _, captured = self._run("Adpositions")
-        self.assertIn("q.hierarchy[*", captured["query"])
+        self.assertIn("c.hierarchy[*", captured["query"])
         self.assertIn("is_leaf == true", captured["query"])
+
+    def test_reads_categories_not_the_retired_mirror(self):
+        # Regression: ResearchQuestions was folded into Categories (2026-10).
+        _, captured = self._run("andre")
+        self.assertIn("FOR c IN Categories", captured["query"])
+        self.assertNotIn("ResearchQuestions", captured["query"])
+
+
+class ResearchQuestionLookupTests(SimpleTestCase):
+    """/research-questions/ list + retrieve serve the is_leaf subset of
+    Categories now that the ResearchQuestions mirror collection is gone."""
+
+    DOCS = {
+        "10": {"_key": "10", "id": 10, "name": "Marker", "parent_id": 9, "is_leaf": None},
+        "24": {"_key": "24", "id": 24, "name": "-ičn-", "parent_id": 10, "is_leaf": True},
+    }
+
+    def _viewset(self, queries):
+        from data.views import ResearchQuestionViewSet
+
+        def aql_execute(query, bind_vars=None):
+            queries.append(query)
+            return iter([d for d in self.DOCS.values() if d["is_leaf"] is True])
+
+        db = MagicMock()
+        db.aql.execute.side_effect = aql_execute
+        db.collection.return_value.get.side_effect = lambda key: self.DOCS.get(key)
+        req = MagicMock()
+        req.arangodb = db
+        vs = ResearchQuestionViewSet()
+        vs.request = req
+        return vs
+
+    def test_list_filters_categories_to_research_questions(self):
+        queries = []
+        docs = self._viewset(queries).get_queryset()
+        self.assertEqual([d["id"] for d in docs], [24])
+        self.assertIn("FOR c IN Categories FILTER c.is_leaf == true", queries[0])
+
+    def test_retrieve_returns_a_research_question(self):
+        self.assertEqual(self._viewset([]).get_object("24")["id"], 24)
+
+    def test_retrieve_rejects_a_branch_category(self):
+        from rest_framework.exceptions import NotFound
+        with self.assertRaises(NotFound):
+            self._viewset([]).get_object("10")
+
+
+class ResearchQuestionIdHelperTests(SimpleTestCase):
+    def test_question_and_category_ids_are_split_by_is_leaf(self):
+        from data.views import _valid_category_ids, _valid_question_ids
+        db = MagicMock()
+        db.aql.execute.side_effect = lambda q, bind_vars=None: iter(bind_vars["ids"][:1])
+        self.assertEqual(_valid_question_ids(db, {5}), {5})
+        self.assertIn("FOR c IN Categories FILTER c.id IN @ids AND c.is_leaf == true", db.aql.execute.call_args_list[0][0][0])
+        self.assertEqual(_valid_category_ids(db, [6]), {6})
+        self.assertIn("c.is_leaf != true", db.aql.execute.call_args_list[1][0][0])
 
 
 class ValidateQuestionsTests(SimpleTestCase):
@@ -1745,7 +1802,7 @@ class ValidateQuestionsTests(SimpleTestCase):
         req = MagicMock()
         db = MagicMock()
         db.aql.execute.side_effect = lambda q, bind_vars=None: iter(
-            [i for i in bind_vars["question_ids"] if i in existing_ids]
+            [i for i in bind_vars["ids"] if i in existing_ids]
         )
         req.arangodb = db
         vs.request = req

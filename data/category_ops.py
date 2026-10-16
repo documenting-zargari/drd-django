@@ -1,14 +1,13 @@
 """
-Mutation primitives for the Categories/ResearchQuestions tree.
+Mutation primitives for the Categories tree.
 
-``Categories`` is the full navigational tree (branches and leaves).
-``ResearchQuestions`` mirrors just the leaf subset — same
-id/name/parent_id/hierarchy/hierarchy_ids schema — as a materialized copy
-used by the Answer-search joins in views.py (see ``_get_question_hierarchy_ids``).
-That duplication is exactly how the two collections drift apart (a hand
-edit or one-off AQL fix hitting one collection but not its mirror) — see
-the "Adverbs > Local > Adverbials" mislabel (24 Sept 2026 agenda), where
-Categories.id 471 held a different `name` on the Köln server than locally.
+``Categories`` is the full tree: branch categories and research questions
+(the ``is_leaf`` nodes). Until 2026-10 the research questions were also
+duplicated into a separate ``ResearchQuestions`` collection, and the two
+copies drifted apart — see the "Adverbs > Local > Adverbials" mislabel
+(24 Sept 2026 agenda), where Categories.id 471 held a different `name` on
+the Köln server than locally. Going through this module (never hand edits
+or one-off AQL) is what keeps the stored hierarchy arrays consistent.
 
 Every mutation here is expressed as a ``Plan`` (a list of before/after field
 changes) that can be inspected before it's applied, and applying it logs the
@@ -17,15 +16,11 @@ tooling for a future Category editor can build on directly instead of
 retrofitting one later.
 
 Only ``rename`` is implemented today. ``move``/``create``/``delete`` share
-the same shape (build a Plan against Categories + ResearchQuestions, log it
-on apply) and are left as follow-ups for when the editor work starts.
+the same shape (build a Plan against Categories, log it on apply) and are left as follow-ups for when the editor work starts.
 """
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-
-MIRRORED_COLLECTIONS = ("Categories", "ResearchQuestions")
-
 
 @dataclass
 class FieldChange:
@@ -82,28 +77,25 @@ def plan_rename(db, category_id, new_name):
     if old_name == new_name:
         return plan
 
-    for collection in MIRRORED_COLLECTIONS:
-        cursor = db.aql.execute(
-            """
-            FOR c IN @@collection
-              FILTER @id IN (c.hierarchy_ids || [])
-              LET depth = POSITION(c.hierarchy_ids, @id, true)
-              FILTER depth >= 0 AND c.hierarchy[depth] == @old_name
-              RETURN c
-            """,
-            bind_vars={"@collection": collection, "id": category_id, "old_name": old_name},
+    cursor = db.aql.execute(
+        """
+        FOR c IN Categories
+          FILTER @id IN (c.hierarchy_ids || [])
+          LET depth = POSITION(c.hierarchy_ids, @id, true)
+          FILTER depth >= 0 AND c.hierarchy[depth] == @old_name
+          RETURN c
+        """,
+        bind_vars={"id": category_id, "old_name": old_name},
+    )
+    for doc in cursor:
+        depth = doc["hierarchy_ids"].index(category_id)
+        new_hierarchy = list(doc["hierarchy"])
+        new_hierarchy[depth] = new_name
+        plan.changes.append(
+            FieldChange("Categories", doc["id"], "hierarchy", doc["hierarchy"], new_hierarchy)
         )
-        for doc in cursor:
-            depth = doc["hierarchy_ids"].index(category_id)
-            new_hierarchy = list(doc["hierarchy"])
-            new_hierarchy[depth] = new_name
-            plan.changes.append(
-                FieldChange(collection, doc["id"], "hierarchy", doc["hierarchy"], new_hierarchy)
-            )
-            if doc["id"] == category_id:
-                # The renamed node's own name — whether that's a Categories
-                # doc, its ResearchQuestions mirror (if it's a leaf), or both.
-                plan.changes.append(FieldChange(collection, doc["id"], "name", doc["name"], new_name))
+        if doc["id"] == category_id:
+            plan.changes.append(FieldChange("Categories", doc["id"], "name", doc["name"], new_name))
 
     return plan
 

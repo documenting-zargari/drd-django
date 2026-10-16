@@ -9,7 +9,6 @@ from data.models import (
     Category,
     MasterPhrase,
     PhraseTranslation,
-    ResearchQuestion,
     Sample,
     SamplePhrase,
     Source,
@@ -128,7 +127,7 @@ class ResearchQuestionSerializer(ArangoModelSerializer):
     parent_id = serializers.IntegerField(allow_null=True)
 
     class Meta:
-        model = ResearchQuestion
+        model = Category
         fields = [
             "id",
             "name",
@@ -138,11 +137,9 @@ class ResearchQuestionSerializer(ArangoModelSerializer):
         ]
 
     def to_representation(self, instance):
-        # batch/search/retrieve pass raw AQL dicts, but the default list()
-        # passes ResearchQuestion model instances (from Model.all()).
         if not isinstance(instance, dict):
             instance = instance.to_dict()
-        exclude_fields = ["_rev", "_id", "tag_ids", "is_leaf"]
+        exclude_fields = ["_rev", "_id", "is_leaf"]
         result = {k: v for k, v in instance.items() if k not in exclude_fields}
         return result
 

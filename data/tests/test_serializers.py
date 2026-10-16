@@ -1,13 +1,13 @@
 from django.test import SimpleTestCase
 
-from data.models import ResearchQuestion
+from data.models import Category
 from data.serializers import AnswerSerializer, ResearchQuestionSerializer
 
 
 class ResearchQuestionSerializerTests(SimpleTestCase):
     DOC = {
         "_key": "7",
-        "_id": "ResearchQuestions/7",
+        "_id": "Categories/7",
         "_rev": "_abc",
         "id": 7,
         "name": "Copula",
@@ -30,10 +30,9 @@ class ResearchQuestionSerializerTests(SimpleTestCase):
         self.assertEqual(ResearchQuestionSerializer(dict(self.DOC)).data, self.EXPECTED)
 
     def test_serializes_model_instance(self):
-        # Regression: the default list() passes ResearchQuestion instances
-        # (Model.all()), which crashed GET /research-questions/ with
-        # "'ResearchQuestion' object has no attribute 'items'".
-        instance = ResearchQuestion(**self.DOC)
+        # Regression: model instances (rather than raw dicts) once crashed
+        # GET /research-questions/ with "object has no attribute 'items'".
+        instance = Category(**self.DOC)
         self.assertEqual(ResearchQuestionSerializer(instance).data, self.EXPECTED)
 
 

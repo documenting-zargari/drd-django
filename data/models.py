@@ -16,13 +16,6 @@ class Category(ArangoModel):
         return self.name
 
 
-class ResearchQuestion(ArangoModel):
-    collection_name = "ResearchQuestions"
-
-    def _str_(self):
-        return self.name
-
-
 class MasterPhrase(ArangoModel):
     """One doc per distinct elicited phrase, keyed by phrase_ref. Replaces
     the old PhraseAnchors + per-phrase tag_ids. See

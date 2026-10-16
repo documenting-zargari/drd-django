@@ -55,7 +55,7 @@ def api_root(request, format=None):
             },
             "research-questions": {
                 "url": reverse("research-questions-list", request=request, format=format),
-                "description": "Leaf ResearchQuestions (a subset of the Categories tree, where is_leaf=true)",
+                "description": "Research questions: the Categories nodes with is_leaf=true",
                 "search": reverse("research-questions-search", request=request, format=format),
                 "batch": reverse("research-questions-batch", request=request, format=format),
             },

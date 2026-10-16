@@ -1,5 +1,5 @@
 """
-CLI for the Categories/ResearchQuestions tree mutation primitives in
+CLI for the Categories tree mutation primitives in
 data/category_ops.py. Subcommand structure so it grows into the future
 Category/ResearchQuestion editor's data-manipulation toolkit without a
 rewrite — `move`/`create`/`delete` add subcommands here, each backed by a
@@ -19,7 +19,7 @@ from data.models import Category
 
 
 class Command(BaseCommand):
-    help = "Inspect and apply structural edits to the Categories/ResearchQuestions tree."
+    help = "Inspect and apply structural edits to the Categories tree."
 
     def add_arguments(self, parser):
         subparsers = parser.add_subparsers(dest="subcommand", required=True)

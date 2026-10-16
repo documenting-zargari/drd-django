@@ -38,7 +38,6 @@ from data.models import (
     Answer,
     Category,
     MasterPhrase,
-    ResearchQuestion,
     Sample,
     SamplePhrase,
     Source,
@@ -232,9 +231,32 @@ def _wordlist_response(db, collection, text_field, sample_refs, opts):
     return summary
 
 
+# Research questions are the Categories nodes flagged ``is_leaf == true``.
+# NB: is_leaf means "answerable research question", not "has no children" —
+# some questions have child questions of their own (e.g. 'better' >
+# Adjective/Adverb). Branch categories are everything else; the stored
+# has_children field is unset on every doc, so is_leaf is the only reliable
+# signal. (A separate ResearchQuestions mirror collection used to duplicate
+# the is_leaf subset; it was folded back into Categories in 2026-10.)
+def _valid_question_ids(db, ids):
+    """The subset of `ids` that are research questions."""
+    return set(db.aql.execute(
+        "FOR c IN Categories FILTER c.id IN @ids AND c.is_leaf == true RETURN c.id",
+        bind_vars={"ids": list(ids)},
+    ))
+
+
+def _valid_category_ids(db, ids):
+    """The subset of `ids` that are branch (non-question) categories."""
+    return set(db.aql.execute(
+        "FOR c IN Categories FILTER c.id IN @ids AND c.is_leaf != true RETURN c.id",
+        bind_vars={"ids": list(ids)},
+    ))
+
+
 def _get_question_hierarchy_ids(db, question_id):
     """
-    Return a ResearchQuestion's hierarchy_ids (itself plus every ancestor
+    Return a research question's hierarchy_ids (itself plus every ancestor
     Category id), or None if not found.
 
     Used to match a MasterPhrase/Transcription's question_ids/category_ids
@@ -249,7 +271,7 @@ def _get_question_hierarchy_ids(db, question_id):
     if question_id is None:
         return None
     cursor = db.aql.execute(
-        "FOR q IN ResearchQuestions FILTER q.id == @id RETURN q.hierarchy_ids",
+        "FOR c IN Categories FILTER c.id == @id AND c.is_leaf == true RETURN c.hierarchy_ids",
         bind_vars={"id": question_id},
     )
     return next(cursor, None)
@@ -481,7 +503,8 @@ class CategoryViewSet(ArangoModelViewSet):
 
 class ResearchQuestionViewSet(ArangoModelViewSet):
     """
-    Read-only API endpoint for browsing/searching ResearchQuestions.
+    Read-only API endpoint for browsing/searching research questions — the
+    ``is_leaf`` subset of Categories (see _valid_question_ids).
 
     Added for the MasterPhrases migration — editors need to look up and
     link specific research questions on MasterPhrases.question_ids (see
@@ -495,15 +518,26 @@ class ResearchQuestionViewSet(ArangoModelViewSet):
     - GET /research-questions/search/?q=<term> - Search questions by name (min 2 chars)
     """
 
-    model = ResearchQuestion
+    model = Category
     serializer_class = ResearchQuestionSerializer
     http_method_names = ["get", "head", "options"]
+
+    def get_queryset(self):
+        return list(self.request.arangodb.aql.execute(
+            "FOR c IN Categories FILTER c.is_leaf == true SORT c.id RETURN c"
+        ))
+
+    def get_object(self, pk):
+        doc = super().get_object(pk)
+        if doc.get("is_leaf") is not True:
+            raise NotFound(detail="Object not found")
+        return doc
 
     @action(detail=False, methods=["get"])
     def batch(self, request):
         """
         GET /research-questions/batch/?ids=<id1,id2,...> - retrieve multiple
-        ResearchQuestions by id in a single request.
+        research questions by id in a single request.
         """
         ids_param = request.query_params.get("ids", "").strip()
         if not ids_param:
@@ -519,7 +553,7 @@ class ResearchQuestionViewSet(ArangoModelViewSet):
 
         db = request.arangodb
         cursor = db.aql.execute(
-            "FOR q IN ResearchQuestions FILTER q.id IN @ids RETURN q",
+            "FOR c IN Categories FILTER c.id IN @ids AND c.is_leaf == true RETURN c",
             bind_vars={"ids": ids},
         )
         results = list(cursor)
@@ -529,7 +563,7 @@ class ResearchQuestionViewSet(ArangoModelViewSet):
     @action(detail=False, methods=["get"])
     def search(self, request):
         """
-        GET /research-questions/search/?q=<term> - search ResearchQuestions
+        GET /research-questions/search/?q=<term> - search research questions
         (case-insensitive substring, minimum 2 characters), sorted by id,
         capped at 50 results.
 
@@ -544,13 +578,13 @@ class ResearchQuestionViewSet(ArangoModelViewSet):
         db = request.arangodb
         cursor = db.aql.execute(
             """
-            FOR q IN ResearchQuestions
-                FILTER q.is_leaf == true
-                FILTER REGEX_TEST(q.name, @pattern, true)
-                    OR LENGTH(q.hierarchy[* FILTER REGEX_TEST(CURRENT, @pattern, true)]) > 0
-                SORT q.id
+            FOR c IN Categories
+                FILTER c.is_leaf == true
+                FILTER REGEX_TEST(c.name, @pattern, true)
+                    OR LENGTH(c.hierarchy[* FILTER REGEX_TEST(CURRENT, @pattern, true)]) > 0
+                SORT c.id
                 LIMIT 50
-                RETURN q
+                RETURN c
             """,
             bind_vars={"pattern": f".*{query}.*"},
         )
@@ -755,11 +789,8 @@ class PhraseViewSet(ArangoModelViewSet):
     @staticmethod
     def _validate_id_overrides(db, value, field_name, want_leaf):
         """Shared validator for question_overrides (want_leaf=True, ids must
-        be ResearchQuestions) and category_overrides (want_leaf=False, ids
-        must be branch Categories) — same is_leaf split MasterPhraseViewSet
-        uses for question_ids/category_ids (see its create()/partial_update()
-        for why has_children can't be used: it's unset on every Categories
-        doc)."""
+        be research questions) and category_overrides (want_leaf=False, ids
+        must be branch categories) — see _valid_question_ids."""
         if value is None:
             return {"include": [], "exclude": []}
         if not isinstance(value, dict):
@@ -771,16 +802,7 @@ class PhraseViewSet(ArangoModelViewSet):
 
         ids = set(include) | set(exclude)
         if ids:
-            if want_leaf:
-                valid = set(db.aql.execute(
-                    "FOR q IN ResearchQuestions FILTER q.id IN @ids AND q.is_leaf == true RETURN q.id",
-                    bind_vars={"ids": list(ids)},
-                ))
-            else:
-                valid = set(db.aql.execute(
-                    "FOR c IN Categories FILTER c.id IN @ids AND c.is_leaf != true RETURN c.id",
-                    bind_vars={"ids": list(ids)},
-                ))
+            valid = _valid_question_ids(db, ids) if want_leaf else _valid_category_ids(db, ids)
             bad = ids - valid
             if bad:
                 kind = "research question" if want_leaf else "category"
@@ -1776,10 +1798,7 @@ class MasterPhraseViewSet(ArangoModelViewSet):
         category_ids = data.get("category_ids") or []
 
         if question_ids:
-            valid = set(db.aql.execute(
-                "FOR q IN ResearchQuestions FILTER q.id IN @ids AND q.is_leaf == true RETURN q.id",
-                bind_vars={"ids": question_ids},
-            ))
+            valid = _valid_question_ids(db, question_ids)
             bad = set(question_ids) - valid
             if bad:
                 return Response(
@@ -1788,14 +1807,7 @@ class MasterPhraseViewSet(ArangoModelViewSet):
                 )
 
         if category_ids:
-            # is_leaf is the only reliable branch/leaf signal — the stored
-            # has_children field is unset on every Categories doc (unlike
-            # CategorySerializer.get_has_children, which computes it live
-            # from actual child docs), so checking it here always rejects.
-            valid = set(db.aql.execute(
-                "FOR c IN Categories FILTER c.id IN @ids AND c.is_leaf != true RETURN c.id",
-                bind_vars={"ids": category_ids},
-            ))
+            valid = _valid_category_ids(db, category_ids)
             bad = set(category_ids) - valid
             if bad:
                 return Response(
@@ -1843,10 +1855,7 @@ class MasterPhraseViewSet(ArangoModelViewSet):
             )
 
         if updates.get("question_ids"):
-            valid = set(db.aql.execute(
-                "FOR q IN ResearchQuestions FILTER q.id IN @ids AND q.is_leaf == true RETURN q.id",
-                bind_vars={"ids": updates["question_ids"]},
-            ))
+            valid = _valid_question_ids(db, updates["question_ids"])
             bad = set(updates["question_ids"]) - valid
             if bad:
                 return Response(
@@ -1855,12 +1864,7 @@ class MasterPhraseViewSet(ArangoModelViewSet):
                 )
 
         if updates.get("category_ids"):
-            # See the matching comment in create() — has_children is unset
-            # on every Categories doc, so is_leaf is the only valid check.
-            valid = set(db.aql.execute(
-                "FOR c IN Categories FILTER c.id IN @ids AND c.is_leaf != true RETURN c.id",
-                bind_vars={"ids": updates["category_ids"]},
-            ))
+            valid = _valid_category_ids(db, updates["category_ids"])
             bad = set(updates["category_ids"]) - valid
             if bad:
                 return Response(
@@ -2693,11 +2697,7 @@ class AnswerViewSet(ArangoModelViewSet):
             return Response({"error": "question_id must be an integer"}, status=status.HTTP_400_BAD_REQUEST)
 
         # Validate that the question exists (question_id on the answer is the link)
-        question_exists = list(db.aql.execute(
-            "FOR q IN ResearchQuestions FILTER q.id == @id LIMIT 1 RETURN 1",
-            bind_vars={"id": question_id},
-        ))
-        if not question_exists:
+        if not _valid_question_ids(db, [question_id]):
             raise NotFound(detail=f"Question {question_id} not found")
 
         # Insert the new answer document
@@ -2887,9 +2887,7 @@ class AnswerViewSet(ArangoModelViewSet):
         research question that was since deleted or renumbered) must not
         blank out an entire table's worth of otherwise-valid data."""
         db = self.request.arangodb
-        aql = "FOR q IN ResearchQuestions FILTER q.id IN @question_ids RETURN q.id"
-        cursor = db.aql.execute(aql, bind_vars={"question_ids": question_ids})
-        existing_questions = set(cursor)
+        existing_questions = _valid_question_ids(db, question_ids)
         missing_questions = set(question_ids) - existing_questions
         if missing_questions:
             if strict:
@@ -3142,7 +3140,7 @@ class ViewViewSet(ArangoModelViewSet):
     API endpoint for table Views.
 
     Each View carries a declarative ``spec`` (schema v1, see ``data.table_spec``)
-    describing a set of Categories/ResearchQuestions/Answers tables. ``content``
+    describing a set of Categories/Answers tables. ``content``
     (the legacy HTML template string) is still returned during the transition.
 
     Available endpoints:
@@ -3313,13 +3311,9 @@ class TranscriptionViewSet(ArangoModelViewSet):
         """Same is_leaf split MasterPhraseViewSet uses for question_ids /
         category_ids (see its create()/partial_update()): research questions
         must be leaves, categories must be branches. Returns an error Response
-        on the first invalid list, else None. has_children is unset on every
-        Categories doc, so is_leaf is the only reliable branch/leaf signal."""
+        on the first invalid list, else None."""
         if question_ids:
-            valid = set(db.aql.execute(
-                "FOR q IN ResearchQuestions FILTER q.id IN @ids AND q.is_leaf == true RETURN q.id",
-                bind_vars={"ids": list(question_ids)},
-            ))
+            valid = _valid_question_ids(db, question_ids)
             bad = set(question_ids) - valid
             if bad:
                 return Response(
@@ -3327,10 +3321,7 @@ class TranscriptionViewSet(ArangoModelViewSet):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
         if category_ids:
-            valid = set(db.aql.execute(
-                "FOR c IN Categories FILTER c.id IN @ids AND c.is_leaf != true RETURN c.id",
-                bind_vars={"ids": list(category_ids)},
-            ))
+            valid = _valid_category_ids(db, category_ids)
             bad = set(category_ids) - valid
             if bad:
                 return Response(

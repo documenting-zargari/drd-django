@@ -6,8 +6,10 @@ Mutation primitives for the Categories tree.
 duplicated into a separate ``ResearchQuestions`` collection, and the two
 copies drifted apart — see the "Adverbs > Local > Adverbials" mislabel
 (24 Sept 2026 agenda), where Categories.id 471 held a different `name` on
-the Köln server than locally. Going through this module (never hand edits
-or one-off AQL) is what keeps the stored hierarchy arrays consistent.
+the Köln server than locally. Each node's ancestor chain used to be stored
+on it too (``hierarchy`` / ``hierarchy_ids``); since 2026-11 it's derived
+from ``parent_id`` at read time (``data.category_tree``), so a node's own
+fields are the only thing a mutation ever has to touch.
 
 Every mutation here is expressed as a ``Plan`` (a list of before/after field
 changes) that can be inspected before it's applied, and applying it logs the
@@ -61,42 +63,16 @@ def _get_category(db, category_id):
 def plan_rename(db, category_id, new_name):
     """Build the diff for renaming one category node, without writing.
 
-    A node's name appears at a fixed depth (its own position in
-    ``hierarchy_ids``) in the ``hierarchy`` array of itself and every
-    descendant. ``hierarchy_ids`` itself never changes — ids are stable
-    identifiers independent of the name. The depth is recomputed per
-    affected document (rather than assumed constant) so a malformed
-    hierarchy array can't silently corrupt the wrong slot.
+    Only the node's own ``name`` changes: descendants pick the new name up
+    through their computed hierarchy.
     """
     node = _get_category(db, category_id)
     if node is None:
         raise ValueError(f"No Category with id={category_id}")
 
-    old_name = node["name"]
     plan = Plan(op="rename", target_id=category_id)
-    if old_name == new_name:
-        return plan
-
-    cursor = db.aql.execute(
-        """
-        FOR c IN Categories
-          FILTER @id IN (c.hierarchy_ids || [])
-          LET depth = POSITION(c.hierarchy_ids, @id, true)
-          FILTER depth >= 0 AND c.hierarchy[depth] == @old_name
-          RETURN c
-        """,
-        bind_vars={"id": category_id, "old_name": old_name},
-    )
-    for doc in cursor:
-        depth = doc["hierarchy_ids"].index(category_id)
-        new_hierarchy = list(doc["hierarchy"])
-        new_hierarchy[depth] = new_name
-        plan.changes.append(
-            FieldChange("Categories", doc["id"], "hierarchy", doc["hierarchy"], new_hierarchy)
-        )
-        if doc["id"] == category_id:
-            plan.changes.append(FieldChange("Categories", doc["id"], "name", doc["name"], new_name))
-
+    if node["name"] != new_name:
+        plan.changes.append(FieldChange("Categories", category_id, "name", node["name"], new_name))
     return plan
 
 

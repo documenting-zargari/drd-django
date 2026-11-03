@@ -808,6 +808,22 @@ class PhraseExportTests(SimpleTestCase):
 # _get_question_hierarchy_ids helper
 # ---------------------------------------------------------------------------
 
+def _category_chain(hierarchy_ids):
+    """Categories nodes forming one root-first chain whose last id is a
+    research question — what the cached category tree loads (see
+    data.category_tree)."""
+    parents = [None] + list(hierarchy_ids[:-1])
+    return [
+        {"id": i, "name": f"c{i}", "parent_id": p, "is_leaf": i == hierarchy_ids[-1]}
+        for i, p in zip(hierarchy_ids, parents)
+    ]
+
+
+def _is_tree_load(query):
+    from data.category_tree import _LOAD_AQL
+    return query == _LOAD_AQL
+
+
 class QuestionHierarchyIdsTests(SimpleTestCase):
     """Unit tests for _get_question_hierarchy_ids in data.views."""
 
@@ -817,7 +833,7 @@ class QuestionHierarchyIdsTests(SimpleTestCase):
 
     def _db(self, hierarchy_ids=None):
         db = MagicMock()
-        db.aql.execute.return_value = iter([hierarchy_ids] if hierarchy_ids is not None else [])
+        db.aql.execute.side_effect = lambda q, **kw: iter(_category_chain(hierarchy_ids) if hierarchy_ids else [])
         return db
 
     def test_returns_hierarchy_ids_when_question_found(self):
@@ -827,6 +843,10 @@ class QuestionHierarchyIdsTests(SimpleTestCase):
     def test_returns_none_when_question_not_found(self):
         db = self._db(hierarchy_ids=None)
         self.assertIsNone(self.resolve(db, 999))
+
+    def test_returns_none_for_a_branch_category(self):
+        db = self._db([1, 4, 5, 6])
+        self.assertIsNone(self.resolve(db, 5))
 
     def test_returns_none_when_question_id_is_none(self):
         db = self._db()
@@ -873,8 +893,8 @@ class _FakeByAnswerPhraseDB:
     def aql_execute(self, query, bind_vars=None):
         bv = bind_vars or {}
 
-        if "RETURN c.hierarchy_ids" in query:
-            return iter([self.question["hierarchy_ids"]] if self.question else [])
+        if _is_tree_load(query):
+            return iter(_category_chain(self.question["hierarchy_ids"]) if self.question else [])
 
         # question_overrides.include/exclude live on SamplePhrases now; the
         # fixtures here don't set them, so this always no-ops (empty override).
@@ -1035,8 +1055,8 @@ class _FakeByAnswerTranscriptionDB:
     def aql_execute(self, query, bind_vars=None):
         bv = bind_vars or {}
 
-        if "RETURN c.hierarchy_ids" in query:
-            return iter([self.question["hierarchy_ids"]] if self.question else [])
+        if _is_tree_load(query):
+            return iter(_category_chain(self.question["hierarchy_ids"]) if self.question else [])
 
         if "FOR key IN @include" in query:
             include = bv["include"]
@@ -1690,15 +1710,22 @@ class TranscriptionWritePermissionTests(SimpleTestCase):
 # ---------------------------------------------------------------------------
 
 class ResearchQuestionSearchTests(SimpleTestCase):
+    NODES = [
+        {"_key": "1", "id": 1, "name": "RLB", "parent_id": None},
+        {"_key": "600", "id": 600, "name": "Adpositions", "parent_id": 1},
+        {"_key": "601", "id": 601, "name": "andre", "parent_id": 600, "is_leaf": True},
+        {"_key": "602", "id": 602, "name": "pa", "parent_id": 600, "is_leaf": True},
+    ]
 
     def _run(self, q):
         from data.views import ResearchQuestionViewSet
-        captured = {}
+        queries = []
 
         def aql_execute(query, bind_vars=None):
-            captured["query"] = query
-            captured["bind_vars"] = bind_vars or {}
-            return iter([])
+            queries.append(query)
+            if _is_tree_load(query):
+                return iter(self.NODES)
+            return iter([n for n in self.NODES if n["id"] in (bind_vars or {}).get("ids", [])])
 
         mock_db = MagicMock()
         mock_db.aql.execute.side_effect = aql_execute
@@ -1712,28 +1739,28 @@ class ResearchQuestionSearchTests(SimpleTestCase):
         vs.format_kwarg = None
         vs.action = "search"
         resp = vs.search(req)
-        return resp, captured
+        return resp, queries
 
     def test_short_query_returns_empty_without_hitting_db(self):
-        resp, captured = self._run("a")
+        resp, queries = self._run("a")
         self.assertEqual(list(resp.data), [])
-        self.assertNotIn("query", captured)
+        self.assertEqual(queries, [])
 
-    def test_still_matches_question_name(self):
-        _, captured = self._run("andre")
-        self.assertIn("REGEX_TEST(c.name", captured["query"])
-        self.assertEqual(captured["bind_vars"]["pattern"], ".*andre.*")
+    def test_matches_question_name(self):
+        resp, _ = self._run("ANDR")
+        self.assertEqual([r["id"] for r in resp.data], [601])
+        self.assertEqual(resp.data[0]["hierarchy"], ["RLB", "Adpositions", "andre"])
+        self.assertEqual(resp.data[0]["hierarchy_ids"], [1, 600, 601])
 
     def test_also_matches_ancestor_category_name(self):
-        _, captured = self._run("Adpositions")
-        self.assertIn("c.hierarchy[*", captured["query"])
-        self.assertIn("is_leaf == true", captured["query"])
+        resp, _ = self._run("Adpositions")
+        self.assertEqual([r["id"] for r in resp.data], [601, 602])
 
     def test_reads_categories_not_the_retired_mirror(self):
         # Regression: ResearchQuestions was folded into Categories (2026-10).
-        _, captured = self._run("andre")
-        self.assertIn("FOR c IN Categories", captured["query"])
-        self.assertNotIn("ResearchQuestions", captured["query"])
+        _, queries = self._run("andre")
+        self.assertTrue(all("ResearchQuestions" not in q for q in queries))
+        self.assertTrue(any("FOR c IN Categories" in q for q in queries))
 
 
 class ResearchQuestionLookupTests(SimpleTestCase):
@@ -1765,7 +1792,7 @@ class ResearchQuestionLookupTests(SimpleTestCase):
         queries = []
         docs = self._viewset(queries).get_queryset()
         self.assertEqual([d["id"] for d in docs], [24])
-        self.assertIn("FOR c IN Categories FILTER c.is_leaf == true", queries[0])
+        self.assertTrue(any("FOR c IN Categories FILTER c.is_leaf == true" in q for q in queries))
 
     def test_retrieve_returns_a_research_question(self):
         self.assertEqual(self._viewset([]).get_object("24")["id"], 24)

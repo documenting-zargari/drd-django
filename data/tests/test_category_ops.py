@@ -1,12 +1,12 @@
 from django.test import SimpleTestCase
 
 from data import category_ops
+from data.category_tree import CategoryTree
 
 
 class FakeAql:
-    """Records every AQL call and answers plan_rename's two lookup queries
-    (the target node's own doc, then the descendant scan) from a small
-    in-memory Categories dataset."""
+    """Records every AQL call and answers plan_rename's node lookup and
+    apply_plan's update from a small in-memory Categories dataset."""
 
     def __init__(self, categories):
         self.categories = categories
@@ -18,22 +18,6 @@ class FakeAql:
 
         if "FOR c IN Categories FILTER c.id == @id RETURN c" in query:
             return iter([c for c in self.categories if c["id"] == bind_vars["id"]])
-
-        if "FILTER @id IN (c.hierarchy_ids || [])" in query:
-            # The ResearchQuestions mirror is gone: only Categories is scanned.
-            assert "FOR c IN Categories" in query and "@collection" not in bind_vars
-            collection = self.categories
-            target_id = bind_vars["id"]
-            old_name = bind_vars["old_name"]
-            matches = []
-            for doc in collection:
-                ids = doc.get("hierarchy_ids", [])
-                if target_id not in ids:
-                    continue
-                depth = ids.index(target_id)
-                if doc["hierarchy"][depth] == old_name:
-                    matches.append(doc)
-            return iter(matches)
 
         if "UPDATE d WITH @patch IN @@collection" in query:
             assert bind_vars["@collection"] == "Categories"
@@ -70,25 +54,20 @@ class FakeDb:
 
 def _make_tree():
     # Adverbs > Local > Adverbial (id 471, mislabeled) > inside (id 472,
-    # a branch node) > Stative (id 473, a research question, is_leaf) — mirrors the real "Adverbs > Local >
-    # Adverbials" mislabel (24 Sept 2026 agenda) at a much smaller scale.
-    categories = [
-        {"id": 471, "name": "Adverbial", "parent_id": 470,
-         "hierarchy": ["RLB", "Adverbs", "Local", "Adverbial"],
-         "hierarchy_ids": [1, 469, 470, 471]},
-        {"id": 472, "name": "inside", "parent_id": 471,
-         "hierarchy": ["RLB", "Adverbs", "Local", "Adverbial", "inside"],
-         "hierarchy_ids": [1, 469, 470, 471, 472]},
-        {"id": 473, "name": "Stative", "parent_id": 472, "is_leaf": True,
-         "hierarchy": ["RLB", "Adverbs", "Local", "Adverbial", "inside", "Stative"],
-         "hierarchy_ids": [1, 469, 470, 471, 472, 473]},
+    # a branch node) > Stative (id 473, a research question, is_leaf) — mirrors
+    # the real "Adverbs > Local > Adverbials" mislabel (24 Sept 2026 agenda)
+    # at a much smaller scale.
+    return [
+        {"id": 1, "name": "RLB", "parent_id": None},
+        {"id": 469, "name": "Adverbs", "parent_id": 1},
+        {"id": 470, "name": "Local", "parent_id": 469},
+        {"id": 471, "name": "Adverbial", "parent_id": 470},
+        {"id": 472, "name": "inside", "parent_id": 471},
+        {"id": 473, "name": "Stative", "parent_id": 472, "is_leaf": True},
         # An unrelated node that happens to also have "Adverbial" as its own
         # name (not this subtree) — must not be touched by the rename.
-        {"id": 900, "name": "Adverbial", "parent_id": 1,
-         "hierarchy": ["RLB", "Adverbial"],
-         "hierarchy_ids": [1, 900]},
+        {"id": 900, "name": "Adverbial", "parent_id": 1},
     ]
-    return categories
 
 
 class PlanRenameTests(SimpleTestCase):
@@ -102,32 +81,14 @@ class PlanRenameTests(SimpleTestCase):
         plan = category_ops.plan_rename(db, 471, "Adverbial")
         self.assertTrue(plan.is_noop())
 
-    def test_renames_node_and_cascades_hierarchy_to_descendants(self):
+    def test_renames_only_the_node_itself(self):
+        # Descendants no longer store their ancestors' names (the hierarchy
+        # is computed from parent_id), so a rename is one field change.
         db = FakeDb(_make_tree())
         plan = category_ops.plan_rename(db, 471, "Local")
-        self.assertFalse(plan.is_noop())
-
-        by_target = {(c.collection, c.doc_id, c.field): c for c in plan.changes}
-
-        # The node itself: both name and hierarchy change.
-        self.assertEqual(by_target[("Categories", 471, "name")].after, "Local")
         self.assertEqual(
-            by_target[("Categories", 471, "hierarchy")].after,
-            ["RLB", "Adverbs", "Local", "Local"],
-        )
-
-        # A branch descendant: hierarchy updates, no name change
-        # (its own name, "inside", is untouched).
-        self.assertEqual(
-            by_target[("Categories", 472, "hierarchy")].after,
-            ["RLB", "Adverbs", "Local", "Local", "inside"],
-        )
-        self.assertNotIn(("Categories", 472, "name"), by_target)
-
-        # A research question below it: hierarchy updates too.
-        self.assertEqual(
-            by_target[("Categories", 473, "hierarchy")].after,
-            ["RLB", "Adverbs", "Local", "Local", "inside", "Stative"],
+            [(c.collection, c.doc_id, c.field, c.before, c.after) for c in plan.changes],
+            [("Categories", 471, "name", "Adverbial", "Local")],
         )
 
     def test_only_touches_categories(self):
@@ -154,11 +115,10 @@ class ApplyPlanTests(SimpleTestCase):
 
         node = next(c for c in categories if c["id"] == 471)
         self.assertEqual(node["name"], "Local")
-        self.assertEqual(node["hierarchy"], ["RLB", "Adverbs", "Local", "Local"])
 
-        question = next(c for c in categories if c["id"] == 473)
+        # Descendants see the new name through the computed hierarchy.
         self.assertEqual(
-            question["hierarchy"],
+            CategoryTree(categories).hierarchy(473),
             ["RLB", "Adverbs", "Local", "Local", "inside", "Stative"],
         )
 

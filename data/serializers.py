@@ -1,5 +1,3 @@
-import ast
-
 from django.conf import settings
 from cryptography.fernet import InvalidToken
 from rest_framework import serializers
@@ -16,6 +14,11 @@ from data.models import (
     View,
 )
 from roma.serializers import ArangoModelSerializer
+
+
+def _field(obj, key, default=None):
+    """Read a field off a raw ArangoDB dict or a model instance."""
+    return obj.get(key, default) if isinstance(obj, dict) else getattr(obj, key, default)
 
 
 class CategorySerializer(ArangoModelSerializer):
@@ -45,37 +48,15 @@ class CategorySerializer(ArangoModelSerializer):
         )
 
     def get_has_table(self, obj):
-        get = obj.get if isinstance(obj, dict) else lambda k, d=None: getattr(obj, k, d)
-        return bool(get("view_slug") or get("path"))
+        return bool(_field(obj, "view_slug") or _field(obj, "path"))
 
+    # hierarchy / hierarchy_ids are computed from the cached tree by the
+    # views (data.category_tree), not stored on the documents.
     def get_hierarchy(self, obj):
-        # this contains a json string - return a list
-        # Handle both dict objects (from ArangoDB) and model objects
-        if isinstance(obj, dict):
-            hierarchy = obj.get("hierarchy", [])
-        else:
-            hierarchy = getattr(obj, "hierarchy", [])
-
-        if isinstance(hierarchy, str):
-            try:
-                hierarchy = ast.literal_eval(hierarchy)  # Convert string representation to list
-            except (ValueError, SyntaxError):
-                hierarchy = []
-        return hierarchy
+        return _field(obj, "hierarchy", [])
 
     def get_hierarchy_ids(self, obj):
-        # Same string-encoded-list quirk as hierarchy above.
-        if isinstance(obj, dict):
-            hierarchy_ids = obj.get("hierarchy_ids", [])
-        else:
-            hierarchy_ids = getattr(obj, "hierarchy_ids", [])
-
-        if isinstance(hierarchy_ids, str):
-            try:
-                hierarchy_ids = ast.literal_eval(hierarchy_ids)
-            except (ValueError, SyntaxError):
-                hierarchy_ids = []
-        return hierarchy_ids
+        return _field(obj, "hierarchy_ids", [])
 
     def get_has_children(self, obj):
         request = self.context.get("request")

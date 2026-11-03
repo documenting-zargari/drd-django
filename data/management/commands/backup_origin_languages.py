@@ -20,6 +20,7 @@ from collections import Counter
 
 from django.core.management.base import BaseCommand
 
+from data.category_tree import get_tree
 from data.models import Answer
 from data.origin_languages import classify, extract_origin_languages, sample_language_levels
 
@@ -57,12 +58,8 @@ class Command(BaseCommand):
                 " country: s.country_code, dialect: s.dialect_name}"
             )
         }
-        categories = {
-            c["id"]: c["path"]
-            for c in db.aql.execute(
-                "FOR c IN Categories RETURN {id: c.id, path: CONCAT_SEPARATOR(' > ', SLICE(c.hierarchy, 1))}"
-            )
-        }
+        tree = get_tree(db)
+        categories = {i: " > ".join(tree.hierarchy(i)[1:]) for i in tree.nodes}
 
         statuses = Counter()
         conflicts = []

@@ -182,17 +182,3 @@ def parse_contact_language_filters(tokens):
         if language and (level is None or level in LEVELS[1:]):
             filters.append({"level": level, "language": language})
     return filters
-
-
-CONTACT_LANGUAGE_SAMPLES_AQL = """
-FOR s IN Samples
-  FILTER LENGTH(
-    FOR e IN (IS_ARRAY(s.contact_languages) ? s.contact_languages : [])
-      FOR f IN @filters
-        FILTER LOWER(TRIM(e.language)) == f.language
-          AND (f.level == null OR e.level == f.level)
-        LIMIT 1
-        RETURN 1
-  ) > 0
-  RETURN s.sample_ref
-"""

@@ -32,8 +32,7 @@ from arango.exceptions import DocumentInsertError
 
 from data import table_spec
 from data.category_tree import get_tree
-from data.country_codes import expand_with_legacy_aliases
-from data.origin_languages import CONTACT_LANGUAGE_SAMPLES_AQL, parse_contact_language_filters
+from data.sample_scope import filter_sample_refs, parse_sample_filters, resolve_sample_scope
 from data.models import (
     Answer,
     Category,
@@ -104,46 +103,6 @@ def _visible_sample_refs(db, user):
     else:
         cursor = db.aql.execute("FOR s IN Samples FILTER s.visible == 'Yes' RETURN s.sample_ref")
     return list(cursor)
-
-
-def _resolve_country_scope(db, request, sample_refs, country_codes, visible_refs):
-    """
-    Final list of sample refs: the caller's explicit `sample_refs` intersected
-    with `visible_refs` (or, when none given, `visible_refs` itself), then
-    narrowed to `country_codes`, then to the request's `contact_languages`
-    (["Current-L2:Russian", "any:Turkish", ...]: samples listing any of them,
-    see data.origin_languages.parse_contact_language_filters).
-
-    `visible_refs` must already be the caller's authorized set (every sample,
-    if they've opted into hidden ones — see `_visible_sample_refs` — else
-    visible=='Yes' only). An explicit `sample_refs` is never trusted on its
-    own: the client is not an authorization boundary (a stale client-side
-    cache, e.g., can hand back a hidden sample_ref for a now-anonymous
-    session — see conversation 2026-09-16), so a caller-supplied ref for a
-    sample the requester isn't authorized to see is silently dropped here
-    rather than served.
-
-    `country_codes` are canonical ISO alpha-2 (what the client sends), but
-    Sample.country_code may still hold legacy un-normalized values (e.g.
-    "FIN") on databases where `normalize_country_codes` hasn't been (re)run
-    or on records reintroduced since — so the lookup is expanded to match
-    those aliases too, rather than assuming the data is clean.
-    """
-    base = (set(sample_refs) & set(visible_refs)) if sample_refs else set(visible_refs)
-    if country_codes:
-        cc_refs = set(
-            db.aql.execute(
-                "FOR s IN Samples FILTER s.country_code IN @codes RETURN s.sample_ref",
-                bind_vars={"codes": list(expand_with_legacy_aliases(country_codes))},
-            )
-        )
-        base &= cc_refs
-    contact_filters = parse_contact_language_filters(
-        request.data.get("contact_languages") if request is not None else None
-    )
-    if contact_filters:
-        base &= set(db.aql.execute(CONTACT_LANGUAGE_SAMPLES_AQL, bind_vars={"filters": contact_filters}))
-    return list(base)
 
 
 def _concord_search_filter(alias, fields, match, fold):
@@ -1226,7 +1185,8 @@ class PhraseViewSet(ArangoModelViewSet):
         - page (optional, default 1): Page number. Ignored when phrase_ref is given (all results returned).
         - page_size (optional, default 50, max 200): Results per page. Ignored when phrase_ref is given.
         - match ('substring' default | 'whole_word'), fold (bool, default true): concordance matching.
-        - country_codes (optional): ISO alpha-2 codes to scope by.
+        - country_codes, contact_languages, dialect_groups, source_type, migrant
+          (optional): sample filters, see data.sample_scope.
         - group ('concept'): collapse free-text results to one row per (phrase_ref,
           distinct Romani form) — {phrase_ref, phrase, english, count, samples:[{sample,
           sample_label}]} — capped at 3000 rows. Response also carries `grouped: true`
@@ -1238,7 +1198,6 @@ class PhraseViewSet(ArangoModelViewSet):
             raise ValidationError("Query must be at least 2 characters")
 
         sample_refs = request.data.get("sample_refs", [])
-        country_codes = request.data.get("country_codes", [])
         sort = request.data.get("sort", "phrase_ref")
         field = request.data.get("field", "both")  # 'romani', 'english', or 'both'
         match, fold = _parse_concord_options(request)
@@ -1299,12 +1258,12 @@ class PhraseViewSet(ArangoModelViewSet):
                 raise ValidationError(f"Search failed: {str(e)}")
         else:
             # Resolve the caller's authorized sample set upfront (once) instead of
-            # a subquery per phrase, then narrow to sample_refs/country_codes if given.
+            # a subquery per phrase, then narrow to sample_refs / sample filters if given.
             if user_sees_hidden_samples(request.user):
                 visible_refs = list(db.aql.execute("FOR s IN Samples RETURN s.sample_ref"))
             else:
                 visible_refs = list(db.aql.execute("FOR s IN Samples FILTER s.visible == 'Yes' RETURN s.sample_ref"))
-            sample_refs = _resolve_country_scope(db, request, sample_refs, country_codes, visible_refs)
+            sample_refs = resolve_sample_scope(db, request.data, sample_refs, visible_refs)
 
             # Romani text ('phrase') lives per-sample on SamplePhrases, indexed by the
             # SamplePhraseSearch ArangoSearch view (norm_lower analyzer). English lives
@@ -1454,7 +1413,6 @@ class PhraseViewSet(ArangoModelViewSet):
             raise ValidationError("Query must be at least 2 characters")
 
         sample_refs = request.data.get("sample_refs", [])
-        country_codes = request.data.get("country_codes", [])
         sort = request.data.get("sort", "phrase_ref")
         field = request.data.get("field", "both")
         match, fold = _parse_concord_options(request)
@@ -1509,7 +1467,7 @@ class PhraseViewSet(ArangoModelViewSet):
                 visible_refs = list(db.aql.execute("FOR s IN Samples RETURN s.sample_ref"))
             else:
                 visible_refs = list(db.aql.execute("FOR s IN Samples FILTER s.visible == 'Yes' RETURN s.sample_ref"))
-            sample_refs = _resolve_country_scope(db, request, sample_refs, country_codes, visible_refs)
+            sample_refs = resolve_sample_scope(db, request.data, sample_refs, visible_refs)
 
             query_lower = query.lower()
             query_bind = query if match == "whole_word" else query_lower
@@ -1569,7 +1527,7 @@ class PhraseViewSet(ArangoModelViewSet):
         """
         Frequency summary for a concordance term over the elicited-phrase
         corpus (the Romani `phrase` field), scoped by sample_refs /
-        country_codes and visibility.
+        sample filters (data.sample_scope) and visibility.
 
         Body params as `search` (paging / `field` ignored — phrase frequency
         always counts Romani forms). Response mirrors
@@ -1587,10 +1545,7 @@ class PhraseViewSet(ArangoModelViewSet):
             visible = list(db.aql.execute("FOR s IN Samples RETURN s.sample_ref"))
         else:
             visible = list(db.aql.execute("FOR s IN Samples FILTER s.visible == 'Yes' RETURN s.sample_ref"))
-        sample_refs = _resolve_country_scope(
-            db, request, request.data.get("sample_refs", []),
-            request.data.get("country_codes", []), visible,
-        )
+        sample_refs = resolve_sample_scope(db, request.data, request.data.get("sample_refs", []), visible)
 
         # Narrow to matching docs via the SamplePhraseSearch view first, then
         # tokenise only those (a full 128k-doc TOKENS scan takes seconds).
@@ -1675,9 +1630,9 @@ class PhraseViewSet(ArangoModelViewSet):
         """
         Alphabetical, de-duplicated word list ("word index") over the Romani
         `phrase` text of the elicited-phrase corpus, scoped by sample_refs /
-        country_codes and visibility. No query term.
+        sample filters (data.sample_scope) and visibility. No query term.
 
-        Body: sample_refs?, country_codes?, fold (bool, default true),
+        Body: sample_refs?, sample filters (data.sample_scope), fold (bool, default true),
         prefix? ("starts with" filter), sort ('alpha' default | 'count'),
         page (default 1), page_size (default 200, max 1000).
 
@@ -1685,11 +1640,8 @@ class PhraseViewSet(ArangoModelViewSet):
         """
         db = request.arangodb
         opts = _parse_wordlist_options(request)
-        sample_refs = _resolve_country_scope(
-            db, request,
-            request.data.get("sample_refs", []),
-            request.data.get("country_codes", []),
-            _visible_sample_refs(db, request.user),
+        sample_refs = resolve_sample_scope(
+            db, request.data, request.data.get("sample_refs", []), _visible_sample_refs(db, request.user),
         )
         try:
             return Response(_wordlist_response(db, "SamplePhrases", "phrase", sample_refs, opts))
@@ -2780,6 +2732,7 @@ class AnswerViewSet(ArangoModelViewSet):
             "question_ids": [1, 2, 3, ...],
             "sample_refs": ["SAMPLE-001", ...],  // optional
             "include_hidden": false               // optional
+            ...sample filters                    // optional, see data.sample_scope
         }
         """
         from rest_framework.response import Response
@@ -2795,7 +2748,10 @@ class AnswerViewSet(ArangoModelViewSet):
             operator = body.get("operator", "OR").upper()
             if operator not in ("AND", "OR"):
                 operator = "OR"
-            answers = self.get_answers_for_questions(question_ids, sample_refs if sample_refs else None, operator)
+            sample_refs = self.scope_sample_refs(body, sample_refs)
+            if sample_refs == []:
+                return Response([])
+            answers = self.get_answers_for_questions(question_ids, sample_refs, operator)
             serializer = self.serializer_class(
                 answers, many=True, context={"request": request, "view": self}
             )
@@ -2842,8 +2798,10 @@ class AnswerViewSet(ArangoModelViewSet):
                 else:
                     raise ValidationError(f"Invalid search parameter format: {param}. Use 'question_id,field,value' format")
 
-            # Get sample filters
-            sample_refs = self.request.GET.getlist("s")
+            # Explicit samples (s=...), narrowed by any sample filters
+            sample_refs = self.scope_sample_refs(self.request.GET, self.request.GET.getlist("s"))
+            if sample_refs == []:
+                return []
 
             # AND/OR operator for combining multiple search criteria (default: OR)
             operator = self.request.GET.get("operator", "OR").upper()
@@ -2888,6 +2846,12 @@ class AnswerViewSet(ArangoModelViewSet):
                 raise NotFound(detail=f"Questions not found: {sorted(missing_questions)}")
             print(f"Warning: ignoring unknown question ids in bulk answers fetch: {sorted(missing_questions)}")
         return [qid for qid in question_ids if qid in existing_questions]
+
+    def scope_sample_refs(self, data, sample_refs):
+        """Explicit `sample_refs` narrowed by the request's sample filters (see
+        data.sample_scope): None = all samples, [] = nothing matches."""
+        filtered = filter_sample_refs(self.request.arangodb, parse_sample_filters(data), sample_refs)
+        return (sample_refs or None) if filtered is None else filtered
 
     def validate_samples(self, sample_refs):
         """Validate all sample references exist"""
@@ -3630,12 +3594,8 @@ class TranscriptionViewSet(ArangoModelViewSet):
 
         db = request.arangodb
         match, fold = _parse_concord_options(request)
-        sample_refs = _resolve_country_scope(
-            db,
-            request,
-            request.data.get("sample_refs", []),
-            request.data.get("country_codes", []),
-            self._get_visible_sample_refs(request),
+        sample_refs = resolve_sample_scope(
+            db, request.data, request.data.get("sample_refs", []), self._get_visible_sample_refs(request),
         )
         params = {
             "query": query,
@@ -3660,7 +3620,8 @@ class TranscriptionViewSet(ArangoModelViewSet):
         Request Body:
         - query (required, min 2 chars): Search term
         - sample_refs (optional): List of sample refs to limit the search
-        - country_codes (optional): List of ISO alpha-2 codes to limit the search
+        - country_codes, contact_languages, dialect_groups, source_type, migrant
+          (optional): sample filters, see data.sample_scope.
         - match (optional, default 'substring'): 'substring' or 'whole_word'
         - fold (optional, default true): fold diacritics for whole-word matching
         - sort (optional, default 'segment_no'): 'segment_no' or 'sample'
@@ -3769,7 +3730,7 @@ class TranscriptionViewSet(ArangoModelViewSet):
     def frequency(self, request):
         """
         Frequency summary for a concordance term over the connected-speech
-        corpus, scoped by sample_refs / country_codes and visibility.
+        corpus, scoped by sample_refs / sample filters and visibility.
 
         Same body params as `search` (paging is ignored). `field` selects the
         text the tokens come from: 'english' counts the translation, anything
@@ -3859,10 +3820,10 @@ class TranscriptionViewSet(ArangoModelViewSet):
     def wordlist(self, request):
         """
         Alphabetical, de-duplicated word list ("word index") over the Romani
-        `transcription` text, scoped by sample_refs / country_codes and
+        `transcription` text, scoped by sample_refs / sample filters and
         visibility. No query term.
 
-        Body: sample_refs?, country_codes?, fold (bool, default true),
+        Body: sample_refs?, sample filters (data.sample_scope), fold (bool, default true),
         prefix? ("starts with" filter), sort ('alpha' default | 'count'),
         page (default 1), page_size (default 200, max 1000).
 
@@ -3871,10 +3832,9 @@ class TranscriptionViewSet(ArangoModelViewSet):
         """
         db = request.arangodb
         opts = _parse_wordlist_options(request)
-        sample_refs = _resolve_country_scope(
-            db, request,
+        sample_refs = resolve_sample_scope(
+            db, request.data,
             request.data.get("sample_refs", []),
-            request.data.get("country_codes", []),
             self._get_visible_sample_refs(request),
         )
         try:

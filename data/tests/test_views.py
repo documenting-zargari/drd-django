@@ -5,6 +5,8 @@ from django.test import RequestFactory, SimpleTestCase
 from rest_framework.exceptions import ValidationError
 from rest_framework.request import Request
 
+from data.sample_scope import _SAMPLES_AQL
+
 
 def _mock_user(is_admin=False, show_hidden=False):
     user = MagicMock()
@@ -434,10 +436,9 @@ class _FakePhraseDB:
             return iter([s["sample_ref"] for s in self.samples])
         if query == "FOR s IN Samples FILTER s.visible == 'Yes' RETURN s.sample_ref":
             return iter([s["sample_ref"] for s in self.samples if s.get("visible") == "Yes"])
-        # _resolve_country_scope: country_code -> sample_refs
-        if "FILTER s.country_code IN @codes" in query:
-            codes = set(bv.get("codes") or [])
-            return iter([s["sample_ref"] for s in self.samples if s.get("country_code") in codes])
+        # data.sample_scope: every sample's filter fields
+        if query == _SAMPLES_AQL:
+            return iter(self.samples)
 
         # get_queryset: GET /phrases/?sample=
         if "FOR sp IN SamplePhrases" in query and "FILTER sp.sample == @sample" in query and "DOCUMENT" in query:
@@ -1226,62 +1227,6 @@ class ConcordanceHelperTests(SimpleTestCase):
         self.assertEqual(_concord_fields("english", "transcription"), ["english"])
         self.assertEqual(_concord_fields("both", "transcription"), ["transcription", "english"])
 
-    def test_resolve_country_scope_intersects_with_country(self):
-        from data.views import _resolve_country_scope
-        db = MagicMock()
-        db.aql.execute.side_effect = lambda q, bind_vars=None: iter(["AL-001", "AL-002"])
-        req = MagicMock()
-        out = _resolve_country_scope(db, req, [], ["AL"], ["AL-001", "AL-002", "RO-009"])
-        self.assertEqual(sorted(out), ["AL-001", "AL-002"])
-
-    def test_resolve_country_scope_no_country_returns_base(self):
-        from data.views import _resolve_country_scope
-        out = _resolve_country_scope(MagicMock(), MagicMock(), [], [], ["AL-001", "RO-009"])
-        self.assertEqual(sorted(out), ["AL-001", "RO-009"])
-
-    def test_resolve_country_scope_explicit_refs_narrowed_by_country(self):
-        from data.views import _resolve_country_scope
-        db = MagicMock()
-        db.aql.execute.side_effect = lambda q, bind_vars=None: iter(["AL-001"])
-        out = _resolve_country_scope(db, MagicMock(), ["AL-001", "AL-002"], ["AL"], ["AL-001", "AL-002"])
-        self.assertEqual(out, ["AL-001"])
-
-    def test_resolve_country_scope_explicit_ref_excluded_when_not_visible(self):
-        # Regression: an explicit sample_refs entry the caller isn't
-        # authorized to see (e.g. a hidden sample handed back by a stale
-        # client-side cache after logout, or crafted directly) must never be
-        # served just because the client asked for it by name. The caller's
-        # authorized set (visible_refs) is the only thing that grants access;
-        # explicit refs narrow it, they don't extend it.
-        # See conversation 2026-09-16: a client cache bug surfaced exactly
-        # this — a hidden sample kept appearing to anonymous/logged-out
-        # visitors because sample_refs alone used to bypass this filter.
-        from data.views import _resolve_country_scope
-        out = _resolve_country_scope(
-            MagicMock(), MagicMock(),
-            ["AL-001", "HIDDEN-01"], [],  # HIDDEN-01 requested explicitly...
-            ["AL-001", "AL-002"],         # ...but not in the caller's visible set
-        )
-        self.assertEqual(out, ["AL-001"])
-
-    def test_resolve_country_scope_matches_legacy_unnormalized_country_code(self):
-        # Regression: querying "FI" (the canonical code the client sends) must
-        # still match samples whose Sample.country_code was never normalized
-        # from the legacy "FIN" value (e.g. because normalize_country_codes
-        # hasn't been run on this database, or a record was reintroduced by
-        # import). Previously an exact IN match against @codes=["FI"] missed
-        # such records entirely, silently zeroing out results.
-        from data.views import _resolve_country_scope
-        db = MagicMock()
-
-        def fake_execute(q, bind_vars=None):
-            self.assertIn("FIN", bind_vars["codes"])  # legacy alias expanded in
-            return iter(["FIN-002"])  # stored as legacy "FIN", not "FI"
-
-        db.aql.execute.side_effect = fake_execute
-        out = _resolve_country_scope(db, MagicMock(), [], ["FI"], ["FIN-002", "AL-001"])
-        self.assertEqual(out, ["FIN-002"])
-
 
 class PhraseSearchConcordanceTests(SimpleTestCase):
     """POST /phrases/search/ with the new match / country_codes params."""
@@ -1388,11 +1333,11 @@ class ConcordanceWordlistTests(SimpleTestCase):
 
         def aql(q, bind_vars=None):
             self.calls.append((q, bind_vars or {}))
-            if "RETURN s.sample_ref" in q and "country_code" not in q:
-                return iter(["AL-001", "AL-002"])
-            if "country_code IN @codes" in q:
-                codes = set((bind_vars or {}).get("codes") or [])
-                return iter([r for r in ["AL-001", "AL-002"] if "AL" in codes])
+            if q == _SAMPLES_AQL:
+                return iter([{"sample_ref": r, "country_code": "AL"} for r in ["AL-001", "AL-002"]]
+                            + [{"sample_ref": "RO-009", "country_code": "RO"}])
+            if "RETURN s.sample_ref" in q:
+                return iter(["AL-001", "AL-002", "RO-009"])
             # the wordlist AQL itself
             return iter([{
                 "count": 2, "total": 5,
@@ -1856,3 +1801,56 @@ class ValidateQuestionsTests(SimpleTestCase):
         vs = self._viewset(existing_ids={100})
         result = vs.validate_questions([998, 999], strict=False)
         self.assertEqual(result, [])
+
+
+class AnswerSampleFilterTests(SimpleTestCase):
+    """POST /answers/ (bulk by question) and GET /answers/?search= take the
+    shared sample filters (data.sample_scope) — previously the Search page
+    scoped results by country / L2 in the browser after fetching everything."""
+
+    SAMPLES = [
+        {"sample_ref": "AL-001", "dialect_group_name": "Balkan", "migrant": "No"},
+        {"sample_ref": "DE-010", "dialect_group_name": "Northern", "migrant": "Yes"},
+    ]
+
+    def _viewset(self, method="POST", data=None, query=""):
+        from django.http import QueryDict
+        from data.views import AnswerViewSet
+        vs = AnswerViewSet()
+        req = MagicMock()
+        req.method = method
+        req.data = data or {}
+        req.GET = QueryDict(query)
+        req.arangodb = MagicMock()
+        req.arangodb.aql.execute.side_effect = lambda q, bind_vars=None: iter(self.SAMPLES)
+        vs.request = req
+        vs.get_answers_for_questions = MagicMock(return_value=[])
+        vs.get_answers_with_field_filters = MagicMock(return_value=[])
+        return vs, req
+
+    def test_bulk_fetch_scopes_samples_by_filter(self):
+        vs, req = self._viewset(data={"question_ids": [5], "dialect_groups": ["Balkan"]})
+        vs.create(req)
+        vs.get_answers_for_questions.assert_called_once_with([5], ["AL-001"], "OR")
+
+    def test_bulk_fetch_without_filters_is_unscoped(self):
+        vs, req = self._viewset(data={"question_ids": [5]})
+        vs.create(req)
+        vs.get_answers_for_questions.assert_called_once_with([5], None, "OR")
+
+    def test_filter_matching_no_sample_returns_nothing_instead_of_everything(self):
+        vs, req = self._viewset(data={"question_ids": [5], "dialect_groups": ["Vlax"]})
+        resp = vs.create(req)
+        self.assertEqual(resp.data, [])
+        vs.get_answers_for_questions.assert_not_called()
+
+    def test_explicit_samples_intersect_with_filters(self):
+        vs, req = self._viewset(data={"question_ids": [5], "sample_refs": ["AL-001", "DE-010"], "migrant": "exclude"})
+        vs.create(req)
+        vs.get_answers_for_questions.assert_called_once_with([5], ["AL-001"], "OR")
+
+    def test_criteria_search_scopes_samples_by_query_params(self):
+        vs, _ = self._viewset(method="GET", query="search=5,form,x&migrant=exclude")
+        vs.get_queryset()
+        args = vs.get_answers_with_field_filters.call_args[0]
+        self.assertEqual(args[1], ["AL-001"])

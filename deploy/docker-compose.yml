@@ -1,0 +1,103 @@
+# Self-contained RLD stack: ArangoDB + PostgreSQL + Django API + Angular client,
+# behind Caddy (automatic HTTPS for real domains). See RESTORE.md.
+#
+#   cp .env.example .env                                   # then edit it
+#   cp frontend-build.env.example frontend-build.env       # then edit it
+#   docker compose up -d arangodb postgres
+#   docker compose --profile restore run --rm restore      # load the Arango dump (once)
+#   docker compose up -d --build
+#   docker compose exec backend python manage.py createsuperuser
+
+name: rld
+
+services:
+  arangodb:
+    image: arangodb/arangodb:3.12.4   # version running on the ACDH cluster, Nov 2026
+    environment:
+      ARANGO_ROOT_PASSWORD: ${ARANGO_ROOT_PASSWORD:?set ARANGO_ROOT_PASSWORD in .env}
+    volumes:
+      - arango-data:/var/lib/arangodb3
+    restart: unless-stopped
+
+  # One-shot: load an unpacked arangodump (DUMP_DIR/rms) into the database "rms".
+  restore:
+    image: arangodb/arangodb:3.12.4
+    profiles: [restore]
+    depends_on: [arangodb]
+    volumes:
+      - ${DUMP_DIR:-./data/dump}:/dump   # writable: arangorestore keeps a progress file there
+    entrypoint:
+      - arangorestore
+      - --server.endpoint=tcp://arangodb:8529
+      - --server.username=root
+      - --server.password=${ARANGO_ROOT_PASSWORD}
+      - --server.database=rms
+      - --create-database=true
+      - --input-directory=/dump/rms
+
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: rld
+      POSTGRES_USER: rld
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "rld"]
+      interval: 5s
+      retries: 20
+    restart: unless-stopped
+
+  backend:
+    build: ..
+    environment:
+      SECRET_KEY: ${DJANGO_SECRET_KEY:?set DJANGO_SECRET_KEY in .env}
+      DEBUG: "false"
+      ALLOWED_HOST: ${API_HOST:-localhost}
+      CORS_ALLOWED_ORIGINS: ${SITE_URL:-http://localhost:8080}
+      DATABASE_URL: postgresql://rld:${POSTGRES_PASSWORD}@postgres:5432/rld
+      ARANGO_HOST: http://arangodb:8529
+      ARANGO_DB_NAME: rms
+      ARANGO_USERNAME: root
+      ARANGO_PASSWORD: ${ARANGO_ROOT_PASSWORD}
+      RMS_ENCRYPT_KEY: ${RMS_ENCRYPT_KEY:-}   # optional, see tools/derive_encrypt_key.py
+    depends_on:
+      postgres:
+        condition: service_healthy
+      arangodb:
+        condition: service_started
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ${FRONTEND_DIR:-../../drd-angular}
+      secrets: [secrets_env]   # read by the client Dockerfile: API_URL, AUDIO_URL
+    volumes:
+      - ${AUDIO_DIR:-./data/audio}:/usr/share/nginx/html/media/mp3:ro
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2.8
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:-http://localhost:8080}
+      API_ADDRESS: ${API_ADDRESS:-http://localhost:8020}
+    ports:
+      - "${HTTP_PORT:-80}:80"     # 80/443 are needed for real domains (certificates)
+      - "${HTTPS_PORT:-443}:443"
+      - "8080:8080"
+      - "8020:8020"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+    depends_on: [backend, frontend]
+    restart: unless-stopped
+
+secrets:
+  secrets_env:
+    file: ./frontend-build.env
+
+volumes:
+  arango-data:
+  postgres-data:
+  caddy-data:

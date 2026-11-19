@@ -1,0 +1,11 @@
+# Two sites: the web client and the API (the client calls the API by its own URL).
+# A bare domain name (rld.example.org) gets HTTPS automatically;
+# an http://host:port address serves plain HTTP (local testing).
+
+{$SITE_ADDRESS} {
+	reverse_proxy frontend:80
+}
+
+{$API_ADDRESS} {
+	reverse_proxy backend:8020
+}

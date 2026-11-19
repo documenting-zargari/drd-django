@@ -47,16 +47,15 @@ http://localhost:8020. For a real server, point two DNS names at it and follow t
 ### Encryption key (personal data and user accounts)
 
 Speakers' personal data (`ENC:` fields) and the user export are encrypted. The
-key, `RMS_ENCRYPT_KEY`, is never published. You derive it from two secrets that
-the project gives you once, on two separate channels (e.g. one by email, one by
-phone); neither works alone:
+key, `RMS_ENCRYPT_KEY`, is never published. You derive it from:
 
-- the **salt**: 64 hexadecimal characters
-- the **master password**
+- the **master password**: the only secret. The project gives it to you once,
+  on a separate channel (not with these instructions).
+- the **salt**: not secret, included as `tools/encrypt_salt.txt`.
 
 ```sh
 pip install cryptography
-python3 ../tools/derive_encrypt_key.py --salt <the 64 hex characters> --check data/dump/rms
+python3 ../tools/derive_encrypt_key.py --check data/dump/rms
 # asks for the master password, checks it against the dump, prints RMS_ENCRYPT_KEY=...
 ```
 

@@ -5,21 +5,23 @@ fields stored with an "ENC:" prefix (speaker name/age/occupation/comments,
 fieldworker, transcriber, ... in the Sources collection).
 
 The key is never stored or published. It is derived from two inputs:
-    - the master password (prompted, never echoed), and
-    - the salt (64 hex characters; ENCRYPT_SALT),
+    - the master password (prompted, never echoed): the only secret,
+      handed over by the project on a separate channel, and
+    - the salt (64 hex characters), which is not secret and ships with this
+      script in encrypt_salt.txt,
 with exactly the parameters the data was encrypted with
 (extract/encrypt_personal_data.py): PBKDF2-HMAC-SHA256, 480,000 iterations,
 32-byte key, urlsafe base64 -> a Fernet key.
 
-Both inputs are needed; either one alone is useless. Use --check with an
+Use --check with an
 unpacked arangodump to confirm the derived key really decrypts the data
 before putting it into the backend's environment.
 
 Requires: pip install cryptography   (already in requirements.txt)
 
 Examples:
-    python3 derive_encrypt_key.py --salt <64 hex chars>
-    ENCRYPT_SALT=<hex> python3 derive_encrypt_key.py --check ./dump-multiple
+    python3 derive_encrypt_key.py --check data/dump/rms
+    python3 derive_encrypt_key.py --salt <64 hex chars>     # a different salt
     → prints  RMS_ENCRYPT_KEY=...   (put that line into the backend's .env)
 """
 
@@ -34,6 +36,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 ENC_PREFIX = "ENC:"
+SALT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "encrypt_salt.txt")
 # Must match extract/encrypt_personal_data.py, or the derived key won't decrypt.
 ITERATIONS = 480_000
 
@@ -67,13 +70,16 @@ def check_against_dump(key: bytes, dump_dir: str) -> bool:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--salt", default=os.environ.get("ENCRYPT_SALT"),
-                    help="salt as 64 hex characters (default: $ENCRYPT_SALT)")
+    ap.add_argument("--salt", help="salt as 64 hex characters (default: encrypt_salt.txt next to this script)")
     ap.add_argument("--check", metavar="DUMP_DIR", help="verify the key against an unpacked arangodump")
     args = ap.parse_args()
 
     if not args.salt:
-        sys.exit("No salt: pass --salt or set ENCRYPT_SALT.")
+        try:
+            with open(SALT_FILE) as fh:
+                args.salt = fh.read()
+        except OSError:
+            sys.exit(f"No salt: pass --salt or provide {SALT_FILE}.")
     try:
         salt = bytes.fromhex(args.salt.strip())
     except ValueError:

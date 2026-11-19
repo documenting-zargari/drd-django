@@ -7,8 +7,8 @@ You choose all passwords yourself. Tested with Docker 29 / Compose 5 on 19 Nov 2
 
 ```sh
 mkdir rld && cd rld
-git clone https://github.com/documenting-zargari/drd-django
-git clone https://github.com/documenting-zargari/drd-angular
+git clone -b dev https://github.com/documenting-zargari/drd-django
+git clone -b dev https://github.com/documenting-zargari/drd-angular
 cd drd-django/deploy
 mkdir -p data/dump data/audio
 ```
@@ -19,7 +19,11 @@ mkdir -p data/dump data/audio
   ```sh
   curl -L https://github.com/documenting-zargari/rlb-database/releases/latest/download/rld-arangodump.tar.gz \
     | tar -xz -C data/dump          # → data/dump/rms/
+  curl -L -o data/rld-users.json.enc \
+    https://github.com/documenting-zargari/rlb-database/releases/latest/download/rld-users.json.enc
   ```
+
+  `rld-users.json.enc` holds the user accounts and their roles (encrypted, see below).
 
   With the read-only account you can also dump the live database yourself:
   `arangodump --server.endpoint ssl://arangodb-dev.romanidb.eu:443 --server.username rld-reader --server.database rms --output-directory data/dump/rms`
@@ -40,12 +44,24 @@ The defaults run everything locally: web client on http://localhost:8080, API on
 http://localhost:8020. For a real server, point two DNS names at it and follow the
 "Real server" lines in `.env.example`; Caddy obtains HTTPS certificates itself.
 
-Optional: speakers' personal data is stored encrypted (`ENC:`). With the salt and
-master password from the project, derive the key and put it into `.env`:
+### Encryption key (personal data and user accounts)
+
+Speakers' personal data (`ENC:` fields) and the user export are encrypted. The
+key, `RMS_ENCRYPT_KEY`, is never published. You derive it from two secrets that
+the project gives you once, on two separate channels (e.g. one by email, one by
+phone); neither works alone:
+
+- the **salt**: 64 hexadecimal characters
+- the **master password**
 
 ```sh
-python3 ../tools/derive_encrypt_key.py --salt <64 hex> --check data/dump/rms
+pip install cryptography
+python3 ../tools/derive_encrypt_key.py --salt <the 64 hex characters> --check data/dump/rms
+# asks for the master password, checks it against the dump, prints RMS_ENCRYPT_KEY=...
 ```
+
+Put the printed line into `.env`. Without it everything else works, but personal
+data shows as `ENC:` and the user accounts cannot be imported.
 
 ## 3. Start
 
@@ -53,12 +69,15 @@ python3 ../tools/derive_encrypt_key.py --salt <64 hex> --check data/dump/rms
 docker compose up -d arangodb postgres
 docker compose --profile restore run --rm restore   # loads data/dump/rms (once)
 docker compose up -d --build                        # builds API + web client
-docker compose exec backend python manage.py createsuperuser
+docker compose cp data/rld-users.json.enc backend:/tmp/   # needs RMS_ENCRYPT_KEY
+docker compose exec backend python manage.py import_users /tmp/rld-users.json.enc
+docker compose exec backend python manage.py createsuperuser  # your own admin account
 ```
 
 The backend runs its migrations and rebuilds the search analyzers on every start.
-User accounts are not part of the public dump: create them again in the admin
-(http://localhost:8020/admin/) or the web client.
+`import_users` restores all accounts with their roles and (hashed) passwords.
+`createsuperuser` makes you the RLD admin: only admins see hidden samples and the
+decrypted personal data.
 
 ## 4. Check
 

@@ -1,3 +1,5 @@
+from django.conf import settings
+from django.http import HttpResponse
 from rest_framework import serializers, status, viewsets
 from rest_framework.authtoken.models import Token
 from rest_framework.decorators import action, api_view, permission_classes
@@ -5,6 +7,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from user.export import encrypt, fingerprint, users_fixture
 from user.models import CustomUser
 from user.permissions import IsGlobalAdmin, IsAdminOrSelf, IsGlobalOrProjectAdmin, get_project_from_request
 from user.serializers import UserSerializer, UserWriteSerializer
@@ -46,6 +49,23 @@ def logout_view(request):
     """Delete the user's auth token."""
     request.user.auth_token.delete()
     return Response(status=status.HTTP_200_OK)
+
+
+def users_export_view(request):
+    """
+    Public, encrypted export of the user database (see user.export), so the
+    published data dumps can carry users and their roles. The body is
+    ciphertext only; X-Content-Fingerprint identifies the plaintext so a
+    publisher can tell whether anything changed.
+    """
+    if settings.FIELD_FERNET is None:
+        return HttpResponse("RMS_ENCRYPT_KEY is not configured.", status=503, content_type="text/plain")
+    plaintext = users_fixture()
+    response = HttpResponse(encrypt(plaintext), content_type="application/octet-stream")
+    response["Content-Disposition"] = 'attachment; filename="rld-users.json.enc"'
+    response["X-Content-Fingerprint"] = fingerprint(plaintext)
+    response["Cache-Control"] = "no-store"
+    return response
 
 
 def _get_admin_projects(user):

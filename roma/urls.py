@@ -24,7 +24,7 @@ from rest_framework.reverse import reverse
 
 import data.urls
 import user.urls
-from user.views import CustomObtainAuthToken, logout_view
+from user.views import CustomObtainAuthToken, logout_view, users_export_view
 
 router = routers.DefaultRouter()
 router.registry.extend(data.urls.router.registry)
@@ -144,4 +144,5 @@ urlpatterns = [
     path("api-auth/", include("rest_framework.urls", namespace="rest_framework")),
     path("api/token/", CustomObtainAuthToken.as_view(), name="api_token_auth"),
     path("api/logout/", logout_view, name="api_logout"),
+    path("export/users/", users_export_view, name="users_export"),
 ]

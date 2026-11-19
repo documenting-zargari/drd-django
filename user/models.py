@@ -1,8 +1,19 @@
-from django.contrib.auth.models import AbstractUser
+from django.contrib.auth.models import AbstractUser, UserManager
 from django.db import models
 
 
+class CustomUserManager(UserManager):
+    def create_superuser(self, username, email=None, password=None, **extra_fields):
+        # A superuser (e.g. from `createsuperuser` after a restore) is the RLD
+        # admin: is_global_admin is what unlocks hidden samples and the
+        # decrypted personal data, not is_superuser.
+        extra_fields.setdefault("is_global_admin", True)
+        return super().create_superuser(username, email, password, **extra_fields)
+
+
 class CustomUser(AbstractUser):
+    objects = CustomUserManager()
+
     is_global_admin = models.BooleanField(
         default=False,
         help_text="Admin for all projects. Overrides per-project roles.",

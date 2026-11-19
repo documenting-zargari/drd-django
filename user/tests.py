@@ -1,6 +1,9 @@
-from django.test import TestCase
+from cryptography.fernet import Fernet
+from django.test import TestCase, override_settings
+from django.utils import timezone
 from rest_framework.test import APIClient
 
+from user.export import encrypt, fingerprint, import_encrypted, users_fixture
 from user.models import CustomUser, UserProjectRole
 from user.serializers import UserWriteSerializer
 
@@ -132,3 +135,48 @@ class ShowHiddenSamplesAPITests(TestCase):
         self.assertEqual(resp.status_code, 400)
         self.editor.refresh_from_db()
         self.assertFalse(self.editor.show_hidden_samples)
+
+
+class SuperuserIsGlobalAdminTests(TestCase):
+    def test_createsuperuser_sets_global_admin(self):
+        user = CustomUser.objects.create_superuser(username="root", password="pw")
+        self.assertTrue(user.is_global_admin)
+
+    def test_regular_user_is_not_global_admin(self):
+        user = CustomUser.objects.create_user(username="u", password="pw")
+        self.assertFalse(user.is_global_admin)
+
+
+TEST_FERNET = Fernet(Fernet.generate_key())
+
+
+@override_settings(FIELD_FERNET=TEST_FERNET)
+class UserExportTests(TestCase):
+    def setUp(self):
+        self.user = CustomUser.objects.create_user(username="editor1", password="pw", email="e@example.org")
+        UserProjectRole.objects.create(user=self.user, project="rms", role="editor", allowed_samples="TR-001")
+
+    def test_roundtrip_restores_users_and_roles(self):
+        token = encrypt(users_fixture())
+        CustomUser.objects.all().delete()
+        import_encrypted(token)
+        user = CustomUser.objects.get(username="editor1")
+        self.assertTrue(user.check_password("pw"))
+        self.assertEqual(user.project_roles.get().sample_list, ["TR-001"])
+
+    def test_fingerprint_ignores_last_login(self):
+        before = fingerprint(users_fixture())
+        self.user.last_login = timezone.now()
+        self.user.save()
+        self.assertEqual(before, fingerprint(users_fixture()))
+
+    def test_endpoint_returns_ciphertext_only(self):
+        response = APIClient().get("/export/users/")
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn(b"editor1", response.content)
+        self.assertIn(b"editor1", TEST_FERNET.decrypt(response.content))
+        self.assertEqual(response["X-Content-Fingerprint"], fingerprint(users_fixture()))
+
+    @override_settings(FIELD_FERNET=None)
+    def test_endpoint_unavailable_without_key(self):
+        self.assertEqual(APIClient().get("/export/users/").status_code, 503)

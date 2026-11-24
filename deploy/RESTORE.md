@@ -59,6 +59,12 @@ python3 ../tools/derive_encrypt_key.py --check data/dump/rms
 # asks for the master password, checks it against the dump, prints RMS_ENCRYPT_KEY=...
 ```
 
+With the right password, `--check` reports that all encrypted values decrypt
+("N encrypted values decrypt, 0 do not") before printing the key. A wrong
+password stops with "The key does not decrypt the data". The salt in
+`tools/encrypt_salt.txt` together with the master password was verified this way
+on 19 Nov 2026.
+
 Put the printed line into `.env`. Without it everything else works, but personal
 data shows as `ENC:` and the user accounts cannot be imported.
 

@@ -19,7 +19,7 @@ service:
 ingress:
   enabled: true
   path: "/"
-  className: "nginx"
+  className: "traefik"
   annotations: {}
 livenessProbe:
   path: # path to your health check route, can be /
